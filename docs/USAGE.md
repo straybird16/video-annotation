@@ -93,8 +93,8 @@ Preview FPS never changes source time or tracking.
 Open **Refine pose**, select **Use current tracks** (prefers saved corrections)
 or browse a point CSV, then **Run refinement**. This estimates center, clockwise
 rotation and image-based scale using the saved circle/foreground as support.
-Fast correlation is the default; no model is loaded. Important controls and
-measured timing appear in the tab. **Render overlay** reuses matching refined
+Both original/recent fits use fast correlation by default; no model is loaded. Independent original recovery, score/disagreement weights and short-gap
+interpolation controls appear in the tab, alongside measured costs. **Render overlay** reuses matching refined
 poses, draws their circles and reliable rotation arrows, and uses the shared
 Render settings for quality, FPS, size and frame limit. Open-folder buttons locate
 the data and MP4. See [pose settings and output definitions](POSE_REFINEMENT.md).

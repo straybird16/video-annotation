@@ -43,7 +43,7 @@ class PointPoseTests(unittest.TestCase):
 
     def run_refinement(self,images,**options):
         with patch('video_annotation.pose.workflow.probe_video',return_value=(self.source,{})), \
-             patch('video_annotation.pose.workflow.video_frames',return_value=iter(images)) as decode:
+             patch('video_annotation.pose.workflow.video_frames',side_effect=lambda *args,**kwargs:iter(images)) as decode:
             result=refine_point_tracks(self.tracks,**options)
         return result,decode
 

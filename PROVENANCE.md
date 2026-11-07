@@ -29,3 +29,9 @@ Event's `scripts/mite_rendering.py` circle/direction renderer. The Event origina
 remain in place for its other pipelines. The point adapter adds transported
 reference support, shared source decoding and GUI/CLI integration; it does not
 replace the registration algorithm or add mutual-information dependencies.
+
+The subsequent `pose/anchored.py` adapter reuses the extracted correlation solve,
+canonical sampling and quality checks while adding original-independent recovery
+and score/disagreement fusion. `pose/gaps.py` is first-party final interpolation
+with explicit raw/processed provenance; Event's legacy box/MI estimator remains
+unchanged.

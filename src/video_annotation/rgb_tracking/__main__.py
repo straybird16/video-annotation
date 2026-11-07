@@ -129,7 +129,7 @@ def parser():
     clean.add_argument("--reacquire-seconds", type=float, default=.5,
                        help="recovery window in source-video seconds (default 0.5; 0 ends immediately)")
     clean.add_argument("--dry-run", action="store_true", help="report changes without writing files")
-    refine = sub.add_parser("refine", help="refine point patches with fast correlation pose estimation")
+    refine = sub.add_parser("refine", help="refine point patches with anchored correlation and short-gap interpolation")
     refine.add_argument("--tracks", type=Path, required=True, help="original or corrected point CSV")
     refine.add_argument("--output-dir", type=Path, help="data-local pose folder; default beside the input tracks")
     refine.add_argument("--point-ids", type=int, nargs="+", help="stable point IDs; defaults to all")
@@ -148,6 +148,26 @@ def parser():
     refine.add_argument("--scale-smoothness", type=float, default=2.)
     refine.add_argument("--tracker-center-weight", type=float, default=.9)
     refine.add_argument("--registration-center-weight", type=float, default=.1)
+    refine.add_argument("--anchor-preference", type=float, default=.8,
+                        help="original-reference weight when equally scored fits agree (default 0.8)")
+    refine.add_argument("--anchor-score-delta", type=float, default=.05,
+                        help="fit-score advantage multiplying its fusion odds by four (default 0.05)")
+    refine.add_argument("--anchor-angle-tolerance", type=float, default=10.,
+                        help="maximum angle disagreement for fusing fits, degrees")
+    refine.add_argument("--anchor-scale-tolerance", type=float, default=.1,
+                        help="fractional scale disagreement for fusing fits (default 0.1)")
+    refine.add_argument("--recovery-scale-min", type=float, default=.25,
+                        help="minimum absolute scale during original-reference recovery")
+    refine.add_argument("--recovery-scale-max", type=float, default=4.,
+                        help="maximum absolute scale during original-reference recovery")
+    refine.add_argument("--recovery-angle-step", type=float, default=15.,
+                        help="coarse original-reference recovery angle step, degrees")
+    refine.add_argument("--recovery-scale-step", type=float, default=1.25,
+                        help="coarse original-reference recovery multiplicative scale step")
+    refine.add_argument("--gap-seconds", type=float, default=.1,
+                        help="maximum short gap to interpolate in source-video seconds; 0 disables")
+    refine.add_argument("--gap-neighbors", type=nonnegative, default=2,
+                        help="trusted samples per side of a filled gap, at least 2; 0 disables")
     refine.add_argument("--opencv-threads", type=positive, default=1)
     refine.add_argument("--overlay", action="store_true", help="render a combined bounding-circle/rotation MP4")
     refine.add_argument("--overlay-fps", type=float, help="preview speed only; source frame IDs/timestamps are preserved")
@@ -366,11 +386,14 @@ def refine_command(args):
     config = Config(support="circle", radius_blend=0., tracker_scale_weight=0., registration_scale_weight=1.,
         **{name:getattr(args, name) for name in ("patch_size", "min_score", "reference_interval", "iterations",
             "fast_iterations", "fast_samples", "scale_limit", "center_limit", "rotation_smoothness",
-            "scale_smoothness", "tracker_center_weight", "registration_center_weight")}, fast=not args.full_search)
+            "scale_smoothness", "tracker_center_weight", "registration_center_weight", "anchor_preference",
+            "anchor_score_delta", "anchor_angle_tolerance", "anchor_scale_tolerance", "recovery_scale_min",
+            "recovery_scale_max", "recovery_angle_step", "recovery_scale_step")}, fast=not args.full_search)
     result = refine_point_tracks(args.tracks, output_dir=args.output_dir, point_ids=args.point_ids,
         config=config, radius=args.patch_radius, max_frames=args.max_frames, overlay=args.overlay,
         overlay_fps=args.overlay_fps, max_width=args.max_width, force=args.force,
         render_options=rendering_configuration(args), opencv_threads=args.opencv_threads,
+        gap_seconds=args.gap_seconds, gap_neighbors=args.gap_neighbors,
         progress=lambda value: print(value, flush=True))
     print(json.dumps(result, indent=2))
 

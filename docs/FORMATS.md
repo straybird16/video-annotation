@@ -58,3 +58,11 @@ circle follows the selected query, with radius equal to its saved patch radius
 times fitted scale. `rotation_valid` gates arrows/evaluation separately from
 center/scale validity. Overlays mirror the source track hierarchy under
 `outputs/videos/point_pose/`; dataset metadata does not reference them.
+
+Point-pose refinements additionally retain `pose.raw.csv` before the final gap
+sweep. Final `pose.csv` keeps raw `fit_valid`/`rotation_fit_valid` and independently
+marks usable `valid`/`rotation_valid`, component interpolation flags and
+`pose_source`. Inferred components have no fabricated fit scores. Original/recent
+candidate scale/rotation, scores, per-component original weights, disagreement
+and recovery flags are included. Interpolation never bridges source-hidden
+points or extends their retained lifetimes.

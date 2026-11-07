@@ -1,4 +1,4 @@
-"""Refine saved point patches using the unchanged correlation pose estimator."""
+"""Refine saved point patches with original-anchored correlation and gap repair."""
 from contextlib import ExitStack
 import csv
 from dataclasses import asdict
@@ -26,7 +26,9 @@ from ..rgb_tracking.video_geometry import DISPLAY_COORDINATE_SPACE, display_rota
 from ..rgb_tracking.workflow import check_cancel, file_digest
 from .annotations import export_annotation
 from .input import patch_supports, transported_mask
-from .registration import Config, PoseEstimator, rotation
+from .registration import Config, rotation
+from .anchored import AnchoredPoseEstimator as PoseEstimator, FUSION_FIELDS
+from .gaps import finalize_pose_csv, validate_gap_options
 
 FIELDS = ('frame','timestamp_us','x','y','rotation_degrees','rotation_unwrapped_degrees',
     'scale','tracker_scale','registration_scale','scale_target','rotation_prior_degrees','scale_prior',
@@ -37,7 +39,7 @@ FIELDS = ('frame','timestamp_us','x','y','rotation_degrees','rotation_unwrapped_
     'tracker_x','tracker_y','tracker_w','tracker_h','fit_mode','circle_x','circle_y','circle_radius',
     'geometry_source',*EXTENT_FIELDS,*ROTATION_QUALITY_FIELDS,
     'reference_frame','point_id','point_visible','point_prediction_x','point_prediction_y',
-    'mask_registration_center_x','mask_registration_center_y')
+    'mask_registration_center_x','mask_registration_center_y',*FUSION_FIELDS)
 
 
 def _config(value):
@@ -74,6 +76,8 @@ def _draw(frame, rows, source_frame):
         x,y = np.rint([float(row['x']),float(row['y'])]).astype(int)
         label = (f'{identity}: {angle:.1f} deg x{float(row["scale"]):.2f}' if angle is not None
                  else f'{identity}: rotation unavailable ({row.get("rotation_reason","unreliable")})')
+        if int(row.get('center_scale_interpolated') or 0) or int(row.get('rotation_interpolated') or 0):
+            label += ' [interpolated]'
         cv2.putText(layer,label,(max(0,x+5),max(15,y-8)),cv2.FONT_HERSHEY_SIMPLEX,.4,color,1,cv2.LINE_AA)
     cv2.addWeighted(layer,.75,frame,.25,0,frame)
     cv2.putText(frame,f'Source frame {source_frame}',(8,22),cv2.FONT_HERSHEY_SIMPLEX,.5,(255,255,255),1,cv2.LINE_AA)
@@ -84,18 +88,72 @@ def _invalid(reason):
     return dict(valid=0,reason=reason,rotation_valid=0,rotation_reason=reason,template_updated=0,fit_mode='none')
 
 
+def _render_saved_poses(paths, video, source, start, count, target, fps, max_width, options,
+                        times, progress, cancel):
+    """Replay finalized CSVs; used for fresh gap-filled output and cached overlays."""
+    target.parent.mkdir(parents=True,exist_ok=True)
+    temporary=target.with_name('.'+target.stem+'.'+uuid4().hex+'.mp4')
+    ratio=min(1.,max_width/source['width'])
+    dw,dh=max(1,round(source['width']*ratio)),max(1,round(source['height']*ratio))
+    size=dw+dw%2,dh+dh%2
+    limit=min(count,options['max_frames'] or count)
+    writer=None
+    try:
+        with ExitStack() as stack:
+            readers={identity:iter(csv.DictReader(stack.enter_context(path.open(newline=''))))
+                     for identity,path in paths.items()}
+            pending={identity:next(reader,None) for identity,reader in readers.items()}
+            clock=time.perf_counter()
+            writer=H264Writer(temporary,size,fps,crf=options['crf'],preset=options['preset'])
+            times['render_seconds']+=time.perf_counter()-clock
+            stream=iter(video_frames(video,start,limit,source=source))
+            for index in range(limit):
+                check_cancel(cancel)
+                clock=time.perf_counter();image=next(stream,None)
+                if image is None:raise ValueError('Source video ended during processed-pose replay')
+                times['decode_seconds']+=time.perf_counter()-clock
+                frame=start+index
+                rows={}
+                for identity,reader in readers.items():
+                    row=pending[identity]
+                    if row is not None and int(row['frame'])<frame:
+                        raise ValueError('Saved pose rows are not in source-frame order')
+                    if row is not None and int(row['frame'])==frame:
+                        rows[identity]=row;pending[identity]=next(reader,None)
+                clock=time.perf_counter()
+                _draw(image,rows,frame)
+                if (dw,dh)!=(source['width'],source['height']):
+                    image=cv2.resize(image,(dw,dh),interpolation=cv2.INTER_AREA)
+                image=cv2.copyMakeBorder(image,0,size[1]-dh,0,size[0]-dw,cv2.BORDER_CONSTANT)
+                writer.write(image)
+                times['render_seconds']+=time.perf_counter()-clock
+                if progress and ((index+1)%30==0 or index+1==limit):
+                    progress(f'Rendering processed point poses: {index+1}/{limit} source frames')
+            clock=time.perf_counter();writer.close();writer=None
+            times['render_seconds']+=time.perf_counter()-clock
+        check_cancel(cancel)
+        return temporary
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    finally:
+        if writer is not None:writer.close()
+
+
 def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None, radius=None,
                         max_frames=None, overlay=True, overlay_fps=None, max_width=1280,
                         render_options=None, force=False, progress=None, cancel=None,
-                        overlay_path=None, opencv_threads=1):
+                        overlay_path=None, opencv_threads=1, gap_seconds=.1, gap_neighbors=2):
     """Decode once for independent point fits; preserve IDs, gaps and source time.
 
-    A saved foreground is transported by the preceding accepted image similarity
-    about its query point. It is support for fitting, not per-frame segmentation.
+    Reference foreground moves with each candidate similarity about the query.
+    It is fitting support, not per-frame segmentation.
     Constant point-circle dimensions never act as a measured image-scale prior.
     """
     begin = time.perf_counter()
-    times = dict(adaptation_seconds=0.,setup_seconds=0.,decode_seconds=0.,refinement_seconds=0.,render_seconds=0.)
+    times = dict(adaptation_seconds=0.,setup_seconds=0.,decode_seconds=0.,refinement_seconds=0.,render_seconds=0.,interpolation_seconds=0.)
+    gap_seconds,gap_neighbors=validate_gap_options(gap_seconds,gap_neighbors)
+    defer_overlay=bool(gap_seconds and gap_neighbors)
     check_cancel(cancel)
     tracks = contained_path(tracks,'data')
     metadata = json.loads(tracks.with_suffix('.json').read_text())
@@ -148,7 +206,7 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
     fps = source['fps'] if overlay_fps is None else overlay_fps
     if not np.isfinite(fps) or fps<=0 or max_width<1:
         raise ValueError('Overlay FPS and maximum width must be positive')
-    signature = hashlib.sha256(json.dumps(dict(version=1,tracks=file_digest(tracks),
+    signature = hashlib.sha256(json.dumps(dict(version=2,gap_seconds=gap_seconds,gap_neighbors=gap_neighbors,tracks=file_digest(tracks),
         metadata=file_digest(tracks.with_suffix('.json')),source=[video.stat().st_size,video.stat().st_mtime_ns],
         point_ids=selected,config=asdict(cfg),frames=count,
         supports={str(i):dict(radius=s['radius'],query=None if s['query'] is None else s['query'].tolist(),
@@ -177,7 +235,7 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
         current_run_timing = dict(timing)
         if reused:
             for key in ('adaptation_seconds','setup_seconds','decode_seconds','refinement_seconds',
-                        'mean_ms_per_point_frame','mean_ms_per_source_frame'):
+                        'mean_ms_per_point_frame','mean_ms_per_source_frame','interpolation_seconds'):
                 timing[key] = old.get('timing',{}).get(key,0.)
         return dict(output=str(output_dir),output_dir=str(output_dir),poses={str(i):str(p) for i,p in poses.items()},
                     overlay=str(overlay_target) if overlay_target else None,timing=timing,reused=reused,
@@ -191,25 +249,27 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
     writer = None
     temporary_overlay = None
     try:
+        if reused:
+            temporary_overlay=_render_saved_poses(poses,video,source,start,count,overlay_target,fps,max_width,
+                                                  options,times,progress,cancel)
+            temporary_overlay.replace(overlay_target)
+            write_json(overlay_sidecar,dict(settings=overlay_signature,output_bytes=overlay_target.stat().st_size,
+                                           source_video=str(video),point_tracks=str(tracks)))
+            return result(old['valid_point_rows'],0)
         with tempfile.TemporaryDirectory(prefix='.point-pose-',dir=output_dir.parent) as temporary, ExitStack() as stack:
             stage = Path(temporary)/'export'; stage.mkdir()
-            writers,readers,states,counts = {},{},{},{i:0 for i in selected}
-            if reused:
-                for i,path in poses.items():
-                    readers[i] = iter(csv.DictReader(stack.enter_context(path.open(newline=''))))
-                pending = {i:next(reader,None) for i,reader in readers.items()}
-            else:
-                for i in selected:
-                    folder = stage/f'point_{i}'; folder.mkdir()
-                    writers[i] = csv.DictWriter(stack.enter_context((folder/'pose.csv').open('w',newline='')),
-                                                fieldnames=FIELDS,extrasaction='ignore')
-                    writers[i].writeheader()
-                    states[i] = dict(estimator=None,reference_frame=None,angle=0.,scale=1.,offset=np.zeros(2))
+            writers,states,counts = {},{},{i:0 for i in selected}
+            for i in selected:
+                folder = stage/f'point_{i}'; folder.mkdir()
+                writers[i] = csv.DictWriter(stack.enter_context((folder/'pose.raw.csv').open('w',newline='')),
+                                            fieldnames=FIELDS,extrasaction='ignore')
+                writers[i].writeheader()
+                states[i] = dict(estimator=None,reference_frame=None,angle=0.,scale=1.,offset=np.zeros(2))
             w,h = source['width'],source['height']
             ratio = min(1.,max_width/w)
             dw,dh = max(1,round(w*ratio)),max(1,round(h*ratio))
             size = dw+dw%2,dh+dh%2
-            if overlay_target:
+            if overlay_target and not defer_overlay:
                 overlay_target.parent.mkdir(parents=True,exist_ok=True)
                 temporary_overlay = overlay_target.with_name('.'+overlay_target.stem+'.'+uuid4().hex+'.mp4')
                 clock = time.perf_counter()
@@ -223,17 +283,10 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                 image = next(stream,None)
                 if image is None:
                     raise ValueError('Source video ended before the declared point interval')
-                gray = None if reused else cv2.cvtColor(image,cv2.COLOR_BGR2GRAY)
+                gray = cv2.cvtColor(image,cv2.COLOR_BGR2GRAY)
                 times['decode_seconds'] += time.perf_counter()-clock
                 rows = {}
                 for point,i in enumerate(selected):
-                    if reused:
-                        row = pending[i]
-                        if row is not None and int(row['frame'])==frame_id:
-                            rows[i] = row
-                            pending[i] = next(readers[i],None)
-                        valid_total += int(rows.get(i,{}).get('valid') or 0)
-                        continue
                     end = policy['point_end_frames'][str(i)]
                     if end is None or frame_id>end:
                         continue
@@ -296,7 +349,7 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                     writer.write(image)
                     times['render_seconds'] += time.perf_counter()-clock
                 if progress and ((index+1)%30==0 or index+1==count):
-                    operation = 'Rendering saved point poses' if reused else 'Refining point poses'
+                    operation = 'Refining point poses'
                     progress(f'{operation}: {index+1}/{count} source frames; {valid_total} accepted')
             clock = time.perf_counter()
             stack.close()
@@ -304,13 +357,28 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                 writer.close(); writer=None
             times['render_seconds'] += time.perf_counter()-clock
             check_cancel(cancel)
+            raw_valid_total=valid_total
+            gap_reports={}
+            for i in selected:
+                check_cancel(cancel)
+                folder=stage/f'point_{i}'
+                clock=time.perf_counter()
+                gap_reports[i]=finalize_pose_csv(folder/'pose.raw.csv',folder/'pose.csv',fps=source['fps'],
+                    radius=supports[i]['radius'],gap_seconds=gap_seconds,gap_neighbors=gap_neighbors,
+                    rotation_period=cfg.rotation_period,fit_fields=FUSION_FIELDS)
+                times['interpolation_seconds']+=time.perf_counter()-clock
+                counts[i]=gap_reports[i]['usable_center_scale_frames']
+            valid_total=sum(counts.values())
+            if overlay_target and defer_overlay:
+                temporary_overlay=_render_saved_poses({i:stage/f'point_{i}/pose.csv' for i in selected},
+                    video,source,start,count,overlay_target,fps,max_width,options,times,progress,cancel)
             if not reused:
                 artifacts = {}
                 for i in selected:
                     folder = stage/f'point_{i}'
                     support = supports[i]
                     point_metadata = dict(schema_version=3,kind='rgb_point_pose',registration_method='correlation',
-                        method='unchanged masked log-polar FFT and robust similarity refinement',config=asdict(cfg),
+                        method='immutable original-reference correlation, independent coarse recovery and score/disagreement fusion',config=asdict(cfg),
                         video=os.path.relpath(video,poses[i].parent),point_tracks=os.path.relpath(tracks,poses[i].parent),
                         point_id=i,object_id=i,coordinate_space=DISPLAY_COORDINATE_SPACE,
                         display_rotation_degrees=display_rotation(source),source_size_px=[w,h],source_fps=source['fps'],fps=source['fps'],
@@ -319,19 +387,23 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                         reference_radius_px=support['radius'],template_radius_px=support['radius'],patch_support_source=support['source'],
                         rotation_convention='clockwise degrees relative to the initialized reference; overlay arrow points up at zero',
                         timestamp_convention='absolute source frame * 1e6 / source_fps; nominal RGB time',
-                        foreground='saved reference foreground transported by prior accepted image similarity; not per-frame segmentation',
+                        foreground='saved canonical reference foreground transported by each candidate similarity; recovery independent of recent support/scale; not per-frame segmentation',
                         center_semantics='x/y and output circle follow the selected query; mask_registration_center is the fitted foreground-bbox center',
                         scale_source='similarity',scale_measurement='image registration; fixed patch size is not measured object zoom',
                         valid_frames=counts[i],csv_sha256=file_digest(folder/'pose.csv'),timing=times,
+                        raw_csv='pose.raw.csv',raw_csv_sha256=file_digest(folder/'pose.raw.csv'),
+                        gap_processing=gap_reports[i],
+                        validity_semantics='fit_valid/rotation_fit_valid preserve native measurements; valid/rotation_valid are independently usable after explicitly flagged gap interpolation; filled fit-quality fields are blank',
                         point_end_frame=policy['point_end_frames'][str(i)])
                     require_no_output_references(point_metadata)
                     write_json(folder/'pose.json',point_metadata)
-                    for filename in ('pose.csv','pose.json'):
+                    for filename in ('pose.csv','pose.raw.csv','pose.json'):
                         relative=str(Path(f'point_{i}')/filename)
                         artifacts[relative]=file_digest(folder/filename)
                 manifest=dict(schema_version=1,kind='point_pose_refinement',input_signature=signature,
                     point_tracks=os.path.relpath(tracks,output_dir),video=os.path.relpath(video,output_dir),
-                    point_ids=selected,frames=count,valid_point_rows=valid_total,point_frames=point_frames,
+                    point_ids=selected,frames=count,valid_point_rows=valid_total,fit_valid_point_rows=raw_valid_total,point_frames=point_frames,
+                    gap_processing=dict(gap_seconds=gap_seconds,gap_neighbors=gap_neighbors),
                     artifacts=artifacts,config=asdict(cfg),timing=times)
                 require_no_output_references(manifest)
                 write_json(stage/'refinement.json',manifest)

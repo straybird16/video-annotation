@@ -16,7 +16,7 @@ except ImportError:
 from .tapnextpp import ROOT, contained_path
 
 
-FIELDS = (
+LOCAL_FIELDS = (
     ('patch_size', 'Registration patch size', int),
     ('min_score', 'Minimum fit score', float),
     ('reference_interval', 'Reference interval (frames)', int),
@@ -27,6 +27,15 @@ FIELDS = (
     ('rotation_smoothness', 'Rotation smoothness', float),
     ('scale_smoothness', 'Scale smoothness', float),
 )
+ANCHOR_FIELDS = (
+    ('anchor_preference', 'Original-anchor preference', float),
+    ('anchor_score_delta', 'Score advantage for 4× odds', float),
+    ('anchor_angle_tolerance', 'Angle agreement (degrees)', float),
+    ('anchor_scale_tolerance', 'Scale agreement (fraction)', float),
+    ('recovery_scale_min', 'Recovery minimum scale', float),
+    ('recovery_scale_max', 'Recovery maximum scale', float),
+)
+FIELDS = LOCAL_FIELDS + ANCHOR_FIELDS
 
 
 def parse_options(values):
@@ -39,12 +48,21 @@ def parse_options(values):
         max_frames = int(values['max_frames']) if str(values.get('max_frames', '')).strip() else None
     except ValueError as error:
         raise ValueError('Point IDs must be integers; radius and maximum frames must be numbers or blank') from error
+    try:
+        gap_seconds = float(values.get('gap_seconds', .1))
+        gap_neighbors = int(values.get('gap_neighbors', 2))
+    except ValueError as error:
+        raise ValueError('Gap duration must be seconds and gap neighbors a whole number') from error
     if point_ids is not None and any(value < 0 for value in point_ids):
         raise ValueError('Point IDs must be nonnegative')
     if radius is not None and (not 4 <= radius < float('inf')):
         raise ValueError('Patch radius must be finite and at least 4 pixels')
     if max_frames is not None and max_frames < 1:
         raise ValueError('Maximum frames must be positive or blank')
+    if not 0 <= gap_seconds < float('inf') or gap_neighbors < 0:
+        raise ValueError('Gap duration and gap neighbors must be finite and nonnegative; zero disables filling')
+    if gap_neighbors == 1:
+        raise ValueError('Gap neighbors must be at least two per side, or zero to disable filling')
     config = Config(support='circle', radius_blend=0., tracker_scale_weight=0., registration_scale_weight=1.)
     for name, label, kind in FIELDS:
         try:
@@ -53,7 +71,8 @@ def parse_options(values):
             raise ValueError(f'{label} must be {"an integer" if kind is int else "a number"}') from error
     config.fast = bool(values.get('fast', True))
     config.validate()
-    return dict(point_ids=point_ids, radius=radius, max_frames=max_frames, config=config)
+    return dict(point_ids=point_ids, radius=radius, max_frames=max_frames, config=config,
+                gap_seconds=gap_seconds, gap_neighbors=gap_neighbors)
 
 
 def timing_text(result):
@@ -65,7 +84,8 @@ def timing_text(result):
     text = (f"Refinement: {number('refinement_seconds', 's')} · "
             f"Mean: {number('mean_ms_per_point_frame', 'ms/point-frame')}\n"
             f"Setup: {number('setup_seconds', 's')} · Decode: {number('decode_seconds', 's')} · "
-            f"Adaptation: {number('adaptation_seconds', 's')} · "
+            f"Adaptation: {number('adaptation_seconds', 's')}\n"
+            f"Interpolation: {number('interpolation_seconds', 's')} · "
             f"Render: {number('render_seconds', 's')} · Wall: {number('wall_seconds', 's')}")
     if result.get('reused'):
         text += '\nSaved refinement reused; its recorded refinement measurements are shown.'
@@ -91,10 +111,11 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
         config = Config()
         self.variables = {name: tk.StringVar(value=str(getattr(config, name))) for name, _, _ in FIELDS}
         self.variables.update(point_ids=tk.StringVar(), radius=tk.StringVar(), max_frames=tk.StringVar(),
+                              gap_seconds=tk.StringVar(value='.1'), gap_neighbors=tk.StringVar(value='2'),
                               fast=tk.BooleanVar(value=True), overlay=tk.BooleanVar(value=True), force=tk.BooleanVar(value=False))
 
         ttk.Label(self, text='Point / patch pose refinement', style='Point.Title.TLabel').pack(anchor='w', pady=(0, 6))
-        ttk.Label(self, text='Correlation estimates rotation and scale around saved points; original tracks and references stay unchanged.',
+        ttk.Label(self, text='Anchored correlation estimates rotation and scale around saved points; short trusted gaps can be interpolated.',
                   wraplength=1100).pack(anchor='w')
         source = ttk.Frame(self); source.pack(fill='x', pady=9)
         ttk.Label(source, text='Point CSV:').pack(side='left')
@@ -106,18 +127,32 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
         form = ttk.LabelFrame(self, text='Refinement settings', padding=10)
         form.pack(fill='x', pady=6)
         basics = [('point_ids', 'Point IDs (blank = all)'), ('radius', 'Patch radius override (px; blank = saved)'),
-                  ('max_frames', 'Maximum source frames (blank = all)')]
-        for row, (name, label) in enumerate(basics):
-            self.field(form, row, 0, label, self.variables[name])
-        for index, (name, label, _) in enumerate(FIELDS):
+                  ('max_frames', 'Maximum source frames (blank = all)'),
+                  ('gap_seconds', 'Fill gaps up to (source seconds; 0 = off)'),
+                  ('gap_neighbors', 'Good neighbors per side (≥2; 0 = off)')]
+        for index, (name, label) in enumerate(basics):
+            self.field(form, index//2, (index % 2)*2, label, self.variables[name])
+        for index, (name, label, _) in enumerate(ANCHOR_FIELDS):
             self.field(form, 3+index//2, (index % 2)*2, label, self.variables[name])
         form.columnconfigure(1, weight=1); form.columnconfigure(3, weight=1)
+        advanced = ttk.LabelFrame(self, text='Local fitting and smoothness', padding=10)
+        for index, (name, label, _) in enumerate(LOCAL_FIELDS):
+            self.field(advanced, index//2, (index % 2)*2, label, self.variables[name])
+        advanced.columnconfigure(1, weight=1); advanced.columnconfigure(3, weight=1)
         options = ttk.Frame(self); options.pack(fill='x', pady=7)
         for name, label in [('fast', 'Fast correlation fitting'), ('overlay', 'Render overlay after refinement'),
                             ('force', 'Force recompute')]:
             widget = ttk.Checkbutton(options, text=label, variable=self.variables[name])
             widget.pack(side='left', padx=(0, 14)); self.controls.append(widget)
-        ttk.Label(self, text='Fixed point circles carry no scale estimate, so registration supplies scale. Overlay quality, FPS and size use Render settings.',
+        advanced_visible = tk.BooleanVar(value=False)
+        def toggle_advanced():
+            if advanced_visible.get():
+                advanced.pack(fill='x', pady=6, before=options)
+            else:
+                advanced.pack_forget()
+        widget = ttk.Checkbutton(options, text='Advanced settings', variable=advanced_visible, command=toggle_advanced)
+        widget.pack(side='left'); self.controls.append(widget)
+        ttk.Label(self, text='At equal agreeing fit scores, preference favors the original reference. Better scores can override it. Scale comes from image registration; overlays use final filled poses and Render settings.',
                   wraplength=1100).pack(anchor='w', pady=5)
         actions = ttk.Frame(self); actions.pack(fill='x', pady=7)
         self.button(actions, 'Run refinement', self.run)

@@ -43,7 +43,31 @@ class Config:
     rotation_min_peak_margin: float = .015
     rotation_max_innovation: float | None = None
 
+    # Interpretable anchored-point controls; legacy box/MI fitting ignores them.
+    anchor_preference: float = .8
+    anchor_score_delta: float = .05
+    anchor_angle_tolerance: float = 10.
+    anchor_scale_tolerance: float = .1
+    recovery_scale_min: float = .25
+    recovery_scale_max: float = 4.
+    recovery_angle_step: float = 15.
+    recovery_scale_step: float = 1.25
+
     def validate(self):
+        anchor = [self.anchor_preference, self.anchor_score_delta, self.anchor_angle_tolerance,
+                  self.anchor_scale_tolerance, self.recovery_scale_min, self.recovery_scale_max,
+                  self.recovery_angle_step, self.recovery_scale_step]
+        if (not np.isfinite(anchor).all() or not 0 < self.anchor_preference < 1
+                or self.anchor_score_delta <= 0 or not 0 < self.anchor_angle_tolerance <= 180
+                or self.anchor_scale_tolerance <= 0
+                or not 0 < self.recovery_scale_min <= 1 <= self.recovery_scale_max
+                or self.recovery_scale_min == self.recovery_scale_max
+                or not 1 <= self.recovery_angle_step <= 90 or self.recovery_scale_step <= 1.01):
+            raise ValueError('Invalid original-anchor preference, score/disagreement tolerances or recovery bounds.')
+        if (np.ceil(360/self.recovery_angle_step) *
+                (np.ceil(np.log(self.recovery_scale_max/self.recovery_scale_min)/np.log(self.recovery_scale_step))+3) > 20000):
+            raise ValueError('Recovery grid exceeds 20,000 coarse poses; use larger angle/scale steps.')
+
         if self.support not in ('box', 'circle'):
             raise ValueError('support must be box or circle.')
         if type(self.rotation_min_inliers) is not int or self.rotation_min_inliers < 4:
