@@ -1,0 +1,295 @@
+"""Responsive point-circle pose refinement using the shared correlation workflow."""
+from copy import deepcopy
+from pathlib import Path
+import queue
+import re
+import subprocess
+import sys
+import threading
+
+try:
+    import tkinter as tk
+    from tkinter import ttk, filedialog
+except ImportError:
+    tk = ttk = filedialog = None
+
+from .tapnextpp import ROOT, contained_path
+
+
+FIELDS = (
+    ('patch_size', 'Registration patch size', int),
+    ('min_score', 'Minimum fit score', float),
+    ('reference_interval', 'Reference interval (frames)', int),
+    ('iterations', 'Full-fit iterations', int),
+    ('fast_iterations', 'Fast-fit iterations', int),
+    ('scale_limit', 'Maximum scale ratio', float),
+    ('center_limit', 'Center limit / patch radius', float),
+    ('rotation_smoothness', 'Rotation smoothness', float),
+    ('scale_smoothness', 'Scale smoothness', float),
+)
+
+
+def parse_options(values):
+    """Snapshot and validate Tk strings before the worker starts."""
+    from video_annotation.pose.registration import Config
+    point_text = str(values.get('point_ids', '')).strip()
+    try:
+        point_ids = list(dict.fromkeys(int(value) for value in re.split(r'[\s,]+', point_text))) if point_text else None
+        radius = float(values['radius']) if str(values.get('radius', '')).strip() else None
+        max_frames = int(values['max_frames']) if str(values.get('max_frames', '')).strip() else None
+    except ValueError as error:
+        raise ValueError('Point IDs must be integers; radius and maximum frames must be numbers or blank') from error
+    if point_ids is not None and any(value < 0 for value in point_ids):
+        raise ValueError('Point IDs must be nonnegative')
+    if radius is not None and (not 4 <= radius < float('inf')):
+        raise ValueError('Patch radius must be finite and at least 4 pixels')
+    if max_frames is not None and max_frames < 1:
+        raise ValueError('Maximum frames must be positive or blank')
+    config = Config(support='circle', radius_blend=0., tracker_scale_weight=0., registration_scale_weight=1.)
+    for name, label, kind in FIELDS:
+        try:
+            setattr(config, name, kind(values[name]))
+        except (ValueError, TypeError) as error:
+            raise ValueError(f'{label} must be {"an integer" if kind is int else "a number"}') from error
+    config.fast = bool(values.get('fast', True))
+    config.validate()
+    return dict(point_ids=point_ids, radius=radius, max_frames=max_frames, config=config)
+
+
+def timing_text(result):
+    """Display measured workflow timings without guessing missing measurements."""
+    timing = result.get('timing', {})
+    def number(key, unit):
+        value = timing.get(key)
+        return '—' if value is None else f'{value:.3f} {unit}'
+    text = (f"Refinement: {number('refinement_seconds', 's')} · "
+            f"Mean: {number('mean_ms_per_point_frame', 'ms/point-frame')}\n"
+            f"Setup: {number('setup_seconds', 's')} · Decode: {number('decode_seconds', 's')} · "
+            f"Adaptation: {number('adaptation_seconds', 's')} · "
+            f"Render: {number('render_seconds', 's')} · Wall: {number('wall_seconds', 's')}")
+    if result.get('reused'):
+        text += '\nSaved refinement reused; its recorded refinement measurements are shown.'
+    return text
+
+
+class PoseRefinementTab(ttk.Frame if ttk is not None else object):
+    """Refine one selected saved point track while keeping the GUI responsive."""
+
+    def __init__(self, parent, owner):
+        if ttk is None:
+            raise RuntimeError('Pose refinement needs the existing Tk annotation runtime')
+        super().__init__(parent, padding=10)
+        from video_annotation.pose.registration import Config
+        self.owner = owner
+        self.busy = self.closed = self._owns_controller_busy = False
+        self.worker = self._poll_after = None
+        self.cancel, self.events = threading.Event(), queue.Queue()
+        self.controls, self.last_result = [], None
+        self.tracks_var = tk.StringVar()
+        self.status = tk.StringVar(value='Choose saved point tracks. Refines circular patches into center, rotation and scale.')
+        self.timings = tk.StringVar(value='Measured refinement and rendering time appears after completion.')
+        config = Config()
+        self.variables = {name: tk.StringVar(value=str(getattr(config, name))) for name, _, _ in FIELDS}
+        self.variables.update(point_ids=tk.StringVar(), radius=tk.StringVar(), max_frames=tk.StringVar(),
+                              fast=tk.BooleanVar(value=True), overlay=tk.BooleanVar(value=True), force=tk.BooleanVar(value=False))
+
+        ttk.Label(self, text='Point / patch pose refinement', style='Point.Title.TLabel').pack(anchor='w', pady=(0, 6))
+        ttk.Label(self, text='Correlation estimates rotation and scale around saved points; original tracks and references stay unchanged.',
+                  wraplength=1100).pack(anchor='w')
+        source = ttk.Frame(self); source.pack(fill='x', pady=9)
+        ttk.Label(source, text='Point CSV:').pack(side='left')
+        entry = ttk.Entry(source, textvariable=self.tracks_var)
+        entry.pack(side='left', fill='x', expand=True, padx=6); self.controls.append(entry)
+        self.button(source, 'Use current tracks', self.use_current_tracks)
+        self.button(source, 'Browse…', self.browse)
+
+        form = ttk.LabelFrame(self, text='Refinement settings', padding=10)
+        form.pack(fill='x', pady=6)
+        basics = [('point_ids', 'Point IDs (blank = all)'), ('radius', 'Patch radius override (px; blank = saved)'),
+                  ('max_frames', 'Maximum source frames (blank = all)')]
+        for row, (name, label) in enumerate(basics):
+            self.field(form, row, 0, label, self.variables[name])
+        for index, (name, label, _) in enumerate(FIELDS):
+            self.field(form, 3+index//2, (index % 2)*2, label, self.variables[name])
+        form.columnconfigure(1, weight=1); form.columnconfigure(3, weight=1)
+        options = ttk.Frame(self); options.pack(fill='x', pady=7)
+        for name, label in [('fast', 'Fast correlation fitting'), ('overlay', 'Render overlay after refinement'),
+                            ('force', 'Force recompute')]:
+            widget = ttk.Checkbutton(options, text=label, variable=self.variables[name])
+            widget.pack(side='left', padx=(0, 14)); self.controls.append(widget)
+        ttk.Label(self, text='Fixed point circles carry no scale estimate, so registration supplies scale. Overlay quality, FPS and size use Render settings.',
+                  wraplength=1100).pack(anchor='w', pady=5)
+        actions = ttk.Frame(self); actions.pack(fill='x', pady=7)
+        self.button(actions, 'Run refinement', self.run)
+        self.button(actions, 'Render overlay', lambda: self.run(overlay=True))
+        self.cancel_button = ttk.Button(actions, text='Cancel', command=self.cancel_processing, state='disabled')
+        self.cancel_button.pack(side='left', padx=4)
+        self.button(actions, 'Open refined-track folder', lambda: self.open_folder('tracks'))
+        self.button(actions, 'Open overlay folder', lambda: self.open_folder('overlay'))
+        ttk.Label(self, textvariable=self.timings, wraplength=1100, padding=(0, 10)).pack(anchor='w')
+        ttk.Label(self, textvariable=self.status, wraplength=1100).pack(anchor='w', pady=8)
+        self._poll_after = self.after(75, self.poll)
+        self.bind('<Destroy>', lambda event: self.close() if event.widget is self else None, add='+')
+
+    def button(self, parent, text, command):
+        widget = ttk.Button(parent, text=text, command=lambda: self.action(command))
+        widget.pack(side='left', padx=3, pady=2)
+        self.controls.append(widget)
+        return widget
+
+    def field(self, parent, row, column, label, variable):
+        ttk.Label(parent, text=label).grid(row=row, column=column, sticky='w', padx=(0, 8), pady=5)
+        widget = ttk.Entry(parent, textvariable=variable, width=13)
+        widget.grid(row=row, column=column+1, sticky='ew', padx=(0, 20), pady=5)
+        self.controls.append(widget)
+
+    def action(self, function):
+        try:
+            return function()
+        except Exception as error:
+            self.status.set(f'Failed: {error}')
+
+    def require_idle(self):
+        if self.closed:
+            raise ValueError('The refinement view has closed')
+        active = self.busy or getattr(self.owner.controller, 'busy', False)
+        for name in ('review', 'mask_review', 'mask_labeler'):
+            view = getattr(self.owner, name, None)
+            active = active or bool(getattr(view, 'busy', False)) or bool(getattr(getattr(view, 'controller', None), 'busy', False))
+        if active:
+            raise ValueError('Wait for the current job or cancel it first')
+
+    def use_current_tracks(self):
+        self.require_idle()
+        from .publication import preferred_tracks
+        video = Path(self.owner.controller.video).resolve()
+        review = getattr(self.owner, 'review', None)
+        model = getattr(review, 'model', None)
+        if model is not None and Path(model.video).resolve() == video:
+            if review.dirty:
+                raise ValueError('Save or discard current track corrections before refining them')
+            chosen = getattr(review, 'last_saved_path', None) or getattr(model, 'output', None)
+        else:
+            chosen = None
+        if chosen is None:
+            if self.owner.processor is None:
+                raise ValueError('Select a point tracker first, or browse saved tracks')
+            base = self.owner.processor.paths_for(video)['tracks']
+            variable = getattr(review, 'track_name', None)
+            name = variable.get().strip() if variable is not None else 'corrected/points.csv'
+            chosen = preferred_tracks(base, name=name or 'corrected/points.csv')
+        chosen = contained_path(chosen, 'data')
+        if not chosen.is_file():
+            raise ValueError(f'No saved point tracks at {chosen}; run tracking first or browse an existing CSV')
+        self.tracks_var.set(str(chosen))
+        self.status.set(f'Selected saved tracks: {chosen}')
+        return chosen
+
+    def browse(self):
+        self.require_idle()
+        path = filedialog.askopenfilename(parent=self, title='Choose saved point tracks',
+            initialdir=ROOT/'data/pseudo-ground-truths/point_tracks', filetypes=[('Point tracks', '*.csv')])
+        if path:
+            self.tracks_var.set(path)
+
+    def run(self, *, overlay=None):
+        self.require_idle()
+        if not self.tracks_var.get().strip():
+            self.use_current_tracks()
+        tracks = contained_path(self.tracks_var.get().strip(), 'data')
+        if not tracks.is_file():
+            raise ValueError(f'Point CSV does not exist: {tracks}')
+        values = {name: variable.get() for name, variable in self.variables.items()}
+        options = parse_options(values)
+        options.update(overlay=values['overlay'] if overlay is None else overlay,
+                       force=values['force'], overlay_fps=getattr(self.owner, 'overlay_fps', None),
+                       max_width=getattr(self.owner, 'max_width', 1280),
+                       render_options=deepcopy(getattr(self.owner, 'render_options', None)))
+        self.busy = self._owns_controller_busy = self.owner.controller.busy = True
+        self.cancel.clear()
+        for widget in self.controls:
+            widget.configure(state='disabled')
+        self.cancel_button.configure(state='normal')
+        self.status.set(f'Refining {tracks.name}…')
+        self.timings.set('Running; measured timing will appear when the job finishes.')
+        def work():
+            try:
+                from video_annotation.pose.workflow import refine_point_tracks
+                result = refine_point_tracks(tracks, **options, cancel=self.cancel.is_set,
+                    progress=lambda message: self.events.put(('progress', message)))
+                self.events.put(('done', result))
+            except BaseException as error:
+                self.events.put(('error', f'{type(error).__name__}: {error}'))
+            finally:
+                if self.closed:
+                    self.release_busy()
+        self.worker = threading.Thread(target=work, name='point-pose-refinement', daemon=False)
+        self.worker.start()
+
+    def release_busy(self):
+        self.busy = False
+        if self._owns_controller_busy:
+            self.owner.controller.busy = False
+            self._owns_controller_busy = False
+
+    def poll(self):
+        self._poll_after = None
+        if self.closed:
+            return
+        try:
+            while True:
+                kind, value = self.events.get_nowait()
+                if kind == 'progress':
+                    self.status.set(str(value))
+                    continue
+                self.release_busy()
+                for widget in self.controls:
+                    widget.configure(state='normal')
+                self.cancel_button.configure(state='disabled')
+                if kind == 'done':
+                    self.last_result = value
+                    self.timings.set(timing_text(value))
+                    self.status.set(f'Completed: {value.get("output_dir", value.get("output", ""))}')
+                else:
+                    self.status.set(f'Refinement stopped: {value}')
+        except queue.Empty:
+            pass
+        self._poll_after = self.after(75, self.poll)
+
+    def cancel_processing(self):
+        self.cancel.set()
+        if self.busy and not self.closed:
+            self.status.set('Cancelling at the next safe refinement boundary…')
+
+    def can_leave(self):
+        if self.busy:
+            self.status.set('Refinement is running. Cancel it or wait for completion before leaving.')
+            return False
+        return True
+
+    def open_folder(self, kind):
+        if not self.last_result:
+            raise ValueError('Run refinement first')
+        path = self.last_result.get('output_dir', self.last_result.get('output')) if kind == 'tracks' else self.last_result.get('overlay')
+        if not path:
+            raise ValueError('No overlay was rendered; use Render overlay first')
+        path = Path(path) if kind == 'tracks' else Path(path).parent
+        if not path.is_dir():
+            raise ValueError(f'Folder does not exist: {path}')
+        if sys.platform == 'win32':
+            import os
+            os.startfile(str(path))
+        else:
+            subprocess.Popen(['open' if sys.platform == 'darwin' else 'xdg-open', str(path)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.cancel.set()
+        if self._poll_after is not None:
+            self.after_cancel(self._poll_after)
+            self._poll_after = None
+        if self.worker is None or not self.worker.is_alive():
+            self.release_busy()

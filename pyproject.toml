@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Point/patch and SAM mask annotation, tracking, correction and portable overlays"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.24", "opencv-python>=4.8", "pillow>=10"]
+dependencies = ["numpy>=1.24", "opencv-python>=4.8", "pillow>=10", "scipy>=1.10"]
 
 [project.optional-dependencies]
 models = ["torch>=2.5", "torchvision"]

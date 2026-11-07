@@ -3,7 +3,7 @@
 Launch `video-annotate annotate --source-dir <workspace>/data/videos/rgb/<collection>`.
 The folder is searched recursively. Use `--workspace <workspace>` when launching
 outside its root. The GUI contains separate **Annotate points**, **Review tracks**,
-**SAM objects**, **Review masks** and **Render settings** tabs.
+**Refine pose**, **SAM objects**, **Review masks** and **Render settings** tabs.
 
 ## Points and patches
 
@@ -87,6 +87,17 @@ settings. Render all prefers the selected correction name, then legacy
 Rendering old CSVs applies the disappearance rule without rewriting those CSVs.
 **Render settings** controls compression, FPS, dimensions, frame limit and trails.
 Preview FPS never changes source time or tracking.
+
+## Refine point-patch pose
+
+Open **Refine pose**, select **Use current tracks** (prefers saved corrections)
+or browse a point CSV, then **Run refinement**. This estimates center, clockwise
+rotation and image-based scale using the saved circle/foreground as support.
+Fast correlation is the default; no model is loaded. Important controls and
+measured timing appear in the tab. **Render overlay** reuses matching refined
+poses, draws their circles and reliable rotation arrows, and uses the shared
+Render settings for quality, FPS, size and frame limit. Open-folder buttons locate
+the data and MP4. See [pose settings and output definitions](POSE_REFINEMENT.md).
 
 ## SAM objects and masks
 

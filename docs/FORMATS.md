@@ -47,3 +47,14 @@ Overlay videos mirror source folders under `outputs/videos/point_tracks/` or
 `outputs/videos/rgb_masks/`. Overlays use H.264 MP4, YUV420 and faststart.
 Rendering may filter visibility/trails, but never changes source coordinates or
 timing. Portable GUI session JSON stores settings, not model binaries or tracks.
+
+Point-patch pose refinement saves `refined-correlation/refinement.json` and
+`refined-correlation/point_<ID>/pose.csv` plus `pose.json` beside the input point
+CSV. Original and corrected inputs therefore have separate default pose folders.
+Each row retains absolute source frame, point ID and source-time timestamp;
+invalid input gaps/fits are flagged and ended points have no frozen pose tail.
+`scale` is fitted similarity scale, distinct from `bbox_scale`; the exported
+circle follows the selected query, with radius equal to its saved patch radius
+times fitted scale. `rotation_valid` gates arrows/evaluation separately from
+center/scale validity. Overlays mirror the source track hierarchy under
+`outputs/videos/point_pose/`; dataset metadata does not reference them.

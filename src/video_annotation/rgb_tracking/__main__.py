@@ -129,14 +129,39 @@ def parser():
     clean.add_argument("--reacquire-seconds", type=float, default=.5,
                        help="recovery window in source-video seconds (default 0.5; 0 ends immediately)")
     clean.add_argument("--dry-run", action="store_true", help="report changes without writing files")
+    refine = sub.add_parser("refine", help="refine point patches with fast correlation pose estimation")
+    refine.add_argument("--tracks", type=Path, required=True, help="original or corrected point CSV")
+    refine.add_argument("--output-dir", type=Path, help="data-local pose folder; default beside the input tracks")
+    refine.add_argument("--point-ids", type=int, nargs="+", help="stable point IDs; defaults to all")
+    refine.add_argument("--patch-radius", type=float, help="override saved patch radii; pixels")
+    refine.add_argument("--max-frames", type=positive)
+    refine.add_argument("--patch-size", type=positive, default=128)
+    refine.add_argument("--min-score", type=float, default=.75)
+    refine.add_argument("--full-search", action="store_true", help="disable the cheaper guarded local path")
+    refine.add_argument("--reference-interval", type=positive, default=10)
+    refine.add_argument("--iterations", type=positive, default=8)
+    refine.add_argument("--fast-iterations", type=positive, default=8)
+    refine.add_argument("--fast-samples", type=positive, default=2500)
+    refine.add_argument("--scale-limit", type=float, default=1.6)
+    refine.add_argument("--center-limit", type=float, default=.3)
+    refine.add_argument("--rotation-smoothness", type=float, default=.5)
+    refine.add_argument("--scale-smoothness", type=float, default=2.)
+    refine.add_argument("--tracker-center-weight", type=float, default=.9)
+    refine.add_argument("--registration-center-weight", type=float, default=.1)
+    refine.add_argument("--opencv-threads", type=positive, default=1)
+    refine.add_argument("--overlay", action="store_true", help="render a combined bounding-circle/rotation MP4")
+    refine.add_argument("--overlay-fps", type=float, help="preview speed only; source frame IDs/timestamps are preserved")
+    refine.add_argument("--max-width", type=positive, default=1280)
+    refine.add_argument("--force", action="store_true", help="recompute matching results")
     from .render_options import RENDER_PRESETS
-    for name in ('render', 'render-named', 'annotate', 'process'):
+    for name in ('render', 'render-named', 'annotate', 'process', 'refine'):
         command = sub.choices[name]
         command.add_argument('--render-max-frames', type=positive, help='preview limit only; does not shorten tracks')
         command.add_argument('--crf', type=int, help='H.264 quality 0–51; lower is higher quality (default 18)')
         command.add_argument('--preset', choices=RENDER_PRESETS)
-        command.add_argument('--trails', action=argparse.BooleanOptionalAction, default=None)
-        command.add_argument('--trail-length', type=positive)
+        if name != 'refine':
+            command.add_argument('--trails', action=argparse.BooleanOptionalAction, default=None)
+            command.add_argument('--trail-length', type=positive)
     sub.add_parser("migrate", help="move legacy point tracks/overlays into source-matching folders without inference")
     return p
 
@@ -335,6 +360,21 @@ def saved_track_files(master):
     return paths
 
 
+def refine_command(args):
+    from ..pose.registration import Config
+    from ..pose.workflow import refine_point_tracks
+    config = Config(support="circle", radius_blend=0., tracker_scale_weight=0., registration_scale_weight=1.,
+        **{name:getattr(args, name) for name in ("patch_size", "min_score", "reference_interval", "iterations",
+            "fast_iterations", "fast_samples", "scale_limit", "center_limit", "rotation_smoothness",
+            "scale_smoothness", "tracker_center_weight", "registration_center_weight")}, fast=not args.full_search)
+    result = refine_point_tracks(args.tracks, output_dir=args.output_dir, point_ids=args.point_ids,
+        config=config, radius=args.patch_radius, max_frames=args.max_frames, overlay=args.overlay,
+        overlay_fps=args.overlay_fps, max_width=args.max_width, force=args.force,
+        render_options=rendering_configuration(args), opencv_threads=args.opencv_threads,
+        progress=lambda value: print(value, flush=True))
+    print(json.dumps(result, indent=2))
+
+
 def benchmark(args):
     output = contained_path(args.output, "outputs")
     begin = time.perf_counter()
@@ -431,6 +471,8 @@ def main(argv=None):
             from .cleanup_tracks import cleanup_saved_tracks
             print(json.dumps(cleanup_saved_tracks(saved_track_files(args.master),
                 reacquire_seconds=args.reacquire_seconds, dry_run=args.dry_run), indent=2))
+        elif args.command == "refine":
+            refine_command(args)
         elif args.command in ('render-named', 'export-ready'):
             from .publication import render_named_tracks, export_ready_tracks
             if args.command == 'render-named':

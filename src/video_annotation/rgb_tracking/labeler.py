@@ -163,16 +163,18 @@ class PointLabeler:
         self.notebook.pack(fill="both", expand=True)
         annotation_parent = self.annotation_frame = ttk.Frame(self.notebook)
         self.review_frame = ttk.Frame(self.notebook)
+        self.pose_frame = ttk.Frame(self.notebook)
         self.sam_frame = ttk.Frame(self.notebook)
         self.mask_review_frame = ttk.Frame(self.notebook)
         self.render_frame = ttk.Frame(self.notebook)
         self.notebook.add(annotation_parent, text="Annotate points")
         self.notebook.add(self.review_frame, text="Review tracks")
+        self.notebook.add(self.pose_frame, text="Refine pose")
         self.notebook.add(self.sam_frame, text="SAM objects")
         self.notebook.add(self.mask_review_frame, text="Review masks")
         self.notebook.add(self.render_frame, text="Render settings")
         self.review = None
-        self.mask_labeler = self.mask_review = None
+        self.mask_labeler = self.mask_review = self.pose_view = None
         self._active_tab, self._changing_tab = str(annotation_parent), False
         self.notebook.bind("<<NotebookTabChanged>>", self.tab_changed)
         header = ttk.Frame(annotation_parent, padding=8)
@@ -360,6 +362,8 @@ class PointLabeler:
             allowed = False
         elif self._active_tab == str(self.review_frame) and self.review is not None:
             allowed = self.review.can_leave()
+        elif self._active_tab == str(getattr(self, "pose_frame", None)) and self.pose_view is not None:
+            allowed = self.pose_view.can_leave()
         elif self._active_tab == str(getattr(self, "sam_frame", None)) and self.mask_labeler is not None:
             if self.mask_labeler.controller.busy:
                 self.status.set("Cancel or finish SAM processing before switching views.")
@@ -385,7 +389,11 @@ class PointLabeler:
                 self.messages.showerror("Track review unavailable", str(error), parent=self.root)
                 return
         try:
-            if selected == str(getattr(self, "sam_frame", None)) and self.mask_labeler is None:
+            if selected == str(getattr(self, "pose_frame", None)) and self.pose_view is None:
+                from .pose_gui import PoseRefinementTab
+                self.pose_view = PoseRefinementTab(self.pose_frame, self)
+                self.pose_view.pack(fill="both", expand=True)
+            elif selected == str(getattr(self, "sam_frame", None)) and self.mask_labeler is None:
                 from video_annotation.mask_tracking.annotations import MaskController
                 from video_annotation.mask_tracking.labeler import MaskLabeler
                 from video_annotation.mask_tracking.workflow import Processor as MaskProcessor
@@ -407,7 +415,8 @@ class PointLabeler:
             self._changing_tab = True
             self.notebook.select(self._active_tab)
             self._changing_tab = False
-            self.messages.showerror("Mask view unavailable", str(error), parent=self.root)
+            title = "Pose refinement unavailable" if selected == str(getattr(self, "pose_frame", None)) else "Mask view unavailable"
+            self.messages.showerror(title, str(error), parent=self.root)
             return
         self._active_tab = selected
 
@@ -998,6 +1007,12 @@ class PointLabeler:
         """Extension hook for applying optional results on the Tk main thread."""
 
     def close(self):
+        pose = getattr(self, "pose_view", None)
+        if pose is not None and pose.busy:
+            pose.cancel_processing()
+            self.status.set("Cancelling pose refinement before closing; waiting for the active fit/encoder call.")
+            self.root.after(100, self.close)
+            return
         mask_review = getattr(self, "mask_review", None)
         if mask_review is not None and not mask_review.can_leave():
             return
@@ -1042,6 +1057,10 @@ class PointLabeler:
 
     def _destroy_window(self):
         try:
+            pose = getattr(self, "pose_view", None)
+            if pose is not None:
+                pose.close()
+                self.pose_view = None
             mask_review = getattr(self, "mask_review", None)
             if mask_review is not None:
                 mask_review.close()
@@ -1066,6 +1085,10 @@ class PointLabeler:
 
     def _window_destroyed(self, event):
         if event.widget is self.root:
+            pose = getattr(self, "pose_view", None)
+            if pose is not None:
+                pose.close()
+                self.pose_view = None
             mask_review = getattr(self, "mask_review", None)
             if mask_review is not None:
                 mask_review.close()

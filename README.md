@@ -3,7 +3,7 @@
 [GitHub](https://github.com/straybird16/video-annotation)
 
 A desktop GUI and batch CLI for point/patch tracking, SAM object-mask tracking,
-manual correction and compressed MP4 overlays. Point and object annotations have
+manual correction, point-patch pose refinement and compressed MP4 overlays. Point and object annotations have
 separate views and persistent IDs. KLT and manual drawing run on CPU; SAM2.1,
 SAM3.1 and TAPNext++ load only when requested.
 
@@ -49,6 +49,9 @@ video-annotate clean --master data/pseudo-ground-truths/point_tracks/my_collecti
 video-annotate process --source-dir data/videos/rgb/my_collection \
   --tracker klt-template --motion-model adaptive --render-only --overlay-fps 120
 
+# Refine saved/corrected point patches into center, rotation and scale.
+video-annotate refine --tracks data/pseudo-ground-truths/point_tracks/SEQUENCE/klt-template/adaptive/corrected/points.csv --overlay
+
 # Separate SAM object annotation view/CLI (optional models required for inference).
 video-mask annotate --source-dir data/videos/rgb/my_collection --tracker sam31
 ```
@@ -58,6 +61,7 @@ video-mask annotate --source-dir data/videos/rgb/my_collection --tracker sam31
 Use each command's `--help` for its options.
 
 - [Annotation, correction and batch workflow](docs/USAGE.md)
+- [Point-patch pose refinement and timing](docs/POSE_REFINEMENT.md)
 - [Reference/track formats and workspace layout](docs/FORMATS.md)
 - [KLT algorithm and parameter explanations](src/video_annotation/guides/KLT_PARAMETERS.md)
 - [Optional model installation and revisions](docs/OPTIONAL_MODELS.md)
