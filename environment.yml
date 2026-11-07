@@ -1,0 +1,16 @@
+name: video-annotation
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12
+  - numpy=1.26
+  - opencv=4.11
+  - scipy>=1.11
+  - pillow>=10
+  # Linux Xft build: antialiased GUI text, unlike Tk's noxft variant.
+  - tk=8.6.13=xft_*
+  - fontconfig
+  - fonts-conda-ecosystem
+  - ffmpeg
+  - pip

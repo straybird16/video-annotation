@@ -1,0 +1,22 @@
+# Provenance and notices
+
+Extracted on 2026-11-06 from https://github.com/straybird16/EventTracking
+(workspace HEAD `16a547e22138bbcea6c2ec9a351dab56ea8365a0`). The extraction includes working-tree GUI code that
+was not yet committed there; that commit alone does not reproduce this snapshot.
+Original milestones and contributor reports remain in Event/HISTORY.md and its
+docs/reports/. The initial standalone snapshot is maintained here from now on.
+
+The first-party point/SAM GUI and adapters came from scripts/rgb_tracking/ and
+scripts/mask_tracking/. common/ contains selected helper implementations from
+Event/scripts/{temporal_mapping,tracking_pose,pipeline}, tracking_geometry.py,
+rgb_tracker_adapter.py and dataset.py. Their source attribution is retained in
+module docstrings. The Event originals remain in place because its pipelines
+also use them. This project has no import/runtime dependency on Event.
+
+Upstream model implementations and weights are not redistributed. models.json
+records inspected source revisions; LICENSES/ retains their license notices.
+The SAM3 patch modifies the separately installed upstream source. Review the
+upstream source/model license when obtaining those optional assets.
+
+No first-party distribution license has been selected in this extraction.
+Upstream notices do not license the first-party application by implication.

@@ -1,0 +1,91 @@
+diff --git a/sam3/model/io_utils.py b/sam3/model/io_utils.py
+index 4e76f04..1dc3729 100644
+--- a/sam3/model/io_utils.py
++++ b/sam3/model/io_utils.py
+@@ -342,7 +342,7 @@ def load_video_frames_from_video_file_using_cv2(
+         )
+ 
+     # Convert to tensor
+-    frames_np = np.stack(frames, axis=0).astype(np.float32)  # (T, H, W, C)
++    frames_np = np.stack(frames, axis=0).astype(np.float32) / 255.0  # (T, H, W, C)
+     video_tensor = torch.from_numpy(frames_np).permute(0, 3, 1, 2)  # (T, C, H, W)
+ 
+     # pyrefly: ignore [bad-assignment]
+diff --git a/sam3/model/sam3_base_predictor.py b/sam3/model/sam3_base_predictor.py
+index 33ccf8c..4425262 100644
+--- a/sam3/model/sam3_base_predictor.py
++++ b/sam3/model/sam3_base_predictor.py
+@@ -154,6 +154,16 @@ class Sam3BasePredictor:
+             init_kwargs["async_loading_frames"] = self.async_loading_frames
+         if hasattr(self, "video_loader_type"):
+             init_kwargs["video_loader_type"] = self.video_loader_type
++        # SAM3.1 multiplex init_state has no state-offload argument. Keep the
++        # shared API's default usable without silently ignoring a true request.
++        import inspect
++
++        parameters = inspect.signature(self.model.init_state).parameters
++        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
++        if "offload_state_to_cpu" not in parameters and not accepts_kwargs:
++            if offload_state_to_cpu:
++                raise NotImplementedError(f"{type(self.model).__name__} does not support state offloading")
++            init_kwargs.pop("offload_state_to_cpu")
+         inference_state = self.model.init_state(**init_kwargs)
+ 
+         if not session_id:
+diff --git a/sam3/model/sam3_multiplex_tracking.py b/sam3/model/sam3_multiplex_tracking.py
+index 1b6ce7d..fc2873f 100644
+--- a/sam3/model/sam3_multiplex_tracking.py
++++ b/sam3/model/sam3_multiplex_tracking.py
+@@ -1241,10 +1241,9 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
+     def _build_sam2_output(
+         self, inference_state, frame_idx, refined_obj_id_to_mask=None
+     ):
+-        if not frame_idx in inference_state["cached_frame_outputs"]:
+-            return {}
+-
+-        cached_outputs = inference_state["cached_frame_outputs"][frame_idx]
++        # A point-only session has no detector cache on subsequent frames.
++        # Merge its new tracker predictions even when the base cache is empty.
++        cached_outputs = inference_state["cached_frame_outputs"].get(frame_idx, {})
+         obj_id_to_mask = cached_outputs.copy()
+ 
+         # Update with refined masks if provided
+diff --git a/sam3/model/video_tracking_multiplex.py b/sam3/model/video_tracking_multiplex.py
+index 869ed22..1e161c5 100644
+--- a/sam3/model/video_tracking_multiplex.py
++++ b/sam3/model/video_tracking_multiplex.py
+@@ -2812,7 +2812,10 @@ def _append(
+     # pyre-fixme[26]: TypedDict key must be a string literal.
+     # pyre-fixme[6]: For 1st argument expected `Union[List[Tensor], tuple[Tensor,
+     #  ...]]` but got `List[Union[Set[int], Tensor]]`.
+-    d1[k1] = torch.cat([d1[k1], d2[k2]], dim=dim)
++    # Reconditioning can produce CUDA tensors for CPU-offloaded history.
++    # Keep the destination's storage policy when adding new object entries.
++    incoming = d2[k2].to(device=d1[k1].device, dtype=d1[k1].dtype)
++    d1[k1] = torch.cat([d1[k1], incoming], dim=dim)
+ 
+ 
+ def _merge(
+@@ -2831,7 +2834,8 @@ def _merge(
+     # pyre-fixme[16]: `set` has no attribute `__setitem__`.
+     # pyre-fixme[26]: TypedDict key must be a string literal.
+     # pyre-fixme[16]: `set` has no attribute `dtype`.
+-    d1[k1][d2_idx] = d2[k2].to(dtype=d1[k1].dtype)
++    # Indexed assignment does not copy CUDA decoder results into CPU history.
++    d1[k1][d2_idx] = d2[k2].to(device=d1[k1].device, dtype=d1[k1].dtype)
+ 
+ 
+ class VideoTrackingDynamicMultiplex(VideoTrackingMultiplex):
+diff --git a/sam3/model_builder.py b/sam3/model_builder.py
+index 64c6308..492f323 100644
+--- a/sam3/model_builder.py
++++ b/sam3/model_builder.py
+@@ -1119,7 +1119,7 @@ def build_sam3_multiplex_video_predictor(
+ 
+     # Build tracker
+     tracker_model = build_sam3_multiplex_video_model(
+-        checkpoint_path=checkpoint_path,
++        checkpoint_path=None,  # The merged detector/tracker checkpoint is loaded below.
+         load_from_HF=False,
+         multiplex_count=multiplex_count,
+         use_fa3=use_fa3,

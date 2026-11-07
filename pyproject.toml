@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video-annotation"
+version = "0.1.0"
+description = "Point/patch and SAM mask annotation, tracking, correction and portable overlays"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "opencv-python>=4.8", "pillow>=10"]
+
+[project.optional-dependencies]
+models = ["torch>=2.5", "torchvision"]
+
+[project.scripts]
+video-annotate = "video_annotation.__main__:main"
+video-mask = "video_annotation.__main__:masks"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+video_annotation = ["guides/*.md"]

@@ -1,0 +1,417 @@
+"""Label RGB points, choose a tracker, and render portable MP4 previews."""
+from __future__ import annotations
+
+from ..paths import configure_cli
+if __name__ == "__main__":
+    import sys
+    sys.argv[1:] = configure_cli()
+
+import argparse
+import json
+from pathlib import Path
+import sys
+import time
+
+import numpy as np
+
+from .tapnextpp import (DEFAULT_REPO, Tracker, chunks, contained_path,
+                       track_paths, video_frames, write_json)
+
+
+def positive(value):
+    result = int(value)
+    if result < 1:
+        raise argparse.ArgumentTypeError("must be positive")
+    return result
+
+
+def nonnegative(value):
+    result = int(value)
+    if result < 0:
+        raise argparse.ArgumentTypeError("must be zero or positive")
+    return result
+
+
+def parser():
+    p = argparse.ArgumentParser(description=__doc__, epilog="Locations: --workspace DIR (default: current directory); --models-root DIR (optional model checkouts/weights). Relative file arguments use the current directory.")
+    sub = p.add_subparsers(dest="command", required=True)
+    descriptions = {
+        "check": "check the TAPNext++ model and runtime",
+        "track": "track explicit points in one video",
+        "benchmark": "measure temporal batching throughput",
+        "annotate": "pick and save points across a video folder; optionally track and render",
+        "process": "track saved point references across a folder without the GUI",
+    }
+    from .backends import BACKENDS, DEFAULT_BACKEND
+    for name, description in descriptions.items():
+        s = sub.add_parser(name, help=description, description=description)
+        tap_only = name in ("check", "benchmark")
+        if not tap_only:
+            s.add_argument("--reacquire-seconds", type=float,
+                           help="allow tracker recovery within this many source-video seconds (default 0.5; 0 ends immediately)")
+            s.add_argument("--tracker", choices=BACKENDS, default=DEFAULT_BACKEND,
+                           help="point tracking algorithm (default: %(default)s)")
+            s.add_argument("--tracker-options", type=Path,
+                           help="JSON object of algorithm-specific options; unknown keys fail")
+            s.add_argument("--lk-window", type=positive, help="KLT window side length (odd pixels)")
+            s.add_argument("--fb-threshold", type=float, help="KLT forward/backward limit in pixels")
+            s.add_argument("--patch-radius", type=positive, help="local support/template radius in pixels")
+            s.add_argument("--reanchor-interval", type=positive, help="klt-template registration period in frames")
+            s.add_argument("--motion-model", choices=("similarity", "affine", "homography", "adaptive"),
+                           help="local geometric model for klt-affine/klt-template (default: similarity)")
+            s.add_argument("--keyframe-interval", type=nonnegative,
+                           help="klt-template validated keyframe period; 0 disables (default)")
+        s.add_argument("--repo", type=Path, default=DEFAULT_REPO if tap_only else None,
+                       help="TAPNext++ checkout")
+        s.add_argument("--checkpoint", type=Path, help="TAPNext++ checkpoint")
+        s.add_argument("--resolution", type=int, choices=(256, 512), default=512 if tap_only else None,
+                       help="TAPNext++ image input side (default: 512)")
+        s.add_argument("--device", default="cuda" if tap_only else None, help="TAPNext++ device (default: cuda)")
+        s.add_argument("--precision", choices=("auto", "none", "float16", "bfloat16"),
+                       default="auto" if tap_only else None, help="TAPNext++ precision")
+        s.add_argument("--compile", action="store_true", default=False if tap_only else None,
+                       help="experimental TAPNext++ compilation; included in timings")
+        s.add_argument("--threads", type=positive, default=8 if tap_only else None,
+                       help="CPU worker threads (default: 8)")
+    track = sub.choices["track"]
+    track.add_argument("--video", type=Path, required=True)
+    queries = track.add_mutually_exclusive_group(required=True)
+    queries.add_argument("--query", type=float, nargs=2, action="append", metavar=("X", "Y"))
+    queries.add_argument("--queries", type=Path, help='reference CSV with JSON sidecar, or JSON: {"frame":0,"points_xy":[[x,y],...]}')
+    track.add_argument("--frame", type=int, default=0, help="zero-based query frame; JSON frame takes precedence")
+    track.add_argument("--batch-size", type=positive,
+                       help="consecutive frames per call; KLT default 1, TAP default 1 at 512 / 32 at 256")
+    track.add_argument("--max-frames", type=positive)
+    track.add_argument("--output", type=Path, required=True, help="point CSV, under data/")
+    track.add_argument("--profile", type=Path, help="optional timing JSON, under outputs/")
+    bench = sub.choices["benchmark"]
+    bench.add_argument("--video", type=Path, help="otherwise use a reproducible moving synthetic texture")
+    bench.add_argument("--frames", type=positive, default=33)
+    bench.add_argument("--points", type=positive, default=256)
+    bench.add_argument("--batch-sizes", type=positive, nargs="+", default=[1, 8, 32])
+    bench.add_argument("--output", type=Path, required=True, help="timing/correctness JSON, under outputs/")
+    for name in ("annotate", "process"):
+        command = sub.choices[name]
+        command.add_argument("--source-dir", type=Path, help="RGB folder; may be supplied by --config")
+        command.add_argument("--config", type=Path, help="saved GUI session settings; explicit flags override them")
+        command.add_argument("--no-recursive", action="store_true")
+        command.add_argument("--batch-size", type=positive)
+        command.add_argument("--max-frames", type=positive)
+        command.add_argument("--overlay", action="store_true", help="save a portable MP4 sanity preview; enables tracking in annotate")
+        command.add_argument("--overlay-fps", type=float, help="preview FPS only; defaults to source metadata")
+        command.add_argument("--max-width", type=positive, default=1280, help="maximum overlay width")
+    sub.choices["annotate"].add_argument("--frame", type=int, default=0, help="default query frame for unlabeled videos")
+    sub.choices["annotate"].add_argument("--track", action="store_true", help="track after saving each video's points")
+    sub.choices["process"].add_argument("--force", action="store_true", help="recompute matching tracks; prior results preserved")
+    sub.choices["process"].add_argument("--render-only", action="store_true", help="render existing predictions across the folder, without tracking")
+    sub.choices["process"].add_argument("--corrected-name", default="corrected/points.csv",
+                                        help="prefer these saved corrections relative to each prediction folder when rendering")
+    render = sub.add_parser("render", help="render an existing point CSV without loading the model")
+    render.add_argument("--tracks", type=Path, required=True)
+    render.add_argument("--output", type=Path, required=True)
+    render.add_argument("--fps", type=float, help="preview FPS, not physical playback/label timing")
+    render.add_argument("--max-width", type=positive, default=1280)
+    render.add_argument("--force", action="store_true")
+    render.add_argument("--reacquire-seconds", type=float, help="override stored recovery window in source-video seconds")
+    for name in ('render-named', 'export-ready'):
+        command = sub.add_parser(name, help='render or export uniformly named corrected tracks across a master folder')
+        command.add_argument('--master', type=Path, default=Path('data/pseudo-ground-truths/point_tracks'))
+        command.add_argument('--name', default='corrected/points.csv', help='CSV path relative to each prediction folder')
+        command.add_argument('--output-dir', type=Path, required=name == 'export-ready')
+    sub.choices['render-named'].add_argument('--fps', type=float)
+    sub.choices['render-named'].add_argument('--max-width', type=positive, default=1280)
+    sub.choices['render-named'].add_argument('--reacquire-seconds', type=float)
+    from .render_options import RENDER_PRESETS
+    for name in ('render', 'render-named', 'annotate', 'process'):
+        command = sub.choices[name]
+        command.add_argument('--render-max-frames', type=positive, help='preview limit only; does not shorten tracks')
+        command.add_argument('--crf', type=int, help='H.264 quality 0–51; lower is higher quality (default 18)')
+        command.add_argument('--preset', choices=RENDER_PRESETS)
+        command.add_argument('--trails', action=argparse.BooleanOptionalAction, default=None)
+        command.add_argument('--trail-length', type=positive)
+    sub.add_parser("migrate", help="move legacy point tracks/overlays into source-matching folders without inference")
+    return p
+
+
+def tracking_configuration(args):
+    """Resolve model-specific options before opening videos or writing artifacts."""
+    from .backends import validate_backend_options
+    options = dict(getattr(args, '_session_tracker_options', {}))
+    if args.tracker_options:
+        supplied = json.loads(args.tracker_options.read_text())
+        if not isinstance(supplied, dict):
+            raise ValueError("--tracker-options must contain a JSON object")
+        options.update(supplied)
+    overrides = {"win_size": args.lk_window, "fb_threshold": args.fb_threshold,
+                 "patch_radius": args.patch_radius, "reanchor_interval": args.reanchor_interval,
+                 "motion_model": args.motion_model, "keyframe_interval": args.keyframe_interval}
+    options.update({key: value for key, value in overrides.items() if value is not None})
+    tap_flags = ("repo", "checkpoint", "resolution", "device", "precision", "compile")
+    explicit = ["--" + key.replace("_", "-") for key in tap_flags if getattr(args, key) is not None]
+    if args.tracker != "tapnextpp" and explicit:
+        raise ValueError(f"{' '.join(explicit)} only apply to --tracker tapnextpp")
+    tap = dict(repo=args.repo or DEFAULT_REPO, checkpoint=args.checkpoint,
+               resolution=args.resolution or 512, device=args.device or "cuda",
+               precision=args.precision or "auto", compile_model=bool(args.compile), threads=args.threads or 8)
+    if args.tracker == "tapnextpp":
+        canonical = validate_backend_options(args.tracker, options)
+    else:
+        from .klt import available_options
+        inapplicable = sorted(set(options) - set(available_options(args.tracker)))
+        if inapplicable:
+            raise ValueError(f"{', '.join(inapplicable)} not applicable to {args.tracker}")
+        if args.threads is not None:
+            options["threads"] = args.threads
+        else:
+            options.setdefault("threads", 8)
+        canonical = validate_backend_options(args.tracker, options)
+    return canonical, tap
+
+
+def resolve_session_args(args, argv):
+    if args.command not in ('annotate', 'process'):
+        return
+    if args.config:
+        from .session import load_settings
+        value = load_settings(args.config)
+        explicit = {arg.split('=', 1)[0] for arg in argv if arg.startswith('--')}
+        if '--tracker' not in explicit:
+            args.tracker = value['tracker']
+        args._session_tracker_options = (value['tracker_options']
+                                        if args.tracker == value['tracker'] else {})
+        for key in ('source_dir', 'batch_size', 'max_frames', 'reacquire_seconds', 'overlay_fps', 'max_width', 'frame'):
+            if hasattr(args, key) and '--'+key.replace('_', '-') not in explicit:
+                setattr(args, key, value[key])
+        if '--no-recursive' not in explicit:
+            args.no_recursive = not value['recursive']
+        for key in ('mask_color', 'mask_alpha', 'mask_visible'):
+            setattr(args, key, value[key])
+        args._render_options = value['render_options']
+        if args.tracker == 'tapnextpp':
+            for key, setting in value['tap_options'].items():
+                flag = '--compile' if key == 'compile_model' else '--'+key.replace('_', '-')
+                if flag not in explicit:
+                    setattr(args, 'compile' if key == 'compile_model' else key, setting)
+    if not args.source_dir:
+        raise ValueError('Provide --source-dir or load a --config containing source_dir')
+
+
+def rendering_configuration(args):
+    from .render_options import normalize_render_options
+    value = dict(getattr(args, '_render_options', {}))
+    for key in ('crf', 'preset', 'trails', 'trail_length', 'max_frames'):
+        field = 'render_max_frames' if key == 'max_frames' else key
+        setting = getattr(args, field, None)
+        if setting is not None:
+            value[key] = setting
+    return normalize_render_options(value)
+
+
+def load_tracker(args):
+    begin = time.perf_counter()
+    if hasattr(args, "tracker"):
+        from .backends import make_tracker
+        options, tap = tracking_configuration(args)
+        tracker = make_tracker(args.tracker, options, **tap) if args.tracker == "tapnextpp" else make_tracker(args.tracker, options)
+    else:
+        tracker = Tracker(repo=args.repo, checkpoint=args.checkpoint, resolution=args.resolution,
+                          device=args.device, precision=args.precision, compile_model=args.compile,
+                          threads=args.threads)
+    tracker.synchronize()
+    return tracker, time.perf_counter() - begin
+
+
+def track(args):
+    from .workflow import export_tracks
+    from video_annotation.common.video import probe_video
+    from .annotations import validate_reference
+    from .video_geometry import DISPLAY_COORDINATE_SPACE, display_rotation
+    setup_begin = time.perf_counter()
+    tracking_configuration(args)
+    batch_size = args.batch_size or (32 if args.tracker == "tapnextpp" and args.resolution == 256 else 1)
+    output, video = track_paths(args.output, args.video, args.queries)
+    profile = contained_path(args.profile, "outputs") if args.profile else None
+    points, frame = args.query, args.frame
+    query = {"frame": frame, "points_xy": points}
+    if args.queries:
+        from .annotations import read_reference_file
+        query = read_reference_file(args.queries)
+        points, frame = query["points_xy"], query.get("frame", frame)
+        query = {**query, "frame": frame}
+    source = probe_video(video)[0]
+    # Literal queries and the historical minimal CLI query JSON use displayed
+    # coordinates. Source-adjacent saved references carry dimensions, allowing
+    # safe recovery of old encoded-raster annotations instead of guessing.
+    if not args.queries or ("width" not in query and "height" not in query and "coordinate_space" not in query):
+        query.update(coordinate_space=DISPLAY_COORDINATE_SPACE,
+                     display_rotation_degrees=display_rotation(source))
+    reference = validate_reference(query, video, source["width"], source["height"], source=source)
+    points, frame = reference["points_xy"], reference["frame"]
+    if frame >= source["number_of_frames"]:
+        raise ValueError("query frame is outside the video")
+    tracker, load_seconds = load_tracker(args)
+    provenance_begin = time.perf_counter()
+    provenance = tracker.provenance()
+    provenance_seconds = time.perf_counter() - provenance_begin
+    setup_seconds = time.perf_counter() - setup_begin
+    from .regions import load_patch_regions
+    patch_regions = load_patch_regions(reference, video, tracker.config.patch_radius) if args.tracker != "tapnextpp" and "patches" in reference else None
+    result = export_tracks(video, points, frame, output, tracker, batch_size=batch_size,
+                           max_frames=args.max_frames, provenance=provenance, source=source, patch_regions=patch_regions,
+                           point_ids=reference.get("point_ids"),
+                           reacquire_seconds=.5 if args.reacquire_seconds is None else args.reacquire_seconds)
+    result.update(load_seconds=load_seconds, provenance_seconds=provenance_seconds,
+                  setup_seconds=setup_seconds)
+    if profile:
+        write_json(profile, result)
+    print(json.dumps(result, indent=2))
+
+
+def folder_command(args):
+    from .annotations import PointController, discover_videos, reference_path
+    from .workflow import Processor
+    options, tap = tracking_configuration(args)
+    skipped = []
+    videos = discover_videos(args.source_dir, not args.no_recursive, skipped)
+    for video, reason in skipped:
+        print(f"Skipped {video}: {reason}", flush=True)
+    if not videos:
+        raise ValueError("no valid source videos found")
+    print(f"Found {len(videos)} source videos. Saved point references are reloaded automatically.", flush=True)
+    processor = Processor(backend=args.tracker, backend_options=options, **tap,
+                          batch_size=args.batch_size, max_frames=args.max_frames, source_root=args.source_dir,
+                          reacquire_seconds=.5 if args.reacquire_seconds is None else args.reacquire_seconds)
+    if args.command == "annotate":
+        from .labeler import PointLabeler
+        PointLabeler(PointController(videos, args.frame, default_radius=options.get("patch_radius",32),
+                                    source_dir=args.source_dir, recursive=not args.no_recursive), processor,
+                     track=args.track or args.overlay, overlay=args.overlay,
+                     overlay_fps=args.overlay_fps, max_width=args.max_width,
+                     mask_color=getattr(args, 'mask_color', '#45b8e8'),
+                     mask_alpha=getattr(args, 'mask_alpha', .3),
+                     mask_visible=getattr(args, 'mask_visible', True),
+                     render_options=rendering_configuration(args)).run()
+    else:
+        result = processor.process_all(videos,
+            mode='render' if args.render_only else 'both' if args.overlay else 'track',
+            force=args.force, overlay_fps=args.overlay_fps, max_width=args.max_width,
+            progress=lambda text: print(text, flush=True), render_options=rendering_configuration(args),
+            corrected_name=args.corrected_name)
+        print(json.dumps(result), flush=True)
+
+
+def benchmark(args):
+    output = contained_path(args.output, "outputs")
+    begin = time.perf_counter()
+    if args.video:
+        frames = list(video_frames(args.video, limit=args.frames))
+    else:
+        texture = np.random.default_rng(20261031).integers(0, 256, (360, 640, 3), np.uint8)
+        frames = [np.roll(texture, i, axis=1) for i in range(args.frames)]
+    preparation = time.perf_counter() - begin
+    if not frames:
+        raise ValueError("no benchmark frames")
+    h, w = frames[0].shape[:2]
+    side = int(np.ceil(np.sqrt(args.points)))
+    x, y = np.meshgrid(np.linspace(w * .1, w * .9, side), np.linspace(h * .1, h * .9, side))
+    points = np.column_stack([x.ravel(), y.ravel()])[:args.points]
+    tracker, load_seconds = load_tracker(args)
+    begin = time.perf_counter()
+    tracker.infer(frames[:1], points)
+    warmup = time.perf_counter() - begin
+    reference = None
+    rows = []
+    def save():
+        write_json(output, {**tracker.environment(), "source": str(args.video) if args.video else "moving seeded RGB texture",
+                           "point_count": args.points, "load_seconds": load_seconds, "initial_warmup_seconds": warmup,
+                           "decode_or_generation_seconds": preparation, "results": rows,
+                           "compiled": args.compile,
+                           "measurement": "one measured pass per size, after initial and per-size initial/recurrent warmups; wall includes preprocessing/inference/CPU transfer, excludes disk export; decode measured separately; any remaining compilation is included"})
+    # Always obtain the frame-by-frame reference even if only larger sizes given.
+    for size in dict.fromkeys([1, *args.batch_sizes]):
+        tracker.reset()
+        if tracker.device.type == "cuda":
+            tracker.torch.cuda.empty_cache()
+            tracker.torch.cuda.reset_peak_memory_stats(tracker.device)
+        positions, visibility, times = [], [], dict(preprocessing_seconds=0., inference_seconds=0., transfer_seconds=0.)
+        begin = time.perf_counter()
+        try:
+            warm_frames = (frames * (2 * size // len(frames) + 1))[:2 * size]
+            for batch in chunks(warm_frames, size):
+                tracker.infer(batch, points if tracker.frames_seen == 0 else None)
+            shape_warmup = time.perf_counter() - begin
+            tracker.reset()
+            begin = time.perf_counter()
+            for batch in chunks(frames, size):
+                xy, logits, timing = tracker.infer(batch, points if tracker.frames_seen == 0 else None)
+                positions.append(xy)
+                visibility.append(logits)
+                for key in times:
+                    times[key] += timing[key]
+        except tracker.torch.cuda.OutOfMemoryError:
+            rows.append({"batch_size": size, "status": "out_of_memory"})
+            tracker.reset()
+            tracker.torch.cuda.empty_cache()
+            save()
+            print(json.dumps(rows[-1]), flush=True)
+            continue
+        elapsed = time.perf_counter() - begin
+        xy, logits = np.concatenate(positions), np.concatenate(visibility)
+        if reference is None:
+            reference = (xy, logits)
+        error = np.linalg.norm(xy - reference[0], axis=-1)
+        row = {"batch_size": size, "status": "ok", "frames": len(xy), **times,
+               "shape_warmup_seconds": shape_warmup,
+               "wall_seconds": elapsed, "wall_fps": len(xy) / elapsed,
+               "inference_fps": len(xy) / times["inference_seconds"],
+               "max_xy_difference_px": float(error.max()),
+               "mean_xy_difference_px": float(error.mean()),
+               "max_visibility_logit_difference": float(np.abs(logits - reference[1]).max()),
+               "visible_disagreements": int(np.count_nonzero((logits > 0) != (reference[1] > 0))),
+               "final_state_step": tracker.state.step}
+        if tracker.device.type == "cuda":
+            row["peak_allocated_bytes"] = tracker.torch.cuda.max_memory_allocated(tracker.device)
+        rows.append(row)
+        save()
+        print(json.dumps(row), flush=True)
+
+
+def main(argv=None):
+    p = parser()
+    argv = list(sys.argv[1:] if argv is None else argv)
+    args = p.parse_args(argv)
+    try:
+        resolve_session_args(args, argv)
+        if args.command == "track":
+            track(args)
+        elif args.command in ("annotate", "process"):
+            folder_command(args)
+        elif args.command == "render":
+            from .render import render_tracks
+            print(json.dumps(render_tracks(args.tracks, args.output, fps=args.fps,
+                                           max_width=args.max_width, force=args.force,
+                                           render_options=rendering_configuration(args),
+                                           reacquire_seconds=args.reacquire_seconds), indent=2))
+        elif args.command in ('render-named', 'export-ready'):
+            from .publication import render_named_tracks, export_ready_tracks
+            if args.command == 'render-named':
+                result = render_named_tracks(args.master, args.name, args.output_dir, fps=args.fps,
+                    max_width=args.max_width, render_options=rendering_configuration(args), progress=print,
+                    reacquire_seconds=args.reacquire_seconds)
+            else:
+                result = export_ready_tracks(args.master, args.name, args.output_dir, progress=print)
+            print(json.dumps(result, indent=2))
+        elif args.command == "benchmark":
+            benchmark(args)
+        elif args.command == "migrate":
+            from .storage import migrate_legacy_exports
+            print(json.dumps({"moved": migrate_legacy_exports()}, indent=2))
+        else:
+            tracker, elapsed = load_tracker(args)
+            print(json.dumps({**tracker.environment(), "load_seconds": elapsed}, indent=2))
+    except Exception as error:
+        p.exit(1, f"Point tracking failed: {error}\n")
+
+
+if __name__ == "__main__":
+    main()

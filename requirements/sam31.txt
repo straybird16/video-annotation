@@ -1,0 +1,9 @@
+setuptools==80.9.0
+psutil
+scipy
+einops
+matplotlib
+pandas
+pycocotools
+scikit-image
+scikit-learn

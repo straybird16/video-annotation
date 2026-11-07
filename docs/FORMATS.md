@@ -1,0 +1,49 @@
+# Workspace and file contracts
+
+The configured workspace contains dataset dependencies in `data/` and final
+videos/logs in `outputs/`. Dataset metadata may not reference `outputs/`. Model
+sources/checkpoints are configured separately with `--models-root` or
+`VIDEO_ANNOTATION_MODELS`; they are never part of a dataset export.
+
+For a selected source folder `data/videos/rgb/my_collection` containing
+`ball_02/ball_02.mp4`, human references use:
+
+```text
+data/reference/rgb/my_collection/
+  points/ball_02.csv
+  points/ball_02.json
+  points/ball_02.masks/<content-hash>.png
+  masks/ball_02/<roi_id>/reference.json
+  masks/ball_02/<roi_id>/mask.png
+```
+
+Reference naming flattens children of the selected collection. Duplicate video
+stems in one collection are rejected before overwriting anything. Legacy
+`<video>.points.json`, `ROI/<id>` and `<video>.rois/<id>` references remain readable;
+new saves use the canonical location above.
+
+Point reference CSV columns are `frame,point_id,x,y,radius,mask`. Coordinates and
+radii are native displayed-image pixels; frame indices are zero-based. A query
+set uses one reference frame. The JSON sidecar records source/root paths,
+dimensions and orientation, without duplicating point rows. Optional masks are
+full-frame binary PNGs referenced relative to the CSV. Point IDs remain stable.
+
+Point predictions mirror RGB folders under
+`data/pseudo-ground-truths/point_tracks/<source-relative-folder>/<tracker>/<motion>/`.
+Files include `points.csv`, its JSON metadata and optional quality diagnostics.
+CSV rows identify source `frame`, stable `point_id`, `x`, `y`, `visible` and
+`quality_score` (KLT) or `visibility_logit` (TAPNext++). Versioned lifetime metadata declares each point's retained end; never
+assume every ID has a row until video EOF. Use the shared `point_groups` reader
+with metadata. Corrected tracks keep source frame IDs and sparse manual-anchor
+provenance, without inheriting original pose/fit confidence for corrected rows.
+
+SAM predictions mirror RGB folders under
+`data/pseudo-ground-truths/<source-relative-folder>/<tracker>/roi_<id>/track/`
+(or an explicitly grouped run). Native per-frame mask arrays, metadata and
+derived box/circle geometry remain data-local. Grouping computation never merges
+object identity. Corrected masks are saved separately beside `track/`.
+
+Overlay videos mirror source folders under `outputs/videos/point_tracks/` or
+`outputs/videos/rgb_masks/`. Overlays use H.264 MP4, YUV420 and faststart.
+Rendering may filter visibility/trails, but never changes source coordinates or
+timing. Portable GUI session JSON stores settings, not model binaries or tracks.

@@ -1,0 +1,40 @@
+{
+  "sam21": {
+    "url": "https://github.com/facebookresearch/sam2.git",
+    "commit": "2b90b9f5ceec907a1c18123530e92e794ad901a4",
+    "directory": "sam2",
+    "checkpoint": "checkpoints/sam2.1/sam2.1_hiera_large.pt"
+  },
+  "sam31": {
+    "url": "https://github.com/facebookresearch/sam3.git",
+    "commit": "f1647e8d0c1d280991f4d1b7d974c2704537fe66",
+    "directory": "sam3",
+    "checkpoint": "checkpoints/sam3.1/sam3.1_multiplex.pt",
+    "patch": "patches/sam31-native-inference.patch"
+  },
+  "tapnextpp": {
+    "url": "https://github.com/google-deepmind/tapnet.git",
+    "commit": "730cda1c730877cfedbe01bf87fb1cadb78a565d",
+    "directory": "TAPNextPP",
+    "checkpoints": [
+      {
+        "input_resolution": 256,
+        "coordinate_model_size": 256,
+        "url": "https://storage.googleapis.com/dm-tapnet/tapnextpp/tapnextpp_ckpt.pt",
+        "bytes": 2532282370,
+        "sha256": "cb96a43444ccb4fbdb25d800b88c7ba196179a526e78f01b021a16b1c1eff6da",
+        "license": "Apache-2.0",
+        "path": "checkpoints/tapnextpp/tapnextpp_ckpt.pt"
+      },
+      {
+        "input_resolution": 512,
+        "coordinate_model_size": 256,
+        "url": "https://storage.googleapis.com/gresearch/tapnextpp/tapnextpp_512.ckpt",
+        "bytes": 2532283010,
+        "sha256": "6cd0e793fdcface3063d63f8ed3819bcf74c2c0468fe1fef85acee4de2f3609f",
+        "license": "Apache-2.0",
+        "path": "checkpoints/tapnextpp/tapnextpp_512.ckpt"
+      }
+    ]
+  }
+}
