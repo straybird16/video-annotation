@@ -66,7 +66,8 @@ def settings_fields(processor, *, overlay_fps=None, max_width=1280):
             ("overlay_fps", float, overlay_fps, True, "gui"),
             ("max_width", int, max_width, False, "gui")):
         result[name] = {"type": kind, "value": value, "choices": None, "optional": optional, "target": target}
-    return result
+    # Keep the shared lifetime control visible before the long algorithm list.
+    return {"reacquire_seconds": result["reacquire_seconds"], **result}
 
 
 def parse_settings(fields, values):
@@ -574,7 +575,7 @@ class PointLabeler:
         window.bind("<Button-5>", lambda event: canvas.yview_scroll(1, "units"))
         variables = {}
         for row, (name, spec) in enumerate(fields.items()):
-            label = ttk.Label(form, text=name)
+            label = ttk.Label(form, text="Reacquisition grace (seconds)" if name == "reacquire_seconds" else name)
             label.grid(row=row, column=0, sticky="w", padx=(0, 12), pady=3)
             self.parameter_tooltip(label, name)
             value = spec["value"]
@@ -603,7 +604,7 @@ class PointLabeler:
         ttk.Button(buttons, text="Cancel", command=window.destroy).pack(side="right", padx=6)
         ttk.Button(buttons, text="Help / parameters", command=lambda: self.show_parameter_help(window)).pack(side="left")
 
-    def parameter_tooltip(self, widget, name):
+    def parameter_tooltip(self, widget, name, *, help_text=None):
         """Keep hover help local to the settings window, without global binds."""
         from .session import parameter_help
         state = {"timer": None, "window": None}
@@ -625,7 +626,7 @@ class PointLabeler:
             tip = self.tk.Toplevel(widget)
             tip.overrideredirect(True)
             tip.geometry(f"+{widget.winfo_rootx()+15}+{widget.winfo_rooty()+widget.winfo_height()+4}")
-            self.ttk.Label(tip, text=parameter_help(name), padding=8, wraplength=480,
+            self.ttk.Label(tip, text=help_text or parameter_help(name), padding=8, wraplength=480,
                            relief="solid").pack()
             state["window"] = tip
         widget.bind("<Enter>", lambda event: state.update(timer=widget.after(450, show)), add="+")

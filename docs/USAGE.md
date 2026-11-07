@@ -35,6 +35,31 @@ Lost points disappear and trails clear. Native reacquisition is accepted within
 are suppressed. Zero ends immediately. This policy adds no new KLT recovery
 algorithm. New CSVs omit unrecovered tails; readers preserve full source timing.
 
+For old predictions **and corrected tracks**, apply the rule to the stored CSVs:
+
+```bash
+video-annotate clean --master data/pseudo-ground-truths/point_tracks/my_collection \
+  --reacquire-seconds 0.5
+```
+
+This searches all tracker/model folders and saved correction names, preserves
+`.pre-cleanup` backups, trims prediction/quality rows, and updates hashes/end
+metadata and correction provenance. Repeating with the same setting is a no-op.
+Use `--dry-run` to inspect changes first. A stricter cleanup cannot restore rows
+already removed; pre-cleanup backups preserve that information.
+
+To clean and render one selected tracker/model in the existing folder workflow:
+
+```bash
+video-annotate process --source-dir data/videos/rgb/my_collection \
+  --tracker klt-template --motion-model adaptive --render-only --clean-existing \
+  --reacquire-seconds 0.5 --overlay-fps 120
+```
+
+Render-only without `--clean-existing` still leaves CSVs unchanged. The policy
+uses reported visibility and in-frame positions; it cannot detect an object that
+has disappeared when the tracker continues to report a valid visible position.
+
 ## Review and batch actions
 
 **Review tracks** opens predictions, permits sparse manual labels and interpolates
@@ -42,6 +67,14 @@ positions between them. Tune every N frames (default 30). Choose whether to end
 at the last label or join the next original position. Originals remain preserved;
 the default correction name is `corrected/points.csv`. Explicit visible manual
 anchors can restart a point after a long gap.
+
+**Reacquisition grace (seconds)** is directly above the review controls. Apply or
+press Enter to refresh the preview; Save also applies a pending value. The same
+setting appears in tracking Settings and is stored in saved session/track metadata.
+Manual correction applies the rule **after** interpolation, joining and tail
+choices. Its CSV ends at the final accepted visible frame, without a grace-period
+frozen tail. Invisible/ended markers and their trails are hidden in review;
+you can still select their IDs and click to place a new visible manual anchor.
 
 Left/Right moves by N frames; comma/period moves one frame. Ctrl+S saves and
 Ctrl+Z undoes. In the anchor list, Up/Down selects labels; Ctrl/Shift enables

@@ -41,6 +41,10 @@ video-annotate annotate --source-dir data/videos/rgb/my_collection --track --ove
 # Track saved references in a folder using the session's saved settings.
 video-annotate process --config session.json --overlay
 
+# Clean existing originals and corrections on disk; preserve pre-cleanup backups.
+video-annotate clean --master data/pseudo-ground-truths/point_tracks/my_collection \
+  --reacquire-seconds 0.5
+
 # Render saved predictions, preferring corrected tracks; no inference.
 video-annotate process --source-dir data/videos/rgb/my_collection \
   --tracker klt-template --motion-model adaptive --render-only --overlay-fps 120

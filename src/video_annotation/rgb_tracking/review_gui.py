@@ -90,6 +90,7 @@ class TrackReview(ttk.Frame if ttk is not None else object):
         self.x_var, self.y_var = tk.StringVar(), tk.StringVar()
         self.visible_var = tk.BooleanVar(value=True)
         self.show_trail, self.only_selected = tk.BooleanVar(value=True), tk.BooleanVar(value=False)
+        self.reacquire_var = tk.StringVar(value=f"{getattr(getattr(owner, 'processor', None), 'reacquire_seconds', .5):g}")
         self.tail_var, self.join_var = tk.StringVar(value="Keep original tail"), tk.StringVar()
         self.save_mode = tk.StringVar(value="Named track")
         self.track_name = tk.StringVar(value="corrected/points.csv")
@@ -97,13 +98,24 @@ class TrackReview(ttk.Frame if ttk is not None else object):
         self.render_dir = tk.StringVar(value=str(ROOT/"outputs/videos/point_tracks"))
         self.ready_dir = tk.StringVar(value=str(ROOT/"data/pseudo-ground-truths/point_tracks_ready"))
         self._shortcut_bindings, self._shortcut_widgets = [], []
-        self.status = tk.StringVar(value="Cyan: original · amber: corrected · hollow: occluded. Click/drag to add a manual label.")
+        self.status = tk.StringVar(value="Cyan: original · amber: corrected. Lost points are hidden; click to add a recovery anchor.")
 
         load = ttk.Frame(self)
         load.pack(fill="x")
         self.button(load, "Load current tracks", self.load_current)
         self.button(load, "Browse CSV…", self.browse)
         ttk.Label(self, textvariable=self.path_var, wraplength=1100).pack(fill="x", pady=4)
+        policy = ttk.Frame(self)
+        policy.pack(fill="x", pady=4)
+        grace_label = ttk.Label(policy, text="Reacquisition grace (seconds):")
+        grace_label.pack(side="left")
+        self.grace_entry = self.entry(policy, self.reacquire_var, 7, self.apply_reacquisition_policy)
+        self.button(policy, "Apply grace", self.apply_reacquisition_policy)
+        ttk.Label(policy, text="Source-video time · default 0.5 · 0 ends immediately").pack(side="left", padx=7)
+        tooltip = getattr(owner, "parameter_tooltip", None)
+        if tooltip is not None:
+            for widget in (grace_label, self.grace_entry):
+                tooltip(widget, "reacquire_seconds", help_text="Maximum source-video seconds a lost point may recover before its track ends. Uses source FPS, never overlay FPS. Applies to this corrected track and future tracking runs. Click the video to add a manual recovery anchor even after an end.")
         seek = ttk.Frame(self)
         seek.pack(fill="x", pady=4)
         ttk.Label(seek, text="Point ID:").pack(side="left")
@@ -161,7 +173,7 @@ class TrackReview(ttk.Frame if ttk is not None else object):
         visible.pack(anchor="w")
         self.control(visible)
         self.button(point_controls, "Set anchor at X/Y", self.set_numeric, side="top")
-        ttk.Label(point_controls, text="Cyan = original\nAmber = corrected\nHollow = occluded", justify="left").pack(anchor="w", pady=8)
+        ttk.Label(point_controls, text="Cyan = original\nAmber = corrected\nLost/occluded points are hidden", justify="left").pack(anchor="w", pady=8)
         self.anchors.pack_forget()
         self.anchors.pack(fill='both', expand=True, pady=4)
 
@@ -328,6 +340,12 @@ class TrackReview(ttk.Frame if ttk is not None else object):
             tail, join = self.tail_options()
         except ValueError:
             return True
+        if hasattr(self, "reacquire_var"):
+            try:
+                if float(self.reacquire_var.get()) != self.model.reacquire_seconds:
+                    return True
+            except ValueError:
+                return True
         return self.model.dirty or (tail, join) != (self.model.tail, self.model.join_frame)
 
     def can_leave(self):
@@ -362,6 +380,8 @@ class TrackReview(ttk.Frame if ttk is not None else object):
         from video_annotation.common.video import probe_video
         path = contained_path(path, "data")
         model = TrackEdits(path)
+        if not model.has_saved_policy:
+            model.set_reacquire_seconds(getattr(getattr(self.owner, "processor", None), "reacquire_seconds", .5))
         source = probe_video(model.video)[0]
         if (source["width"], source["height"]) != (model.width, model.height):
             raise ValueError("Track and displayed source-video dimensions differ")
@@ -372,6 +392,7 @@ class TrackReview(ttk.Frame if ttk is not None else object):
         if self.cache is not None:
             self.cache.clear()
         self.model, self.cache, self.last_saved_path = model, cache, path
+        self.reacquire_var.set(f"{model.reacquire_seconds:g}")
         if self._seek_after is not None:
             self.after_cancel(self._seek_after)
             self._seek_after = None
@@ -509,6 +530,23 @@ class TrackReview(ttk.Frame if ttk is not None else object):
         if model.status:
             self.status.set(model.status)
 
+    def apply_reacquisition_policy(self, *, announce=True):
+        model = self.require_model()
+        try:
+            seconds = float(self.reacquire_var.get())
+        except ValueError as error:
+            raise ValueError("Reacquisition grace must be a finite nonnegative number of seconds") from error
+        if not np.isfinite(seconds) or seconds < 0:
+            raise ValueError("Reacquisition grace must be a finite nonnegative number of seconds")
+        model.set_reacquire_seconds(seconds)
+        processor = getattr(self.owner, "processor", None)
+        if processor is not None:
+            processor.reacquire_seconds = seconds
+        self.reacquire_var.set(f"{seconds:g}")
+        self.refresh_preview()
+        if announce:
+            self.status.set(f"Reacquisition grace: {seconds:g} source-video seconds. Lost points are hidden; save to keep this policy with the corrected track.")
+
     def press(self, event):
         self.require_model()
         self.canvas.focus_set()
@@ -597,24 +635,34 @@ class TrackReview(ttk.Frame if ttk is not None else object):
         for point_column in columns:
             point_id = self.model.point_ids[point_column]
             selected = point_column == column
-            for values, validity, color in ((self.model.original_xy, self.model.original_visible, "#55d6ef"), (xy, visible, "#ffbc4a")):
+            native_visible = getattr(self.model, "original_lifecycle_visible", self.model.original_visible)
+            original_visible = native_visible[:, point_column] & visible[:, point_column]
+            for values, validity, color in ((self.model.original_xy, original_visible, "#55d6ef"), (xy, visible[:, point_column], "#ffbc4a")):
+                dragging = values is xy and selected and self.drag_xy is not None
+                if not validity[self.frame_index] and not dragging:
+                    continue
                 if length:
-                    for index in range(first+1, self.frame_index+1):
-                        if validity[index-1, point_column] and validity[index, point_column]:
+                    gaps = np.flatnonzero(~validity[first:self.frame_index+1])
+                    trail_first = first+int(gaps[-1])+1 if len(gaps) else first
+                    for index in range(trail_first+1, self.frame_index+1):
+                        if validity[index-1] and validity[index]:
                             self.canvas.create_line(*self.transform.to_canvas(*values[index-1, point_column]),
                                 *self.transform.to_canvas(*values[index, point_column]), fill=color, width=2 if selected else 1)
-                point = self.drag_xy if values is xy and selected and self.drag_xy is not None else values[self.frame_index, point_column]
+                point = self.drag_xy if dragging else values[self.frame_index, point_column]
                 px, py = self.transform.to_canvas(*point)
                 radius = (7 if selected else 5) if values is self.model.original_xy else (5 if selected else 3)
                 self.canvas.create_oval(px-radius, py-radius, px+radius, py+radius, outline=color, width=2,
-                    fill=color if validity[self.frame_index, point_column] and values is xy else "")
-            px, py = self.transform.to_canvas(*xy[self.frame_index, point_column])
-            self.canvas.create_text(px+9, py-9, text=str(point_id), fill="#ffffff", anchor="sw", font="TkDefaultFont")
+                    fill=color if (validity[self.frame_index] or dragging) and values is xy else "")
+            if visible[self.frame_index, point_column] or (selected and self.drag_xy is not None):
+                point = self.drag_xy if selected and self.drag_xy is not None else xy[self.frame_index, point_column]
+                px, py = self.transform.to_canvas(*point)
+                self.canvas.create_text(px+9, py-9, text=str(point_id), fill="#ffffff", anchor="sw", font="TkDefaultFont")
         self.canvas.create_text(8, 8, text=f"Source frame {frame} · point {identity} · {labels[self.frame_index, column]}",
             fill="white", anchor="nw", font="TkDefaultFont")
 
     def save(self, output=None):
         model = self.require_model()
+        self.apply_reacquisition_policy(announce=False)
         tail, join = self.tail_options()
         frame, point = int(model.frames[self.frame_index]), int(self.point_var.get())
         mode = SAVE_MODES[self.save_mode.get()] if output is None else "copy"

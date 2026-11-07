@@ -88,3 +88,25 @@ def trim_terminal_rows(path, ends):
     finally:
         temporary.unlink(missing_ok=True)
     return count, registrations, models
+
+
+def apply_lifecycle(frames, point_ids, xy, visible, fps, reacquire_seconds=.5, anchors=None):
+    """Apply one shared final lifetime pass to native or manually edited geometry."""
+    frames, xy, visible = np.asarray(frames), np.asarray(xy), np.asarray(visible, bool)
+    if xy.shape != (len(frames), len(point_ids), 2) or visible.shape != xy.shape[:2] or not np.isfinite(xy).all():
+        raise ValueError('Track lifetime needs finite frame-by-point XY and visibility arrays')
+    resets = {}
+    for identity, rows in (anchors or {}).items():
+        if isinstance(rows, dict):
+            for frame, value in rows.items():
+                if value[2]:
+                    resets.setdefault(int(frame), []).append(int(identity))
+        else:
+            for row in rows:
+                if row.get('visible') is True:
+                    resets.setdefault(int(row['frame']), []).append(int(identity))
+    gate = TrackLifecycle(point_ids, fps, reacquire_seconds)
+    accepted = np.empty_like(visible)
+    for index, frame in enumerate(frames):
+        accepted[index] = gate.step(int(frame), visible[index], resets.get(int(frame), ()))
+    return accepted, gate.metadata()

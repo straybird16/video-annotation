@@ -11,6 +11,7 @@ import numpy as np
 from video_annotation.common.validation import require_no_output_references
 from .annotations import sequence_id
 from .render import point_groups
+from .lifecycle import apply_lifecycle, validate_reacquire_seconds
 from .tapnextpp import contained_path, write_json
 from .video_geometry import DISPLAY_COORDINATE_SPACE, VIDEO_GEOMETRY_VERSION, display_rotation
 from .workflow import archive_files, file_digest
@@ -23,9 +24,14 @@ class TrackEdits:
     invisible held-coordinate gaps, never a fabricated visible trajectory.
     """
 
-    def __init__(self, tracks):
+    def __init__(self, tracks, reacquire_seconds=None):
         self.input_tracks = contained_path(tracks, "data")
         opened = self._metadata(self.input_tracks)
+        self.opened_metadata = deepcopy(opened)
+        self.has_saved_policy = 'reacquire_seconds' in opened.get('track_policy', {})
+        stored_seconds = opened.get('track_policy', {}).get('reacquire_seconds', .5)
+        self._saved_reacquire_seconds = validate_reacquire_seconds(stored_seconds)
+        self.reacquire_seconds = validate_reacquire_seconds(stored_seconds if reacquire_seconds is None else reacquire_seconds)
         manual = opened.get("manual_edits")
         if manual is not None and (not isinstance(manual, dict) or not isinstance(manual.get("base_tracks"), str)):
             raise ValueError("manual export lacks original-track provenance")
@@ -73,6 +79,11 @@ class TrackEdits:
         self.frames.setflags(write=False)
         self.original_xy.setflags(write=False)
         self.original_visible.setflags(write=False)
+        self.source_fps = opened.get('track_policy', {}).get('source_fps') or self.metadata.get('source_metadata_fps')
+        if self.source_fps is None:
+            from video_annotation.common.video import probe_video
+            self.source_fps = probe_video(self.video)[0]['fps']
+        self._refresh_original_lifecycle()
         self._point_index = {point: i for i, point in enumerate(self.point_ids)}
         self.anchors = {point: {} for point in self.point_ids}
         self._undo = []
@@ -97,7 +108,19 @@ class TrackEdits:
 
     @property
     def dirty(self):
-        return self.anchors != self._saved_anchors
+        return self.anchors != self._saved_anchors or self.reacquire_seconds != self._saved_reacquire_seconds
+
+    def _refresh_original_lifecycle(self):
+        inside = np.all((self.original_xy >= 0) & (self.original_xy < [self.width, self.height]), axis=-1)
+        self.original_lifecycle_visible, _ = apply_lifecycle(self.frames, self.point_ids, self.original_xy,
+            self.original_visible & inside, self.source_fps, self.reacquire_seconds)
+        self.original_lifecycle_visible.setflags(write=False)
+
+    def set_reacquire_seconds(self, seconds):
+        seconds = validate_reacquire_seconds(seconds)
+        if seconds != self.reacquire_seconds:
+            self.reacquire_seconds = seconds
+            self._refresh_original_lifecycle()
 
     def _location(self, point_id, frame):
         if isinstance(point_id, bool) or not isinstance(point_id, (int, np.integer)) or point_id not in self._point_index:
@@ -197,8 +220,12 @@ class TrackEdits:
             for frame, value in ordered:
                 index = int(frame-self.frames[0])
                 xy[index, point], visible[index, point], labels[index, point] = value[:2], value[2], "manual"
+        inside = np.all((xy >= 0) & (xy < [self.width, self.height]), axis=-1)
+        accepted, self.track_policy = apply_lifecycle(self.frames, self.point_ids, xy,
+            visible & inside, self.source_fps, self.reacquire_seconds, self.anchors)
+        labels[visible & ~accepted] = 'terminated'
         self.status = "; ".join(notices)
-        return xy, visible, labels
+        return xy, accepted, labels
 
     def save(self, output=None, *, tail="keep", join_frame=None):
         xy, visible, labels = self.preview(tail, join_frame)
@@ -227,6 +254,9 @@ class TrackEdits:
                 writer.writerow(["frame", "point_id", "x", "y", "visible", "quality_score", "manual_origin"])
                 for index, frame in enumerate(self.frames):
                     for point, identity in enumerate(self.point_ids):
+                        end = self.track_policy['point_end_frames'][str(identity)]
+                        if end is None or frame > end:
+                            continue
                         valid = bool(visible[index, point])
                         writer.writerow([int(frame), identity, *xy[index, point], int(valid), 1 if valid else -1, labels[index, point]])
             metadata = {"schema_version": 1, "kind": "rgb_point_tracks", "tracker": "manual",
@@ -236,6 +266,9 @@ class TrackEdits:
                 "coordinate_space": DISPLAY_COORDINATE_SPACE, "video_geometry_version": VIDEO_GEOMETRY_VERSION,
                 "display_rotation_degrees": display_rotation(self.metadata), "point_ids": self.point_ids,
                 "query_frame": int(self.frames[0]), "frames": len(self.frames),
+                "query_points_xy": xy[0].tolist(), "track_policy": deepcopy(self.track_policy),
+                "point_rows": sum((end-int(self.frames[0])+1) if end is not None else 0
+                                  for end in self.track_policy['point_end_frames'].values()),
                 "score_column": "quality_score", "score_kind": "signed visibility flag only; no tracker fit confidence",
                 "visibility": "manual/interpolated validity or unchanged original validity; not measured physical visibility",
                 "timing": "original zero-based source frame IDs; linear positions use source frame numbers",
@@ -269,4 +302,6 @@ class TrackEdits:
                 backup.unlink(missing_ok=True)
         self.output, self.tail, self.join_frame = output, tail, join_frame
         self._saved_anchors = deepcopy(self.anchors)
+        self._saved_reacquire_seconds = self.reacquire_seconds
+        self.opened_metadata, self.has_saved_policy = deepcopy(metadata), True
         return output

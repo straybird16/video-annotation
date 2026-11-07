@@ -104,6 +104,8 @@ def parser():
     sub.choices["annotate"].add_argument("--track", action="store_true", help="track after saving each video's points")
     sub.choices["process"].add_argument("--force", action="store_true", help="recompute matching tracks; prior results preserved")
     sub.choices["process"].add_argument("--render-only", action="store_true", help="render existing predictions across the folder, without tracking")
+    sub.choices["process"].add_argument("--clean-existing", action="store_true",
+                                        help="with --render-only, first clean original and corrected CSVs in place; keep backups")
     sub.choices["process"].add_argument("--corrected-name", default="corrected/points.csv",
                                         help="prefer these saved corrections relative to each prediction folder when rendering")
     render = sub.add_parser("render", help="render an existing point CSV without loading the model")
@@ -121,6 +123,12 @@ def parser():
     sub.choices['render-named'].add_argument('--fps', type=float)
     sub.choices['render-named'].add_argument('--max-width', type=positive, default=1280)
     sub.choices['render-named'].add_argument('--reacquire-seconds', type=float)
+    clean = sub.add_parser("clean", help="clean existing original/corrected point CSVs in place, without tracking or rendering")
+    clean.add_argument("--master", type=Path, required=True,
+                       help="point prediction folder to search recursively; includes saved corrections")
+    clean.add_argument("--reacquire-seconds", type=float, default=.5,
+                       help="recovery window in source-video seconds (default 0.5; 0 ends immediately)")
+    clean.add_argument("--dry-run", action="store_true", help="report changes without writing files")
     from .render_options import RENDER_PRESETS
     for name in ('render', 'render-named', 'annotate', 'process'):
         command = sub.choices[name]
@@ -292,12 +300,39 @@ def folder_command(args):
                      mask_visible=getattr(args, 'mask_visible', True),
                      render_options=rendering_configuration(args)).run()
     else:
+        if args.clean_existing:
+            if not args.render_only:
+                raise ValueError("--clean-existing requires --render-only; use clean --master DIR for data-only cleanup")
+            from .cleanup_tracks import cleanup_saved_tracks
+            paths = []
+            for video in videos:
+                original = processor.paths_for(video)["tracks"]
+                for candidate in saved_track_files(original.parent):
+                    metadata = json.loads(candidate.with_suffix(".json").read_text())
+                    base = (metadata.get("manual_edits") or {}).get("base_tracks")
+                    if candidate == original or (base and (candidate.parent/base).resolve() == original):
+                        paths.append(candidate)
+            cleaned = cleanup_saved_tracks(paths, reacquire_seconds=processor.reacquire_seconds)
+            print(json.dumps({"cleanup": cleaned}), flush=True)
         result = processor.process_all(videos,
             mode='render' if args.render_only else 'both' if args.overlay else 'track',
             force=args.force, overlay_fps=args.overlay_fps, max_width=args.max_width,
             progress=lambda text: print(text, flush=True), render_options=rendering_configuration(args),
             corrected_name=args.corrected_name)
         print(json.dumps(result), flush=True)
+
+
+def saved_track_files(master):
+    """Find point predictions, excluding references, diagnostics and backups."""
+    master = contained_path(master, "data")
+    if not master.is_dir():
+        raise ValueError(f"Prediction folder does not exist: {master}")
+    paths = []
+    for path in sorted(master.rglob("*.csv")):
+        metadata = path.with_suffix(".json")
+        if metadata.is_file() and json.loads(metadata.read_text()).get("kind") == "rgb_point_tracks":
+            paths.append(path)
+    return paths
 
 
 def benchmark(args):
@@ -392,6 +427,10 @@ def main(argv=None):
                                            max_width=args.max_width, force=args.force,
                                            render_options=rendering_configuration(args),
                                            reacquire_seconds=args.reacquire_seconds), indent=2))
+        elif args.command == "clean":
+            from .cleanup_tracks import cleanup_saved_tracks
+            print(json.dumps(cleanup_saved_tracks(saved_track_files(args.master),
+                reacquire_seconds=args.reacquire_seconds, dry_run=args.dry_run), indent=2))
         elif args.command in ('render-named', 'export-ready'):
             from .publication import render_named_tracks, export_ready_tracks
             if args.command == 'render-named':
