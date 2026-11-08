@@ -12,6 +12,7 @@ except ImportError:
     tk = ttk = filedialog = messagebox = None
 
 from video_annotation.rgb_tracking.annotations import DisplayTransform
+from video_annotation.rgb_tracking.viewport import CanvasNavigation
 from video_annotation.rgb_tracking.review_gui import FrameCache, nearest_frame_index
 from video_annotation.rgb_tracking.tapnextpp import ROOT
 from video_annotation.rgb_tracking.video_geometry import display_rotation
@@ -100,6 +101,9 @@ class MaskTrackReview(ttk.Frame if ttk is not None else object):
         self.canvas.pack(side="left", fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda event: self.action(self.redraw))
         self.canvas.bind("<Double-Button-1>", lambda event: self.action(self.edit_mask))
+        navigation = ttk.Frame(self)
+        navigation.pack(fill='x', pady=(0, 4), before=body)
+        self.navigation = CanvasNavigation(self, navigation)
         side = ttk.Frame(body, padding=(8, 0))
         side.pack(side="right", fill="y")
         ttk.Label(side, text="Manual labels for object").pack(anchor="w")
@@ -221,9 +225,13 @@ class MaskTrackReview(ttk.Frame if ttk is not None else object):
         masks = model.masks(frame)
         if not self.show_others.get():
             masks = {key: mask for key, mask in masks.items() if key == identity}
-        image = draw_masks(self.cache.get(frame), masks, frame)
-        transform = DisplayTransform(model.width, model.height, max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height()))
-        x, y, width, height = transform.geometry
+        source = self.cache.get(frame)
+        navigation = getattr(self, 'navigation', None)
+        self.transform = (navigation.transform(source, str(model.video)) if navigation is not None else
+            DisplayTransform(model.width, model.height, max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())))
+        crop = getattr(self.transform, 'slices', (slice(None), slice(None)))
+        image = draw_masks(source[crop], {key: mask[crop] for key, mask in masks.items()}, frame)
+        x, y, width, height = self.transform.geometry
         self.photo = self.ImageTk.PhotoImage(self.Image.fromarray(image[..., ::-1]).resize((width, height)), master=self)
         self.canvas.delete("all")
         self.canvas.create_image(x, y, image=self.photo, anchor="nw")

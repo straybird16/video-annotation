@@ -14,6 +14,7 @@ except ImportError:  # Pure cache/navigation helpers remain usable without Tk.
     tk = ttk = filedialog = messagebox = None
 
 from .annotations import DisplayTransform
+from .viewport import CanvasNavigation
 from .tapnextpp import ROOT, contained_path, video_frames
 
 
@@ -143,6 +144,9 @@ class TrackReview(ttk.Frame if ttk is not None else object):
         self.canvas.bind("<Button-1>", lambda event: self.action(lambda: self.press(event)))
         self.canvas.bind("<B1-Motion>", lambda event: self.action(lambda: self.motion(event)))
         self.canvas.bind("<ButtonRelease-1>", lambda event: self.action(lambda: self.release(event)))
+        navigation = ttk.Frame(self)
+        navigation.pack(fill='x', pady=(0, 4), before=body)
+        self.navigation = CanvasNavigation(self, navigation)
         side = ttk.Frame(body, padding=(7, 0))
         side.pack(side="right", fill="y")
         ttk.Label(side, text="Manual anchors (selected point)").pack(anchor="w")
@@ -621,10 +625,13 @@ class TrackReview(ttk.Frame if ttk is not None else object):
             return
         frame = int(self.model.frames[self.frame_index])
         image = self.cache.get(frame)
-        self.transform = DisplayTransform(self.model.width, self.model.height,
-            max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height()))
+        navigation = getattr(self, 'navigation', None)
+        self.transform = (navigation.transform(image, str(self.model.video)) if navigation is not None else
+            DisplayTransform(self.model.width, self.model.height,
+                max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())))
         left, top, width, height = self.transform.geometry
-        self.photo = self.ImageTk.PhotoImage(self.Image.fromarray(image[..., ::-1]).resize((width, height), self.Image.Resampling.BILINEAR), master=self)
+        crop = getattr(self.transform, 'slices', (slice(None), slice(None)))
+        self.photo = self.ImageTk.PhotoImage(self.Image.fromarray(image[crop][..., ::-1]).resize((width, height), self.Image.Resampling.BILINEAR), master=self)
         self.canvas.delete("all")
         self.canvas.create_image(left, top, image=self.photo, anchor="nw")
         identity, column = self.selected_point()

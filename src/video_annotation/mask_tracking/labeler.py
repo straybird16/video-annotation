@@ -191,6 +191,17 @@ class MaskLabeler(PointLabeler):
                                              command=lambda: self.action(self.select_cleanup))
         self.cleanup_check.pack(side="left")
         self.controls.append(self.cleanup_check)
+        if annotation_tools:
+            batch = ttk.Frame(self.root, padding=4)
+            batch.pack(fill="x")
+            self._button(batch, "Track all", lambda:self.start_batch("track"))
+            self._button(batch, "Render all", lambda:self.start_batch("render"))
+            self._button(batch, "Track + render all", lambda:self.start_batch("both"))
+            self.skip_existing_var = tk.BooleanVar(value=True)
+            reuse = ttk.Checkbutton(batch, text="Reuse completed predictions", variable=self.skip_existing_var)
+            reuse.pack(side="left", padx=5)
+            self.controls.append(reuse)
+            self._button(batch, "Memory / limits…", self.memory_settings)
         actions = ttk.Frame(self.root, padding=4)
         actions.pack(fill="x")
         self._button(actions, "Save ROI", self.save)
@@ -878,6 +889,59 @@ class MaskLabeler(PointLabeler):
         if not self.controller.reference_file.is_file():
             raise ValueError("Save the ROI before tracking")
         self.start_processing(advance=False)
+
+    def memory_settings(self):
+        self.controller._idle()
+        window = self.tk.Toplevel(self.root)
+        window.title("SAM memory and run limits")
+        window.transient(self.root.winfo_toplevel())
+        fields = (("state_device", "History device", "cpu/cuda; full temporal history is retained"),
+                  ("objects_per_pass", "Objects per pass", "auto: 1 for long clips; 0: all objects; 1: lowest history cost"),
+                  ("ram_reserve_gb", "Free RAM reserve (GiB)", "Stop before available RAM falls below this; 0 disables the guard"),
+                  ("vram_reserve_gb", "Free VRAM reserve (GiB)", "Stop before free GPU memory falls below this; 0 disables the guard"),
+                  ("max_frames", "Maximum frames", "Blank: full video; positive integer: bounded trial"))
+        variables = {}
+        for row, (key, title, hint) in enumerate(fields):
+            value = self.processor.max_frames if key == "max_frames" else self.processor.options[key]
+            variables[key] = self.tk.StringVar(value="auto" if key == "objects_per_pass" and value is None else "" if value is None else str(value))
+            self.ttk.Label(window, text=title).grid(row=row,column=0,sticky="w",padx=8,pady=6)
+            if key == "state_device":
+                entry = self.ttk.Combobox(window,textvariable=variables[key],values=("cpu","cuda"),state="readonly",width=10)
+            else:
+                entry = self.ttk.Entry(window,textvariable=variables[key],width=10)
+            entry.grid(row=row,column=1,sticky="w",padx=8,pady=6)
+            self.ttk.Label(window,text=hint).grid(row=row,column=2,sticky="w",padx=8)
+        def apply():
+            self.apply_memory_settings({key:value.get() for key,value in variables.items()})
+            window.destroy()
+        self.ttk.Button(window,text="Apply",command=lambda:self.action(apply)).grid(row=len(fields),column=1,pady=10)
+        self.ttk.Button(window,text="Cancel",command=window.destroy).grid(row=len(fields),column=2,sticky="w",pady=10)
+
+    def apply_memory_settings(self, values):
+        self.controller._idle()
+        limit = values["objects_per_pass"].strip().lower()
+        maximum = values["max_frames"].strip()
+        maximum = int(maximum) if maximum else None
+        if maximum is not None and maximum < 1:
+            raise ValueError("Maximum frames must be positive or blank")
+        options = {**self.processor.options, "state_device":values["state_device"],
+                   "objects_per_pass":None if limit in ("", "auto") else int(limit),
+                   "ram_reserve_gb":float(values["ram_reserve_gb"]),
+                   "vram_reserve_gb":float(values["vram_reserve_gb"])}
+        self.processor.set_backend(self.processor.backend, options)
+        self.processor.max_frames = maximum
+        self.backend_options[self.processor.backend] = deepcopy(self.processor.options)
+        self.status.set(f"SAM limits applied: history {options['state_device']}; objects/pass {limit or 'auto'}; RAM/VRAM reserve {options['ram_reserve_gb']:g}/{options['vram_reserve_gb']:g} GiB; frames {maximum or 'all'}.")
+
+    def start_batch(self, mode):
+        self.controller._idle()
+        if self.controller.dirty or self.queued_prompts:
+            raise ValueError("Save the current masks before processing the saved video queue")
+        videos = tuple(self.controller.videos)
+        options = dict(mode=mode, joint=bool(self.joint_var.get()), skip_existing=bool(self.skip_existing_var.get()),
+                       overlay_fps=self.overlay_fps,max_width=self.max_width,cancel=self.cancel.is_set,
+                       progress=lambda message:self.events.put(("progress",message)))
+        self._launch(lambda:self.processor.process_all(videos,**options))
 
     def start_processing(self, advance=False, all_saved=False):
         self._prompt_ready()

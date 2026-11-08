@@ -72,6 +72,11 @@ def artifact_paths(video, backend, roi_id="1"):
             "profile": ROOT / "outputs/runs/rgb_masks" / identity / backend / f"roi_{roi_id}" / "profile.json"}
 
 
+def joint_roi_id(roi_ids):
+    selected = sorted(set(map(str, roi_ids)))
+    return "joint_"+hashlib.sha256(json.dumps(selected).encode()).hexdigest()[:10]
+
+
 def native_prompt(reference, backend, initialization):
     prompt = deepcopy(reference["prompt"])
     region = region_mask(reference)
@@ -301,7 +306,7 @@ class Processor:
             if not selected:
                 raise ValueError("Save at least one ROI before tracking")
             references = [(identity, read_reference(video, identity, source=source, source_root=self.source_root)) for identity in selected]
-            group = "joint_"+hashlib.sha256(json.dumps(selected).encode()).hexdigest()[:10]
+            group = joint_roi_id(selected)
             reference = min(references, key=lambda item: item[1]["frame"])[1]
             return self._process(video, reference, group, overlay, force, overlay_fps, max_width,
                                  progress, cancel, references=references, skip_existing=skip_existing, force_overlay=force_overlay)
@@ -309,6 +314,65 @@ class Processor:
             raise Cancelled(str(exc)) from exc
         finally:
             self._busy = False
+
+    def saved_exports(self, video, roi_ids, *, joint=True):
+        """Choose the current ROI set's saved group or individual exports, without SAM."""
+        group = artifact_paths(video, self.backend, joint_roi_id(roi_ids))["tracks"]
+        individual = [artifact_paths(video, self.backend, identity)["tracks"] for identity in roi_ids]
+        present = [path for path in individual if (path/"metadata.json").is_file()]
+        has_group = (group/"metadata.json").is_file()
+        chosen = ([group] if has_group and (joint or len(present) != len(individual)) else present)
+        result = []
+        for path in chosen:
+            corrected = path.with_name("corrected")
+            metadata = corrected/"metadata.json"
+            if metadata.is_file():
+                manual = json.loads(metadata.read_text()).get("manual_correction", {})
+                if (manual.get("base_metadata_sha256") != file_digest(path/"metadata.json") or
+                        (corrected/manual.get("base_export", "")).resolve() != path.resolve()):
+                    raise ValueError(f"Saved mask correction no longer matches its original: {corrected}")
+                path = corrected
+            result.append(path)
+        return result
+
+    def process_all(self, videos, *, mode="track", joint=True, skip_existing=True,
+                    overlay_fps=None, max_width=1280, progress=None, cancel=None):
+        """Run saved references across the queue; rendering never loads a model."""
+        if mode not in ("track", "render", "both"):
+            raise ValueError("Choose track, render or both")
+        if self._busy:
+            raise ValueError("A mask job is already running")
+        from .render import render_masks
+        results, skipped = [], []
+        for index, video in enumerate(videos, 1):
+            check_cancel(cancel)
+            video = contained_path(video, "data")
+            identities = list(saved_references(video, source_root=self.source_root))
+            if not identities:
+                skipped.append(str(video))
+                if progress: progress(f"No saved ROIs; skipped: {video.name}")
+                continue
+            if progress: progress(f"{mode.title()} {index}/{len(videos)}: {video.name} ({len(identities)} ROIs)")
+            if mode != "render":
+                options = dict(skip_existing=skip_existing, progress=progress, cancel=cancel)
+                if self.backend == "sam31" and joint and len(identities) > 1:
+                    self.process_many(video, identities, **options)
+                else:
+                    for identity in identities:
+                        check_cancel(cancel)
+                        self.process(video, roi_id=identity, **options)
+            if mode in ("render", "both"):
+                tracks = self.saved_exports(video, identities, joint=joint)
+                if not tracks:
+                    skipped.append(str(video))
+                    if progress: progress(f"No saved predictions; skipped: {video.name}")
+                    continue
+                output = artifact_paths(video, self.backend, "all_rois")["overlay"].with_name("all_rois.mp4")
+                results.append(render_masks(tracks, output, fps=overlay_fps, max_width=max_width,
+                                            force=True, progress=progress, cancel=cancel))
+            else:
+                results.append({"output":str(video), "rois":len(identities)})
+        return {"output":f"{len(results)} video(s) completed; {len(skipped)} skipped", "results":results, "skipped":skipped}
 
     def _process(self, video, reference, roi_id, overlay, force, overlay_fps, max_width, progress, cancel, references=None, skip_existing=False, force_overlay=False):
         video = contained_path(video, "data")

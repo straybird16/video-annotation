@@ -93,6 +93,11 @@ choices. Its CSV ends at the final accepted visible frame, without a grace-perio
 frozen tail. Invisible/ended markers and their trails are hidden in review;
 you can still select their IDs and click to place a new visible manual anchor.
 
+Both **Review tracks** and **Review masks** support wheel/+/- zoom, middle-drag
+or Shift-left-drag pan, and **Fit** / F. Zoom changes display only; dragging a
+point still records native source pixels. The mask brush editor receives the
+full frame and has its own zoom controls.
+
 Left/Right moves by N frames; comma/period moves one frame. Ctrl+S saves and
 Ctrl+Z undoes. In the anchor list, Up/Down selects labels; Ctrl/Shift enables
 multiple selection. Delete/Backspace deletes selected labels and selects the
@@ -114,9 +119,29 @@ Both original/recent fits use fast correlation by default; no model is loaded. I
 interpolation controls appear in the tab, alongside measured costs. **Render overlay** reuses matching refined
 poses, draws their circles and reliable rotation arrows, and uses the shared
 Render settings for quality, FPS, size and frame limit. Open-folder buttons locate
-the data and MP4. See [pose settings and output definitions](POSE_REFINEMENT.md).
+the data and MP4. See [pose settings and output definitions](POSE_REFINEMENT.md). If an earlier
+run stopped with an `int64` JSON error, rerun it: gap-interpolation counts now
+save as plain integers.
 
 ## SAM objects and masks
+
+**Track all**, **Render all** and **Track + render all** process saved ROIs across
+the entire selected video queue, retaining the current video. **Track all saved
+ROIs** in the side panel handles only the current video. Unlabeled videos are
+skipped. **Reuse completed predictions** is enabled by default. Render all loads
+saved predictions without SAM, prefers matching saved corrections, and combines
+ROIs into one `all_rois.mp4` per source video. It uses the current grouped export
+when available, otherwise individual ROI exports. Save draft masks before
+starting a batch; Cancel stops safely and preserves completed work.
+
+**Memory / limits…** exposes history device (`cpu`/`cuda`), objects per pass
+(`auto`, a positive limit, or `0` for all), RAM/VRAM free-memory safety margins
+in GiB, and maximum frames (blank for the full video). SAM3.1 defaults to CPU
+history, automatic object passes and 2/1 GiB free RAM/VRAM margins. These are
+best-effort admission/run guards, not hard allocation caps. Full temporal history
+is preserved. Smaller object passes reduce simultaneous histories; CPU history
+uses RAM to save VRAM. Embedded SAM overlays follow the Render settings tab's
+FPS and width. Standalone `video-mask annotate` uses its CLI overlay settings.
 
 For several objects on one frame, select **Clicks**, click foreground points for
 one object and press **N**. This queues that object's prompt and clears the

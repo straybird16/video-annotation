@@ -349,6 +349,9 @@ class PointLabeler:
         # Review workers snapshot these settings when starting; do not alter them.
         fps, width, options = parse_render_settings({name: variable.get() for name, variable in self.render_variables.items()})
         self.overlay_fps, self.max_width, self.render_options = fps, width, options
+        sam = getattr(self, "mask_labeler", None)
+        if sam is not None:
+            sam.overlay_fps, sam.max_width = fps, width
         self.sync_render_settings()
 
     def tab_changed(self, event=None):

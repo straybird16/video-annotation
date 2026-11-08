@@ -2,6 +2,11 @@
 
 Newest entries first. See PROVENANCE.md for the original workspace history.
 
+- 2026-11-08 — Added whole-queue SAM track/render actions and memory controls,
+  source-coordinate zoom/pan in point/mask review, and fixed JSON serialization
+  after pose gap filling. Codex coordinator, resumed review worker and pose
+  worker; focused model-free and native Tk checks. [Usage](docs/USAGE.md).
+
 - 2026-11-08 — Fixed per-instance SAM preview brushing/undo without discarding
   peer masks. Point draft deletion/undo now compacts labels; added a backed-up
   ID migration for references, original/corrected tracks, quality and refined

@@ -34,7 +34,9 @@ def _flag(value):
 
 def _runs(mask):
     edges=np.diff(np.r_[False,mask,False].astype(np.int8))
-    return zip(np.flatnonzero(edges==1),np.flatnonzero(edges==-1))
+    # These indices also feed persisted interpolation counts; keep them native
+    # Python integers rather than allowing NumPy scalars into JSON metadata.
+    return zip(np.flatnonzero(edges==1).tolist(),np.flatnonzero(edges==-1).tolist())
 
 
 def _coherent(values, frames, neighbors, tolerance):
