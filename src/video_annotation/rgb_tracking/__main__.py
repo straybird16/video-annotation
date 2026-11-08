@@ -132,13 +132,21 @@ def parser():
     reindex = sub.add_parser('reindex',help='compact saved point IDs, including linked corrections/poses, with backups')
     reindex.add_argument('--data-dir',type=Path,help='workspace data directory; default data/')
     reindex.add_argument('--dry-run',action='store_true')
-    refine = sub.add_parser("refine", help="refine point patches with anchored correlation and short-gap interpolation")
+    from ..pose.methods import METHODS, DEFAULT_METHOD
+    refine = sub.add_parser("refine", help="refine saved point patches with selectable correlation/geometric methods")
     refine.add_argument("--tracks", type=Path, required=True, help="original or corrected point CSV")
+    refine.add_argument("--pose-method", choices=METHODS, default=DEFAULT_METHOD,
+                        help="pose algorithm; default fast similarity with guarded IC-LK homography")
     refine.add_argument("--output-dir", type=Path, help="data-local pose folder; default beside the input tracks")
     refine.add_argument("--point-ids", type=int, nargs="+", help="stable point IDs; defaults to all")
     refine.add_argument("--patch-radius", type=float, help="override saved patch radii; pixels")
     refine.add_argument("--max-frames", type=positive)
-    refine.add_argument("--patch-size", type=positive, default=128)
+    refine.add_argument("--patch-size", type=positive, default=128,
+                        help="resampling grid size; does not change saved per-point support radii/masks")
+    refine.add_argument("--ecc-iters", type=positive, default=45, help="ECC iteration limit")
+    refine.add_argument("--ic-iters", type=positive, default=20, help="inverse-compositional iteration limit")
+    refine.add_argument("--ic-stride", type=positive, default=2, help="inverse-compositional pixel sampling stride")
+    refine.add_argument("--min-gain", type=float, default=.0025, help="minimum accepted geometric correlation gain")
     refine.add_argument("--min-score", type=float, default=.75)
     refine.add_argument("--full-search", action="store_true", help="disable the cheaper guarded local path")
     refine.add_argument("--reference-interval", type=positive, default=10)
@@ -151,21 +159,22 @@ def parser():
     refine.add_argument("--scale-smoothness", type=float, default=2.)
     refine.add_argument("--tracker-center-weight", type=float, default=.9)
     refine.add_argument("--registration-center-weight", type=float, default=.1)
-    refine.add_argument("--anchor-preference", type=float, default=.8,
+    anchor = refine.add_argument_group('Original fusion options (--pose-method anchored only)')
+    anchor.add_argument("--anchor-preference", type=float, default=.8,
                         help="original-reference weight when equally scored fits agree (default 0.8)")
-    refine.add_argument("--anchor-score-delta", type=float, default=.05,
+    anchor.add_argument("--anchor-score-delta", type=float, default=.05,
                         help="fit-score advantage multiplying its fusion odds by four (default 0.05)")
-    refine.add_argument("--anchor-angle-tolerance", type=float, default=10.,
+    anchor.add_argument("--anchor-angle-tolerance", type=float, default=10.,
                         help="maximum angle disagreement for fusing fits, degrees")
-    refine.add_argument("--anchor-scale-tolerance", type=float, default=.1,
+    anchor.add_argument("--anchor-scale-tolerance", type=float, default=.1,
                         help="fractional scale disagreement for fusing fits (default 0.1)")
-    refine.add_argument("--recovery-scale-min", type=float, default=.25,
+    anchor.add_argument("--recovery-scale-min", type=float, default=.25,
                         help="minimum absolute scale during original-reference recovery")
-    refine.add_argument("--recovery-scale-max", type=float, default=4.,
+    anchor.add_argument("--recovery-scale-max", type=float, default=4.,
                         help="maximum absolute scale during original-reference recovery")
-    refine.add_argument("--recovery-angle-step", type=float, default=15.,
+    anchor.add_argument("--recovery-angle-step", type=float, default=15.,
                         help="coarse original-reference recovery angle step, degrees")
-    refine.add_argument("--recovery-scale-step", type=float, default=1.25,
+    anchor.add_argument("--recovery-scale-step", type=float, default=1.25,
                         help="coarse original-reference recovery multiplicative scale step")
     refine.add_argument("--gap-seconds", type=float, default=.1,
                         help="maximum short gap to interpolate in source-video seconds; 0 disables")
@@ -391,12 +400,14 @@ def refine_command(args):
             "fast_iterations", "fast_samples", "scale_limit", "center_limit", "rotation_smoothness",
             "scale_smoothness", "tracker_center_weight", "registration_center_weight", "anchor_preference",
             "anchor_score_delta", "anchor_angle_tolerance", "anchor_scale_tolerance", "recovery_scale_min",
-            "recovery_scale_max", "recovery_angle_step", "recovery_scale_step")}, fast=not args.full_search)
+            "recovery_scale_max", "recovery_angle_step", "recovery_scale_step")
+            if args.pose_method == 'anchored' or not name.startswith(('anchor_', 'recovery_'))}, fast=not args.full_search)
     result = refine_point_tracks(args.tracks, output_dir=args.output_dir, point_ids=args.point_ids,
         config=config, radius=args.patch_radius, max_frames=args.max_frames, overlay=args.overlay,
         overlay_fps=args.overlay_fps, max_width=args.max_width, force=args.force,
         render_options=rendering_configuration(args), opencv_threads=args.opencv_threads,
         gap_seconds=args.gap_seconds, gap_neighbors=args.gap_neighbors,
+        method=args.pose_method, method_options={name:getattr(args, name) for name in ('ecc_iters','ic_iters','ic_stride','min_gain')},
         progress=lambda value: print(value, flush=True))
     print(json.dumps(result, indent=2))
 

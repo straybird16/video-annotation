@@ -2,6 +2,13 @@
 
 Newest entries first. See PROVENANCE.md for the original workspace history.
 
+- 2026-11-08 — Integrated the supplied ECC affine/homography, IC-LK and sparse
+  KLT/RANSAC pose alternatives, two guarded homography corrections and the
+  original fast route. Added GUI/CLI method selection, full source-coordinate
+  warps, local query geometry and method-separated artifacts. Legacy fusion is
+  optional; reference circles/masks remain authoritative. Codex coordinator and
+  resumed geometric/GUI workers. [Methods](docs/POSE_REFINEMENT.md).
+
 - 2026-11-08 — Added whole-queue SAM track/render actions and memory controls,
   source-coordinate zoom/pan in point/mask review, and fixed JSON serialization
   after pose gap filling. Codex coordinator, resumed review worker and pose

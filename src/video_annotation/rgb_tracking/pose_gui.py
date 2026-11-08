@@ -17,8 +17,8 @@ from .tapnextpp import ROOT, contained_path
 
 
 LOCAL_FIELDS = (
-    ('patch_size', 'Registration patch size', int),
-    ('min_score', 'Minimum fit score', float),
+    ('patch_size', 'Resampling grid size (px)', int),
+    ('min_score', 'Correlation seed min. score', float),
     ('reference_interval', 'Reference interval (frames)', int),
     ('iterations', 'Full-fit iterations', int),
     ('fast_iterations', 'Fast-fit iterations', int),
@@ -36,11 +36,21 @@ ANCHOR_FIELDS = (
     ('recovery_scale_max', 'Recovery maximum scale', float),
 )
 FIELDS = LOCAL_FIELDS + ANCHOR_FIELDS
+METHOD_FIELDS = (
+    ('ecc_iters', 'ECC iterations', int, 45),
+    ('ic_iters', 'IC-LK iterations', int, 20),
+    ('ic_stride', 'IC-LK pixel stride', int, 2),
+    ('min_gain', 'Minimum geometric score gain', float, .0025),
+)
 
 
 def parse_options(values):
     """Snapshot and validate Tk strings before the worker starts."""
     from video_annotation.pose.registration import Config
+    from video_annotation.pose.methods import DEFAULT_METHOD, METHODS, method_options as validate_method_options
+    method = values.get('method', DEFAULT_METHOD)
+    if method not in METHODS:
+        raise ValueError(f'Choose a supported pose method: {", ".join(METHODS)}')
     point_text = str(values.get('point_ids', '')).strip()
     try:
         point_ids = list(dict.fromkeys(int(value) for value in re.split(r'[\s,]+', point_text))) if point_text else None
@@ -64,15 +74,23 @@ def parse_options(values):
     if gap_neighbors == 1:
         raise ValueError('Gap neighbors must be at least two per side, or zero to disable filling')
     config = Config(support='circle', radius_blend=0., tracker_scale_weight=0., registration_scale_weight=1.)
-    for name, label, kind in FIELDS:
+    config_fields = FIELDS if method == 'anchored' else LOCAL_FIELDS
+    for name, label, kind in config_fields:
         try:
-            setattr(config, name, kind(values[name]))
+            setattr(config, name, kind(values.get(name, getattr(config, name))))
         except (ValueError, TypeError) as error:
             raise ValueError(f'{label} must be {"an integer" if kind is int else "a number"}') from error
     config.fast = bool(values.get('fast', True))
     config.validate()
+    method_options = {}
+    for name, label, kind, default in METHOD_FIELDS:
+        try:
+            method_options[name] = kind(values.get(name, default))
+        except (ValueError, TypeError) as error:
+            raise ValueError(f'{label} must be {"an integer" if kind is int else "a number"}') from error
+    method_options = validate_method_options(method_options)
     return dict(point_ids=point_ids, radius=radius, max_frames=max_frames, config=config,
-                gap_seconds=gap_seconds, gap_neighbors=gap_neighbors)
+                gap_seconds=gap_seconds, gap_neighbors=gap_neighbors, method=method, method_options=method_options)
 
 
 def timing_text(result):
@@ -100,6 +118,7 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
             raise RuntimeError('Pose refinement needs the existing Tk annotation runtime')
         super().__init__(parent, padding=10)
         from video_annotation.pose.registration import Config
+        from video_annotation.pose import methods
         self.owner = owner
         self.busy = self.closed = self._owns_controller_busy = False
         self.worker = self._poll_after = None
@@ -112,10 +131,15 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
         self.variables = {name: tk.StringVar(value=str(getattr(config, name))) for name, _, _ in FIELDS}
         self.variables.update(point_ids=tk.StringVar(), radius=tk.StringVar(), max_frames=tk.StringVar(),
                               gap_seconds=tk.StringVar(value='.1'), gap_neighbors=tk.StringVar(value='2'),
+                              method=tk.StringVar(value=methods.DEFAULT_METHOD),
                               fast=tk.BooleanVar(value=True), overlay=tk.BooleanVar(value=True), force=tk.BooleanVar(value=False))
+        self.variables.update({name:tk.StringVar(value=str(default)) for name, _, _, default in METHOD_FIELDS})
+        labels = getattr(methods, 'METHOD_LABELS', {})
+        self.method_choices = {labels.get(name, name):name for name in methods.METHODS}
+        self.method_label = tk.StringVar(value=labels.get(methods.DEFAULT_METHOD, methods.DEFAULT_METHOD))
 
         ttk.Label(self, text='Point / patch pose refinement', style='Point.Title.TLabel').pack(anchor='w', pady=(0, 6))
-        ttk.Label(self, text='Anchored correlation estimates rotation and scale around saved points; short trusted gaps can be interpolated.',
+        ttk.Label(self, text='Refine saved point patches with correlation or geometric registration. Saved per-point radii and masks define support; only a radius override changes it.',
                   wraplength=1100).pack(anchor='w')
         source = ttk.Frame(self); source.pack(fill='x', pady=9)
         ttk.Label(source, text='Point CSV:').pack(side='left')
@@ -123,6 +147,14 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
         entry.pack(side='left', fill='x', expand=True, padx=6); self.controls.append(entry)
         self.button(source, 'Use current tracks', self.use_current_tracks)
         self.button(source, 'Browse…', self.browse)
+
+        method_row = ttk.Frame(self); method_row.pack(fill='x', pady=5)
+        ttk.Label(method_row, text='Pose method:').pack(side='left')
+        self.method_selector = ttk.Combobox(method_row, textvariable=self.method_label,
+            values=tuple(self.method_choices), state='readonly', width=48)
+        self.method_selector.pack(side='left', padx=7)
+        self.method_selector.bind('<<ComboboxSelected>>', lambda event: self.action(self.select_method))
+        self.controls.append(self.method_selector)
 
         form = ttk.LabelFrame(self, text='Refinement settings', padding=10)
         form.pack(fill='x', pady=6)
@@ -132,14 +164,19 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
                   ('gap_neighbors', 'Good neighbors per side (≥2; 0 = off)')]
         for index, (name, label) in enumerate(basics):
             self.field(form, index//2, (index % 2)*2, label, self.variables[name])
-        for index, (name, label, _) in enumerate(ANCHOR_FIELDS):
-            self.field(form, 3+index//2, (index % 2)*2, label, self.variables[name])
         form.columnconfigure(1, weight=1); form.columnconfigure(3, weight=1)
+        self.anchor_form = ttk.LabelFrame(self, text='Original-anchor fusion (anchored method only)', padding=10)
+        for index, (name, label, _) in enumerate(ANCHOR_FIELDS):
+            self.field(self.anchor_form, index//2, (index % 2)*2, label, self.variables[name])
+        self.anchor_form.columnconfigure(1, weight=1); self.anchor_form.columnconfigure(3, weight=1)
         advanced = ttk.LabelFrame(self, text='Local fitting and smoothness', padding=10)
         for index, (name, label, _) in enumerate(LOCAL_FIELDS):
             self.field(advanced, index//2, (index % 2)*2, label, self.variables[name])
+        for index, (name, label, _, _) in enumerate(METHOD_FIELDS):
+            self.field(advanced, 5+index//2, (index % 2)*2, label, self.variables[name])
         advanced.columnconfigure(1, weight=1); advanced.columnconfigure(3, weight=1)
         options = ttk.Frame(self); options.pack(fill='x', pady=7)
+        self.method_options_row = options
         for name, label in [('fast', 'Fast correlation fitting'), ('overlay', 'Render overlay after refinement'),
                             ('force', 'Force recompute')]:
             widget = ttk.Checkbutton(options, text=label, variable=self.variables[name])
@@ -152,7 +189,7 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
                 advanced.pack_forget()
         widget = ttk.Checkbutton(options, text='Advanced settings', variable=advanced_visible, command=toggle_advanced)
         widget.pack(side='left'); self.controls.append(widget)
-        ttk.Label(self, text='At equal agreeing fit scores, preference favors the original reference. Better scores can override it. Scale comes from image registration; overlays use final filled poses and Render settings.',
+        ttk.Label(self, text='Default: fast similarity correlation with guarded IC-LK homography. Resampling grid size is independent of annotated support radius. Overlays use final filled poses and Render settings.',
                   wraplength=1100).pack(anchor='w', pady=5)
         actions = ttk.Frame(self); actions.pack(fill='x', pady=7)
         self.button(actions, 'Run refinement', self.run)
@@ -163,6 +200,7 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
         self.button(actions, 'Open overlay folder', lambda: self.open_folder('overlay'))
         ttk.Label(self, textvariable=self.timings, wraplength=1100, padding=(0, 10)).pack(anchor='w')
         ttk.Label(self, textvariable=self.status, wraplength=1100).pack(anchor='w', pady=8)
+        self.sync_method_controls()
         self._poll_after = self.after(75, self.poll)
         self.bind('<Destroy>', lambda event: self.close() if event.widget is self else None, add='+')
 
@@ -177,6 +215,20 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
         widget = ttk.Entry(parent, textvariable=variable, width=13)
         widget.grid(row=row, column=column+1, sticky='ew', padx=(0, 20), pady=5)
         self.controls.append(widget)
+
+    def select_method(self):
+        self.require_idle()
+        self.variables['method'].set(self.method_choices[self.method_label.get()])
+        self.sync_method_controls()
+
+    def sync_method_controls(self):
+        if not hasattr(self, 'method_selector'):
+            return
+        self.method_selector.configure(state='disabled' if self.busy else 'readonly')
+        if self.variables['method'].get() == 'anchored':
+            self.anchor_form.pack(fill='x', pady=6, before=self.method_options_row)
+        else:
+            self.anchor_form.pack_forget()
 
     def action(self, function):
         try:
@@ -280,6 +332,7 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
                 self.release_busy()
                 for widget in self.controls:
                     widget.configure(state='normal')
+                self.sync_method_controls()
                 self.cancel_button.configure(state='disabled')
                 if kind == 'done':
                     self.last_result = value

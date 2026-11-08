@@ -1,4 +1,4 @@
-"""Refine saved point patches with original-anchored correlation and gap repair."""
+"""Refine annotated point supports with selectable similarity/geometric methods."""
 from contextlib import ExitStack
 import csv
 from dataclasses import asdict
@@ -26,8 +26,10 @@ from ..rgb_tracking.video_geometry import DISPLAY_COORDINATE_SPACE, display_rota
 from ..rgb_tracking.workflow import check_cancel, file_digest
 from .annotations import export_annotation
 from .input import patch_supports, transported_mask
-from .registration import Config, rotation
-from .anchored import AnchoredPoseEstimator as PoseEstimator, FUSION_FIELDS
+from .registration import Config, rotation, PoseEstimator
+from .anchored import FUSION_FIELDS
+from .methods import (METHODS, DEFAULT_METHOD, METHOD_LABELS, METHOD_FIELDS, create_estimator,
+                      method_options as normalize_method_options, row_matrix, attach_matrix)
 from .gaps import finalize_pose_csv, validate_gap_options
 
 FIELDS = ('frame','timestamp_us','x','y','rotation_degrees','rotation_unwrapped_degrees',
@@ -39,7 +41,7 @@ FIELDS = ('frame','timestamp_us','x','y','rotation_degrees','rotation_unwrapped_
     'tracker_x','tracker_y','tracker_w','tracker_h','fit_mode','circle_x','circle_y','circle_radius',
     'geometry_source',*EXTENT_FIELDS,*ROTATION_QUALITY_FIELDS,
     'reference_frame','point_id','point_visible','point_prediction_x','point_prediction_y',
-    'mask_registration_center_x','mask_registration_center_y',*FUSION_FIELDS)
+    'mask_registration_center_x','mask_registration_center_y',*FUSION_FIELDS,*METHOD_FIELDS)
 
 
 def _config(value):
@@ -56,10 +58,10 @@ def _config(value):
     return result
 
 
-def _overlay_path(tracks, video):
+def _overlay_path(tracks, video, method):
     root = ROOT/'data/pseudo-ground-truths/point_tracks'
     relative = tracks.parent.relative_to(root) if tracks.is_relative_to(root) else source_key(video)/tracks.stem
-    return ROOT/'outputs/videos/point_pose'/relative/'refined-correlation.mp4'
+    return ROOT/'outputs/videos/point_pose'/relative/('refined-'+method+'.mp4')
 
 
 def _draw(frame, rows, source_frame):
@@ -143,13 +145,16 @@ def _render_saved_poses(paths, video, source, start, count, target, fps, max_wid
 def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None, radius=None,
                         max_frames=None, overlay=True, overlay_fps=None, max_width=1280,
                         render_options=None, force=False, progress=None, cancel=None,
-                        overlay_path=None, opencv_threads=1, gap_seconds=.1, gap_neighbors=2):
+                        overlay_path=None, opencv_threads=1, gap_seconds=.1, gap_neighbors=2,
+                        method=DEFAULT_METHOD, method_options=None):
     """Decode once for independent point fits; preserve IDs, gaps and source time.
 
-    Reference foreground moves with each candidate similarity about the query.
+    Reference foreground moves with the accepted warp about the selected query.
     It is fitting support, not per-frame segmentation.
     Constant point-circle dimensions never act as a measured image-scale prior.
     """
+    if method not in METHODS:raise ValueError('Unknown pose method: '+str(method))
+    method_options=normalize_method_options(method_options)
     begin = time.perf_counter()
     times = dict(adaptation_seconds=0.,setup_seconds=0.,decode_seconds=0.,refinement_seconds=0.,render_seconds=0.,interpolation_seconds=0.)
     gap_seconds,gap_neighbors=validate_gap_options(gap_seconds,gap_neighbors)
@@ -194,19 +199,19 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
     frames,xy,visible = frames[:count],xy[:count],visible[:count]
     supports = patch_supports(tracks,metadata,video,source,selected,radius)
     cfg = _config(config)
-    output_dir = contained_path(output_dir or tracks.parent/'refined-correlation','data')
+    output_dir = contained_path(output_dir or tracks.parent/('refined-'+method),'data')
     if output_dir in (tracks.parent,video.parent) or tracks.is_relative_to(output_dir) or video.is_relative_to(output_dir):
         raise ValueError('Point pose output must not contain or replace its source inputs')
     if isinstance(opencv_threads,bool) or not isinstance(opencv_threads,int) or opencv_threads<1:
         raise ValueError('opencv_threads must be a positive integer')
     options = normalize_render_options(render_options)
-    overlay_target = contained_path(overlay_path or _overlay_path(tracks,video),'outputs') if overlay and count else None
+    overlay_target = contained_path(overlay_path or _overlay_path(tracks,video,method),'outputs') if overlay and count else None
     if overlay_target and overlay_target.suffix.lower() != '.mp4':
         raise ValueError('Point pose overlay must be a portable .mp4 file')
     fps = source['fps'] if overlay_fps is None else overlay_fps
     if not np.isfinite(fps) or fps<=0 or max_width<1:
         raise ValueError('Overlay FPS and maximum width must be positive')
-    signature = hashlib.sha256(json.dumps(dict(version=2,gap_seconds=gap_seconds,gap_neighbors=gap_neighbors,tracks=file_digest(tracks),
+    signature = hashlib.sha256(json.dumps(dict(version=3,method=method,method_options=method_options,gap_seconds=gap_seconds,gap_neighbors=gap_neighbors,tracks=file_digest(tracks),
         metadata=file_digest(tracks.with_suffix('.json')),source=[video.stat().st_size,video.stat().st_mtime_ns],
         point_ids=selected,config=asdict(cfg),frames=count,
         supports={str(i):dict(radius=s['radius'],query=None if s['query'] is None else s['query'].tolist(),
@@ -238,7 +243,7 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                         'mean_ms_per_point_frame','mean_ms_per_source_frame','interpolation_seconds'):
                 timing[key] = old.get('timing',{}).get(key,0.)
         return dict(output=str(output_dir),output_dir=str(output_dir),poses={str(i):str(p) for i,p in poses.items()},
-                    overlay=str(overlay_target) if overlay_target else None,timing=timing,reused=reused,
+                    overlay=str(overlay_target) if overlay_target else None,method=method,method_options=method_options,timing=timing,reused=reused,
                     timing_source='recorded refinement' if reused else 'current run',current_run_timing=current_run_timing,
                     frames=count,requested_source_frames=requested_count,point_frames=point_frames,valid_point_rows=valid)
     if reused and (not overlay_target or overlay_reused):
@@ -264,7 +269,7 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                 writers[i] = csv.DictWriter(stack.enter_context((folder/'pose.raw.csv').open('w',newline='')),
                                             fieldnames=FIELDS,extrasaction='ignore')
                 writers[i].writeheader()
-                states[i] = dict(estimator=None,reference_frame=None,angle=0.,scale=1.,offset=np.zeros(2))
+                states[i] = dict(estimator=None,reference_frame=None,angle=0.,scale=1.,offset=np.zeros(2),reference_query=None,reference_center=None,H=None,initial_mask=None,model='similarity')
             w,h = source['width'],source['height']
             ratio = min(1.,max_width/w)
             dw,dh = max(1,round(w*ratio)),max(1,round(h*ratio))
@@ -301,16 +306,23 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                         point_frames += 1
                         mask = (transported_mask(support,center,state['angle'],state['scale'],(w,h))
                                 if support['mask'] is not None else None)
+                        if state['initial_mask'] is not None and state['H'] is not None and state['model']!='similarity':
+                            from .geometric import warp_points
+                            previous=warp_points(state['H'],[state['reference_query']])[0]
+                            move=np.eye(3);move[:2,2]=np.asarray(center)-previous
+                            mask=cv2.warpPerspective(state['initial_mask'],move@state['H'],(w,h),flags=cv2.INTER_NEAREST)
                         times['adaptation_seconds'] += time.perf_counter()-clock
                         clock = time.perf_counter()
                         if state['estimator'] is None:
                             try:
-                                estimator = PoseEstimator(gray,box,cfg,mask=mask)
+                                estimator = create_estimator(gray,box,cfg,mask=mask,method=method,options=method_options,base_factory=PoseEstimator)
                             except ValueError as error:
                                 row = _invalid('initialization_failed: '+str(error))
                             else:
                                 state.update(estimator=estimator,reference_frame=int(frame_id),
-                                             offset=np.asarray(center)-estimator.center)
+                                             offset=np.asarray(center)-estimator.center,reference_query=np.asarray(center).copy(),
+                                             reference_center=estimator.center.copy(),
+                                             initial_mask=None if mask is None else np.asarray(mask,np.uint8).copy())
                                 row = estimator.initial_result()
                         else:
                             row = state['estimator'].estimate(gray,box,int(frame_id-state['reference_frame']),mask=mask)
@@ -319,6 +331,20 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                             scale = float(row['similarity_scale'])
                             angle = float(row['rotation_degrees'])
                             point_center = fitted + scale*rotation(angle)@state['offset']
+                            H=row_matrix(row)
+                            if H is None:
+                                from .geometric import similarity_matrix
+                                H=similarity_matrix({**row,'scale':scale},state['reference_center'])
+                                attach_matrix(row,H,method,'similarity')
+                            else:
+                                from .geometric import local_pose
+                                point_center,local_angle,scale=local_pose(H,state['reference_query'])
+                                unwrapped=float(local_angle+360*round((float(row['rotation_unwrapped_degrees'])-local_angle)/360))
+                                angle=float((unwrapped+180)%360-180)
+                                row.update(scale=float(scale),similarity_scale=float(scale),rotation_degrees=angle,
+                                           rotation_unwrapped_degrees=unwrapped)
+                            state['H']=H
+                            state['model']=row.get('pose_model','similarity')
                             row.update(mask_registration_center_x=float(fitted[0]),mask_registration_center_y=float(fitted[1]),
                                 x=float(point_center[0]),y=float(point_center[1]),
                                 correction_dx=float(point_center[0]-center[0]),correction_dy=float(point_center[1]-center[1]),
@@ -337,6 +363,8 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                     row.update(frame=int(frame_id),timestamp_us=float(frame_id*1e6/source['fps']),object_id=i,point_id=i,
                                reference_frame=state['reference_frame'] if state['reference_frame'] is not None else '',
                                point_visible=int(visible[index,point]),point_prediction_x=float(center[0]),point_prediction_y=float(center[1]))
+                    row.setdefault('pose_method',method)
+                    row.setdefault('homography_valid',0)
                     writers[i].writerow(row)
                     rows[i] = row
                     counts[i] += int(row['valid'])
@@ -365,7 +393,7 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                 clock=time.perf_counter()
                 gap_reports[i]=finalize_pose_csv(folder/'pose.raw.csv',folder/'pose.csv',fps=source['fps'],
                     radius=supports[i]['radius'],gap_seconds=gap_seconds,gap_neighbors=gap_neighbors,
-                    rotation_period=cfg.rotation_period,fit_fields=FUSION_FIELDS)
+                    rotation_period=cfg.rotation_period,fit_fields=(*FUSION_FIELDS,'candidate_score','candidate_gain'))
                 times['interpolation_seconds']+=time.perf_counter()-clock
                 counts[i]=gap_reports[i]['usable_center_scale_frames']
             valid_total=sum(counts.values())
@@ -377,8 +405,8 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                 for i in selected:
                     folder = stage/f'point_{i}'
                     support = supports[i]
-                    point_metadata = dict(schema_version=3,kind='rgb_point_pose',registration_method='correlation',
-                        method='immutable original-reference correlation, independent coarse recovery and score/disagreement fusion',config=asdict(cfg),
+                    point_metadata = dict(schema_version=3,kind='rgb_point_pose',registration_method=method,
+                        method=METHOD_LABELS[method],method_options=method_options,config=asdict(cfg),
                         video=os.path.relpath(video,poses[i].parent),point_tracks=os.path.relpath(tracks,poses[i].parent),
                         point_id=i,object_id=i,coordinate_space=DISPLAY_COORDINATE_SPACE,
                         display_rotation_degrees=display_rotation(source),source_size_px=[w,h],source_fps=source['fps'],fps=source['fps'],
@@ -387,9 +415,10 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                         reference_radius_px=support['radius'],template_radius_px=support['radius'],patch_support_source=support['source'],
                         rotation_convention='clockwise degrees relative to the initialized reference; overlay arrow points up at zero',
                         timestamp_convention='absolute source frame * 1e6 / source_fps; nominal RGB time',
-                        foreground='saved canonical reference foreground transported by each candidate similarity; recovery independent of recent support/scale; not per-frame segmentation',
+                        foreground='saved canonical reference foreground and annotated circle, transported by accepted warp; not per-frame segmentation',
                         center_semantics='x/y and output circle follow the selected query; mask_registration_center is the fitted foreground-bbox center',
-                        scale_source='similarity',scale_measurement='image registration; fixed patch size is not measured object zoom',
+                        scale_source='similarity',scale_measurement='area-equivalent local Jacobian scale at query; fixed patch size is support, not measured zoom',
+                        homography_convention='h00..h22 map reference-frame source pixels to current source pixels; homography_valid marks measured warps only',
                         valid_frames=counts[i],csv_sha256=file_digest(folder/'pose.csv'),timing=times,
                         raw_csv='pose.raw.csv',raw_csv_sha256=file_digest(folder/'pose.raw.csv'),
                         gap_processing=gap_reports[i],
@@ -402,7 +431,7 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                         artifacts[relative]=file_digest(folder/filename)
                 manifest=dict(schema_version=1,kind='point_pose_refinement',input_signature=signature,
                     point_tracks=os.path.relpath(tracks,output_dir),video=os.path.relpath(video,output_dir),
-                    point_ids=selected,frames=count,valid_point_rows=valid_total,fit_valid_point_rows=raw_valid_total,point_frames=point_frames,
+                    point_ids=selected,method=method,method_options=method_options,frames=count,valid_point_rows=valid_total,fit_valid_point_rows=raw_valid_total,point_frames=point_frames,
                     gap_processing=dict(gap_seconds=gap_seconds,gap_neighbors=gap_neighbors),
                     artifacts=artifacts,config=asdict(cfg),timing=times)
                 require_no_output_references(manifest)

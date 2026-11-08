@@ -115,13 +115,13 @@ Preview FPS never changes source time or tracking.
 Open **Refine pose**, select **Use current tracks** (prefers saved corrections)
 or browse a point CSV, then **Run refinement**. This estimates center, clockwise
 rotation and image-based scale using the saved circle/foreground as support.
-Both original/recent fits use fast correlation by default; no model is loaded. Independent original recovery, score/disagreement weights and short-gap
-interpolation controls appear in the tab, alongside measured costs. **Render overlay** reuses matching refined
-poses, draws their circles and reliable rotation arrows, and uses the shared
-Render settings for quality, FPS, size and frame limit. Open-folder buttons locate
-the data and MP4. See [pose settings and output definitions](POSE_REFINEMENT.md). If an earlier
-run stopped with an `int64` JSON error, rerun it: gap-interpolation counts now
-save as plain integers.
+The method selector offers fast correlation, guarded ECC/IC-LK homography,
+ECC affine/homography, IC-LK homography, independent KLT/RANSAC, and the optional
+legacy original-biased fusion. The default is **Fast correlation + guarded
+IC-LK homography**. Source radii/masks follow saved annotations; the resampling
+grid does not change their physical size. **Render overlay** reuses that method's
+saved poses and shared circle/arrow renderer. The tab shows measured costs and
+opens the pose/overlay folders. See [methods, settings and output definitions](POSE_REFINEMENT.md).
 
 ## SAM objects and masks
 

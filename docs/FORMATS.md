@@ -54,8 +54,8 @@ Overlay videos mirror source folders under `outputs/videos/point_tracks/` or
 Rendering may filter visibility/trails, but never changes source coordinates or
 timing. Portable GUI session JSON stores settings, not model binaries or tracks.
 
-Point-patch pose refinement saves `refined-correlation/refinement.json` and
-`refined-correlation/point_<ID>/pose.csv` plus `pose.json` beside the input point
+Point-patch pose refinement saves `refined-<method>/refinement.json` and
+`refined-<method>/point_<ID>/pose.csv` plus `pose.json` beside the input point
 CSV. Original and corrected inputs therefore have separate default pose folders.
 Each row retains absolute source frame, point ID and source-time timestamp;
 invalid input gaps/fits are flagged and ended points have no frozen pose tail.
@@ -72,3 +72,11 @@ marks usable `valid`/`rotation_valid`, component interpolation flags and
 candidate scale/rotation, scores, per-component original weights, disagreement
 and recovery flags are included. Interpolation never bridges source-hidden
 points or extends their retained lifetimes.
+
+Geometric methods also export `h00..h22`, mapping initialized-reference source
+pixels to current source pixels. `homography_valid` identifies measured warps;
+interpolation of center/angle/scale never fabricates H. Rotation and
+`similarity_scale` summarize the local Jacobian at the query, not a global
+homography rotation/zoom. Circle overlays are local summaries. Native candidate
+NCC/gain, fallback/reason and solver costs are retained; KLT uses inlier ratios.
+The optional `anchored` method alone uses original-biased fusion fields.

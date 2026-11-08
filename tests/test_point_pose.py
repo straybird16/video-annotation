@@ -42,6 +42,7 @@ class PointPoseTests(unittest.TestCase):
         return metadata
 
     def run_refinement(self,images,**options):
+        options.setdefault("method","similarity")
         with patch('video_annotation.pose.workflow.probe_video',return_value=(self.source,{})), \
              patch('video_annotation.pose.workflow.video_frames',side_effect=lambda *args,**kwargs:iter(images)) as decode:
             result=refine_point_tracks(self.tracks,**options)

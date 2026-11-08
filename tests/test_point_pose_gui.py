@@ -38,12 +38,19 @@ class PointPoseGuiTests(unittest.TestCase):
         self.assertEqual((config.anchor_preference, config.anchor_score_delta), (.8, .05))
         self.assertEqual((config.recovery_scale_min, config.recovery_scale_max), (.25, 4.))
         self.assertEqual((result['gap_seconds'], result['gap_neighbors']), (.1, 2))
+        self.assertEqual(result['method'], 'similarity_ic_homography')
+        self.assertEqual(result['method_options'], {'ecc_iters':45, 'ic_iters':20, 'ic_stride':2, 'min_gain':.0025})
+        self.assertEqual(parse_options({})['method'], 'similarity_ic_homography')
         self.assertEqual(parse_options(dict(values(), gap_seconds='0', gap_neighbors='0'))['gap_seconds'], 0.)
         for change in ({'point_ids':'-1'}, {'radius':'nan'}, {'max_frames':'0'}, {'patch_size':'4'},
                        {'gap_seconds':'nan'}, {'gap_seconds':'-.1'}, {'gap_neighbors':'-1'},
-                       {'gap_neighbors':'1'}, {'gap_neighbors':'1.5'}, {'anchor_preference':'1.1'}):
+                       {'gap_neighbors':'1'}, {'gap_neighbors':'1.5'}, {'method':'missing'},
+                       {'ecc_iters':'0'}, {'ic_iters':'bad'}, {'ic_stride':'1.5'}, {'min_gain':'nan'}):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 parse_options(dict(values(), **change))
+        with self.assertRaises(ValueError):
+            parse_options(dict(values(), method='anchored', anchor_preference='1.1'))
+        self.assertEqual(parse_options(dict(values(), method='similarity', anchor_preference='bad'))['config'].anchor_preference, .8)
 
     def test_current_tracks_prefers_saved_review_and_rejects_unsaved_corrections(self):
         tab = PoseRefinementTab.__new__(PoseRefinementTab)
@@ -95,6 +102,8 @@ class PointPoseGuiTests(unittest.TestCase):
                 self.assertTrue(kwargs['overlay'])
                 self.assertEqual((kwargs['gap_seconds'], kwargs['gap_neighbors']), (.1, 2))
                 self.assertEqual(kwargs['config'].anchor_preference, .8)
+                self.assertEqual(kwargs['method'], 'similarity_ic_homography')
+                self.assertEqual(kwargs['method_options'], {'ecc_iters':45, 'ic_iters':20, 'ic_stride':2, 'min_gain':.0025})
                 kwargs['progress']('Frame 2/3')
                 return response
             module.refine_point_tracks = Mock(side_effect=refine)
@@ -122,10 +131,12 @@ class PointPoseGuiTests(unittest.TestCase):
 
     def test_cli_forwards_anchor_recovery_and_gap_options_with_legacy_settings(self):
         from video_annotation.rgb_tracking.__main__ import parser, refine_command
-        args = parser().parse_args(['refine', '--tracks', 'points.csv', '--anchor-preference', '.7',
+        self.assertEqual(parser().parse_args(['refine', '--tracks', 'points.csv']).pose_method, 'similarity_ic_homography')
+        args = parser().parse_args(['refine', '--tracks', 'points.csv', '--pose-method', 'anchored', '--anchor-preference', '.7',
             '--anchor-score-delta', '.03', '--anchor-angle-tolerance', '12', '--anchor-scale-tolerance', '.2',
             '--recovery-scale-min', '.5', '--recovery-scale-max', '3', '--recovery-angle-step', '10',
-            '--recovery-scale-step', '1.1', '--gap-seconds', '.2', '--gap-neighbors', '0', '--patch-size', '64'])
+            '--recovery-scale-step', '1.1', '--gap-seconds', '.2', '--gap-neighbors', '0', '--patch-size', '64',
+            '--ecc-iters', '27', '--ic-iters', '11', '--ic-stride', '3', '--min-gain', '.01'])
         module = ModuleType('video_annotation.pose.workflow')
         module.refine_point_tracks = Mock(return_value={'output':'mock only'})
         with patch.dict('sys.modules', {'video_annotation.pose.workflow':module}), redirect_stdout(io.StringIO()):
@@ -138,6 +149,25 @@ class PointPoseGuiTests(unittest.TestCase):
         self.assertEqual((config.recovery_angle_step, config.recovery_scale_step), (10., 1.1))
         self.assertEqual((config.patch_size, config.fast), (64, True))
         self.assertEqual((options['gap_seconds'], options['gap_neighbors']), (.2, 0))
+        self.assertEqual(options['method'], 'anchored')
+        self.assertEqual(options['method_options'], {'ecc_iters':27, 'ic_iters':11, 'ic_stride':3, 'min_gain':.01})
+
+    def test_method_switch_hides_anchor_fields_and_retains_their_values(self):
+        tab = PoseRefinementTab.__new__(PoseRefinementTab)
+        tab.require_idle = lambda: None
+        tab.busy = False
+        tab.method_choices = {'Guarded IC':'similarity_ic_homography', 'Original fusion':'anchored'}
+        tab.method_label = Value('Original fusion')
+        tab.variables = {'method':Value('similarity_ic_homography'), 'anchor_preference':Value('.9')}
+        tab.method_selector, tab.anchor_form, tab.method_options_row = Mock(), Mock(), object()
+        tab.select_method()
+        self.assertEqual(tab.variables['method'].get(), 'anchored')
+        tab.anchor_form.pack.assert_called_once()
+        tab.method_label.set('Guarded IC')
+        tab.select_method()
+        tab.anchor_form.pack_forget.assert_called_once()
+        self.assertEqual(tab.variables['anchor_preference'].get(), '.9')
+        tab.method_selector.configure.assert_called_with(state='readonly')
 
 
 if __name__ == '__main__':

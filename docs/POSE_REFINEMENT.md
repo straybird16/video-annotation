@@ -3,7 +3,8 @@
 In the GUI, open **Refine pose**, click **Use current tracks** or browse an
 original/corrected `points.csv`, and **Run refinement**. Save pending corrections
 first. Leave point IDs/radius/frame limit blank to use all saved points and
-supports. Refinement and rendering run in a cancellable background job.
+supports. Select the **Method**; the default is fast correlation plus guarded
+IC-LK homography. Refinement and rendering run in a cancellable background job.
 
 **Render overlay** reuses matching poses and draws each fitted patch circle plus
 a clockwise rotation indicator when `rotation_valid=1`. The zero-angle direction
@@ -17,7 +18,7 @@ CLI equivalent from the workspace root:
 ```bash
 video-annotate refine \
   --tracks data/pseudo-ground-truths/point_tracks/SEQUENCE/klt-template/adaptive/corrected/points.csv \
-  --overlay
+  --pose-method similarity_ic_homography --overlay
 ```
 
 Add `--point-ids 0 3`, `--max-frames 60` for a short check, or
@@ -26,33 +27,57 @@ another run. Matching results are reused; changed settings require **Force
 recompute** / `--force` or a different output directory. Force replaces only the
 managed derived pose folder, never the original point predictions/references.
 
-## What is estimated
+## Methods and support
 
-The existing correlation solver fits two similarity candidates around each
-tracked point: the immutable original reference and a recent canonical template. There is one source decode/grayscale conversion per
-frame for all selected points. Each point has independent templates and state.
-Both references receive cheap local fits each frame. Original recovery runs at
-the reference interval, on supported candidate disagreement, or when both local
-fits fail. It samples a coarse grid of absolute scales/angles and refines four
-distinct peaks. The original starts from its own last direct fit, and recovery
-bounds are relative to the original; neither search nor foreground is restricted
-by recent accumulated scale. There is no MI path in this view.
+| `--pose-method` | Behavior |
+|---|---|
+| `similarity` | Original fast correlation, immutable original plus one updated recent canonical template. No original-biased fusion. |
+| `similarity_ic_homography` | **Default:** similarity seed plus a guarded fixed-original IC-LK homography residual. Keeps similarity when the correction fails or gains ≤0.0025 NCC. |
+| `similarity_homography` | Same guarded route with OpenCV ECC homography. |
+| `ecc_affine` | Fixed-original ECC affine, seeded by similarity. Failed candidates remain invalid. |
+| `ecc_homography` | Fixed-original ECC homography, seeded by similarity. Failed candidates remain invalid. |
+| `inverse_compositional` | Fixed-original IC-LK homography, seeded by similarity. Failed candidates remain invalid. |
+| `klt_ransac` | Independent pyramidal KLT, forward/backward filtering and RANSAC homography. No similarity fallback. |
+| `anchored` | Previous expensive original-reference-biased fusion, retained as an explicit option. |
 
-The saved circle intersects the optional reference foreground. Each candidate moves the original foreground on its own transform. A mask or
-circle enlarged by a drifted recent estimate does not define the original fit's
-support. This is fitting support, not independently predicted segmentation. An off-center
-foreground still exports the selected query center. Prediction-time supports
-are preferred, then saved human references. If neither exists, the adapter
-records a fallback circle of radius 32 pixels; use a radius override if needed.
+The dense alternatives are refiners, not independent recovery methods: they
+require a valid correlation seed and can inherit its failures. Guarded variants
+retain the seed whenever the correction is unavailable; they do not guarantee
+better accuracy or recovery from every rejected seed. Dense correction is a
+post-fit candidate; it does not run the expensive fusion or replace the base
+solver's recent appearance with a separately fused absolute pose.
 
-A point's fixed radius measures no zoom: scale is supplied by image registration
-(default scale weights 0 tracker / 1 image). Center defaults to 90% point
-prediction / 10% registration. Scale and angle are relative to the first visible,
-successfully initialized patch. Accepted fusion updates the pose, recent
-appearance sampled directly from raw RGB, mask/search state and motion prior.
-Strong original corrections reset extrapolation so they are not mistaken for
-new velocity. Pose quality cannot turn an incorrect input
-point track into verified GT; inspect the video and quality fields.
+Patch support is the saved source-pixel circle **intersected with its optional
+foreground mask**. Prediction-time supports are preferred, then the saved human
+reference; absent support is explicitly recorded as a radius-32 fallback.
+Leave **radius override** blank to preserve annotations. **Resampling grid size**
+(default 128) controls numerical sampling of that same region; it does not
+replace the annotated radius or enlarge it to a 128-pixel source patch.
+Off-center masks retain the selected query center. Current masks are transported
+reference support, not new per-frame segmentation; background/padded pixels are
+excluded from candidate scoring. Accepted geometric corrections transport masks
+with the full warp; similarity fallbacks use the existing transport.
+
+KLT masks constrain feature centers and replenishment to the transported
+foreground. Native LK windows can still straddle its boundary; this is sparse
+feature masking, not per-pixel masked dense alignment. Use dense methods when
+that distinction matters for a thin foreground.
+
+Dense candidates are compared on the same valid reference foreground pixels.
+Residual bounds reject folding, poles and excessive displacement. IC-LK caches
+its template Jacobian/Hessian once; ECC does not construct an unused IC solver.
+This is the supplied package's compact IC implementation, not an official
+library implementation or the paper's modified IC-LK. ECC and KLT call OpenCV.
+[OpenCV tracking APIs](https://docs.opencv.org/4.x/dc/d6b/group__video__track.html),
+[inverse-compositional reference](https://publications.ri.cmu.edu/lucas-kanade-20-years-on-a-unifying-framework-part-1).
+
+For projective/affine output, center maps the reference query through `H`,
+clockwise rotation is the polar angle of its **local Jacobian at that query**,
+and scale is `sqrt(det(J))`, an area-equivalent local scale. A homography has no
+single global rotation/scale. Circle/arrow overlays summarize this local pose;
+the circle is not the exact projective image of the reference circle. Keep the
+full exported warp for geometric evaluation. Fixed radii are support, never
+measured zoom. Source visibility, endings and reference-frame IDs stay intact.
 
 ## Important settings
 
@@ -61,27 +86,33 @@ point track into verified GT; inspect the video and quality fields.
 | Point IDs | Stable saved IDs; blank selects all. |
 | Patch radius override | Source pixels; blank uses each saved circle. |
 | Maximum source frames | Limits refinement from the saved query frame. |
-| Registration patch size | Canonical fit resolution, 128; smaller is cheaper. |
-| Minimum fit score | Correlation acceptance, 0.75. |
+| Resampling grid size | Canonical fit resolution, 128; annotated source radius/mask stay unchanged. |
+| Minimum fit score | Correlation seed acceptance, 0.75. Candidate NCC is also exported; scores are not calibrated across methods. |
 | Fast correlation fitting | Enabled; turn off for full search every frame. |
-| Reference interval | Independent original recovery every 10 frames in fast mode; failures/disagreement can trigger it earlier. |
+| Reference interval | Periodic full search, 10 frames in fast correlation mode. |
 | Full / fast fit iterations | 8 / 8; larger budgets cost more. |
 | Maximum scale ratio | 1.6 relative to the prior/search hint, not a total-zoom cap. |
 | Center limit | Image correction bound, 0.3 times current patch radius. |
-| Rotation / scale smoothness | 0.5 / 2, applied to recent fitting only so a drifted prior cannot bias original recovery. |
-| Original-anchor preference | 0.8 original weight for equal scores and agreeing poses. |
-| Score odds delta | 0.05 correlation-score advantage multiplies the favored fit’s odds by four. |
-| Angle / scale agreement | 10 degrees / 10% scale; normalize the disagreement boost. |
-| Recovery scale bounds | 0.25–4 times the original size; independent of accumulated scale. |
+| Rotation / scale smoothness | 0.5 / 2 for correlation fitting. |
+| Original-anchor preference (`anchored` only) | 0.8 original weight for equal scores and agreeing poses. |
+| Score odds delta (`anchored` only) | 0.05 correlation-score advantage multiplies the favored fit’s odds by four. |
+| Angle / scale agreement (`anchored` only) | 10 degrees / 10% scale; normalize the disagreement boost. |
+| Recovery scale bounds (`anchored` only) | 0.25–4 times the original size; independent of accumulated scale. |
 | Fill gaps / neighbors | Up to 0.1 source seconds, with 2 consecutive trustworthy estimates on each side. Zero disables. |
+
+Geometric controls: `--ecc-iters 45`, `--ic-iters 20`, `--ic-stride 2` and
+`--min-gain .0025`. Higher stride trades sample density for speed. Only guarded
+variants apply the gain test. OpenCV optimizers can fail to converge.
 
 The CLI also exposes sample budget, center weights and OpenCV threads
 (`video-annotate refine --help`). Fast fitting uses up to 2,500 foreground samples.
 One OpenCV thread avoids small-ROI worker overhead; the GUI restores the prior
 thread count after the job.
 
-## Fusion weights and their defaults
+## Optional legacy fusion (`anchored`)
 
+Only this explicit method performs original-independent coarse recovery and
+score/disagreement fusion; its controls are hidden for other methods.
 For each component (angle or log scale), the original weight is a logistic
 function of score difference and squared normalized pose disagreement:
 
@@ -139,7 +170,7 @@ gaps remain unavailable; interpolation cannot repair continuously accepted drift
 Under the input CSV's folder:
 
 ```text
-refined-correlation/
+refined-<method>/
   refinement.json
   point_0/pose.raw.csv
   point_0/pose.csv
@@ -148,6 +179,17 @@ refined-correlation/
   point_3/pose.csv
   point_3/pose.json
 ```
+
+Each method has a separate default data folder and overlay name, so switching
+methods preserves earlier results and matching runs can be reused.
+`h00..h22` map reference-frame source pixels to current source pixels.
+`homography_valid` marks native measured warps; gap filling never invents a
+homography. `pose_model`, `candidate_used`, `fallback`, candidate NCC/gain/reason,
+solver cost and sparse match/inlier counts expose the chosen path. Dense scores
+are original-reference NCC; KLT scores are inlier ratios, not comparable
+probabilities. Existing rotation-validity gates remain separate from pose
+availability. Low-score but bounded direct fits remain inspectable, following
+the supplied baseline's acceptance policy; they are not verified GT.
 
 Rows retain absolute source frames/IDs and nominal source-video timestamps.
 `pose.raw.csv` preserves every measured fit/rejection; `pose.csv` contains the

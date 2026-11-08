@@ -35,3 +35,13 @@ canonical sampling and quality checks while adding original-independent recovery
 and score/disagreement fusion. `pose/gaps.py` is first-party final interpolation
 with explicit raw/processed provenance; Event's legacy box/MI estimator remains
 unchanged.
+
+On 2026-11-08 `pose/geometric.py` was adapted from the user-supplied
+`pose_non_deep_alternatives_benchmark/pose_alt_package/pose_methods.py`.
+It integrates OpenCV ECC affine/homography, a compact custom inverse-compositional
+LK implementation and OpenCV KLT/RANSAC. Source-coordinate/masked visibility
+guards, lazy IC initialization and local-ROI optical flow/feature detection
+were added. The supplied synthetic performance claims are not reclassified as
+measurements on real data or as an official implementation. The existing fast
+correlation engine supplies seeds; `pose/methods.py` selects candidates with the
+supplied guarded-fallback policy. `anchored` remains explicitly selectable.
