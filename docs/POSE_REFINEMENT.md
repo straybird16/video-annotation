@@ -47,6 +47,14 @@ better accuracy or recovery from every rejected seed. Dense correction is a
 post-fit candidate; it does not run the expensive fusion or replace the base
 solver's recent appearance with a separately fused absolute pose.
 
+These methods do not all keep two image templates. Similarity keeps the immutable
+original plus a recent canonical patch, refreshed only after an accepted image
+fit (default update rate1). All dense choices use that two-template solver for
+their seed, but the extra ECC/IC stage fits only the original. Its acceptance is
+separate from the seed's appearance update. KLT keeps canonical feature coordinates
+and the previous frame/tracked features, rather than original/recent appearance
+templates. Legacy `anchored` keeps both images and performs explicit fusion.
+
 Patch support is the saved source-pixel circle **intersected with its optional
 foreground mask**. Prediction-time supports are preferred, then the saved human
 reference; absent support is explicitly recorded as a radius-32 fallback.
@@ -98,11 +106,15 @@ measured zoom. Source visibility, endings and reference-frame IDs stay intact.
 | Score odds delta (`anchored` only) | 0.05 correlation-score advantage multiplies the favored fit’s odds by four. |
 | Angle / scale agreement (`anchored` only) | 10 degrees / 10% scale; normalize the disagreement boost. |
 | Recovery scale bounds (`anchored` only) | 0.25–4 times the original size; independent of accumulated scale. |
-| Fill gaps / neighbors | Up to 0.1 source seconds, with 2 consecutive trustworthy estimates on each side. Zero disables. |
+| Fill gaps / neighbors | Up to 0.1 source seconds, default2 raw accepted neighbors per side. Set1 for simple bracketed interpolation; zero disables. |
 
 Geometric controls: `--ecc-iters 45`, `--ic-iters 20`, `--ic-stride 2` and
 `--min-gain .0025`. Higher stride trades sample density for speed. Only guarded
 variants apply the gain test. OpenCV optimizers can fail to converge.
+KLT controls are `--klt-max-points 200`, `--klt-min-distance 4` source pixels,
+and `--klt-window 21` (odd); they are also in GUI advanced settings. Smaller feature
+spacing can retain more correspondences on a small patch; larger windows cost
+more and can include background. These options never enlarge the saved support.
 
 The CLI also exposes sample budget, center weights and OpenCV threads
 (`video-annotate refine --help`). Fast fitting uses up to 2,500 foreground samples.
@@ -153,15 +165,21 @@ are photometric agreement and do not establish physical correctness.
 ## Final interpolation sweep
 
 Before rendering, a final pass fills short internal failures only when source
-points remain visible, two measured consecutive neighbors exist on each side,
-and both neighboring trends support the bridge. It interpolates XY linearly,
+points remain visible and raw accepted neighbors exist on each side. The default
+requires two consecutive neighbors per side and matching local trends.
+`--gap-seconds .1 --gap-neighbors 1` instead permits simple endpoint interpolation
+without a trend test, which cannot be estimated from one sample per side.
+At240FPS this allows at most24 missing frames, each with a raw accepted neighbor
+on both sides within0.1 seconds. It interpolates XY linearly,
 scale logarithmically, and locally unwrapped rotation. It never extends a track,
 bridges occlusion, fills half-period angle ambiguity, or treats earlier filled
 rows as new evidence. Rotation-only failures can be filled separately.
 
 Coherence tolerances reuse half the existing local bounds: .05 log scale,
 5 degrees, and 15% of the scaled patch radius (at least 2 pixels). They are
-conservative gap-policy defaults, not accuracy guarantees.
+conservative multi-neighbor gap-policy defaults, not accuracy guarantees. The
+one-neighbor policy retains finite/positive scale, consecutive source-frame,
+visibility and half-period rotation checks, but cannot check motion consistency.
 `--gap-seconds 0` or `--gap-neighbors 0` disables filling. Longer or inconsistent
 gaps remain unavailable; interpolation cannot repair continuously accepted drift.
 

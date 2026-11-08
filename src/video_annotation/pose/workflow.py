@@ -211,7 +211,12 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
     fps = source['fps'] if overlay_fps is None else overlay_fps
     if not np.isfinite(fps) or fps<=0 or max_width<1:
         raise ValueError('Overlay FPS and maximum width must be positive')
-    signature = hashlib.sha256(json.dumps(dict(version=3,method=method,method_options=method_options,gap_seconds=gap_seconds,gap_neighbors=gap_neighbors,tracks=file_digest(tracks),
+    # Added KLT controls must not invalidate older runs using identical defaults.
+    signature_options={k:v for k,v in method_options.items() if not k.startswith('klt_')}
+    if method=='klt_ransac':
+        for key,default in dict(klt_max_points=200,klt_min_distance=4.,klt_window=21).items():
+            if method_options[key]!=default:signature_options[key]=method_options[key]
+    signature = hashlib.sha256(json.dumps(dict(version=3,method=method,method_options=signature_options,gap_seconds=gap_seconds,gap_neighbors=gap_neighbors,tracks=file_digest(tracks),
         metadata=file_digest(tracks.with_suffix('.json')),source=[video.stat().st_size,video.stat().st_mtime_ns],
         point_ids=selected,config=asdict(cfg),frames=count,
         supports={str(i):dict(radius=s['radius'],query=None if s['query'] is None else s['query'].tolist(),

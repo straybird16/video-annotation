@@ -1,5 +1,6 @@
 """Small final-sweep checks: component provenance, source visibility and motion."""
 from copy import deepcopy
+import json
 import math
 import unittest
 
@@ -67,7 +68,67 @@ class PoseGapTests(unittest.TestCase):
         self.assertEqual(processed[3]['x'],rows[3]['x'])
         _,summary=interpolate_pose_gaps(rows,fps=100,radius=30,gap_seconds=0)
         self.assertEqual(summary['rotation_interpolated'],0)
-        with self.assertRaises(ValueError):validate_gap_options(.1,1)
+        self.assertEqual(validate_gap_options(.1,1),(.1,1))
+        with self.assertRaises(ValueError):validate_gap_options(.1,-1)
+
+    def test_one_raw_neighbor_brackets_fill_with_flags_without_homography(self):
+        rows=self.rows()[2:5]
+        for row in rows:
+            row.update(homography_valid=int(row['frame']!=3),h00=1 if row['frame']!=3 else '')
+        rows[1].update(valid=0,rotation_valid=0,x='',y='',scale='',similarity_scale='')
+        saved=deepcopy(rows)
+        processed,summary=interpolate_pose_gaps(rows,fps=240,radius=30,gap_neighbors=1)
+        self.assertEqual(rows,saved)
+        self.assertEqual((summary['center_scale_interpolated'],summary['rotation_interpolated']),(1,1))
+        row=processed[1]
+        self.assertAlmostEqual(row['x'],103.)
+        self.assertAlmostEqual(row['scale'],math.exp(.03))
+        self.assertAlmostEqual(row['rotation_unwrapped_degrees'],179.)
+        self.assertEqual((row['fit_valid'],row['rotation_fit_valid'],row['valid'],row['rotation_valid']),(0,0,1,1))
+        self.assertEqual((row['homography_valid'],row['h00']),(0,''))
+        self.assertEqual(row['score'],'')
+        self.assertIn('one raw good neighbor per side',summary['motion_checks'])
+        json.dumps(summary,allow_nan=False)
+        _,conservative=interpolate_pose_gaps(rows,fps=240,radius=30,gap_neighbors=2)
+        self.assertEqual(conservative['center_scale_interpolated'],0)
+
+    def test_one_neighbor_duration_at_240fps_and_no_extrapolation_or_barriers(self):
+        def bracketed(missing):
+            left=self.rows()[0]
+            right={**left,'frame':missing+1,'x':124.,'scale':1.2,'similarity_scale':1.2,
+                   'rotation_degrees':178.,'rotation_unwrapped_degrees':178.}
+            return [left]+[{**left,'frame':index,'valid':0,'rotation_valid':0}
+                           for index in range(1,missing+1)]+[right]
+        for missing,expected in ((24,24),(25,0)):
+            with self.subTest(missing=missing):
+                _,summary=interpolate_pose_gaps(bracketed(missing),fps=240,radius=30,gap_neighbors=1)
+                self.assertEqual(summary['center_scale_interpolated'],expected)
+                self.assertEqual(summary['rotation_interpolated'],expected)
+        for mode in ('hidden','nonconsecutive','ended','leading','filled_witness'):
+            with self.subTest(mode=mode):
+                rows=bracketed(2)
+                if mode=='hidden':rows[1]['point_visible']=0
+                elif mode=='nonconsecutive':rows[-1]['frame']+=1
+                elif mode=='ended':rows=rows[:-1]
+                elif mode=='leading':rows=rows[1:]
+                else:rows[0].update(fit_valid=0,rotation_fit_valid=0,
+                                    center_scale_interpolated=1,rotation_interpolated=1)
+                _,summary=interpolate_pose_gaps(rows,fps=240,radius=30,gap_neighbors=1)
+                self.assertEqual(summary['center_scale_interpolated'],0)
+                self.assertEqual(summary['rotation_interpolated'],0)
+
+    def test_one_neighbor_retains_positive_scale_and_half_period_angle_guards(self):
+        rows=self.rows()[2:5]
+        rows[1].update(valid=0,rotation_valid=0)
+        rows[-1].update(scale=-1.,similarity_scale=-1.)
+        _,summary=interpolate_pose_gaps(rows,fps=240,radius=30,gap_neighbors=1)
+        self.assertEqual(summary['center_scale_interpolated'],0)
+        rows=self.rows()[2:5]
+        rows[1].update(valid=0,rotation_valid=0)
+        rows[-1].update(rotation_degrees=-4.,rotation_unwrapped_degrees=356.)
+        _,summary=interpolate_pose_gaps(rows,fps=240,radius=30,gap_neighbors=1)
+        self.assertEqual(summary['center_scale_interpolated'],1)
+        self.assertEqual(summary['rotation_interpolated'],0)
 
 
 if __name__=='__main__':unittest.main()

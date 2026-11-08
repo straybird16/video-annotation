@@ -15,8 +15,8 @@ GAP_FIELDS = ('fit_valid','rotation_fit_valid','center_scale_interpolated','rota
 def validate_gap_options(seconds=.1, neighbors=2):
     if isinstance(seconds,bool) or not isinstance(seconds,(int,float)) or not np.isfinite(seconds) or seconds<0:
         raise ValueError('Gap seconds must be finite and nonnegative')
-    if isinstance(neighbors,bool) or not isinstance(neighbors,int) or neighbors not in (0,) and neighbors<2:
-        raise ValueError('Gap neighbors must be zero (disabled) or an integer at least two')
+    if isinstance(neighbors,bool) or not isinstance(neighbors,int) or neighbors<0:
+        raise ValueError('Gap neighbors must be zero (disabled) or a positive integer')
     return float(seconds),neighbors
 
 
@@ -61,6 +61,8 @@ def interpolate_pose_gaps(rows, *, fps, radius, gap_seconds=.1, gap_neighbors=2,
     not previously filled values. Hidden points and nonconsecutive frame IDs are
     barriers. Pixel/log-scale/angle coherence gates intentionally favor leaving a
     gap invalid when neighboring motion does not support simple interpolation.
+    One neighbor per side permits endpoint interpolation without a trend test;
+    two or more retain the bidirectional local-trend checks.
     """
     seconds,neighbors=validate_gap_options(gap_seconds,gap_neighbors)
     if not np.isfinite(fps) or fps<=0 or not np.isfinite(radius) or radius<=0:
@@ -73,8 +75,10 @@ def interpolate_pose_gaps(rows, *, fps, radius, gap_seconds=.1, gap_neighbors=2,
     if count and np.any(np.diff(frames)<=0):
         raise ValueError('Pose rows must have increasing source frame IDs')
     shown=np.array([_flag(row.get('point_visible',0)) for row in rows],bool)
-    fit=np.array([_flag(row.get('valid',0)) for row in rows],bool)
-    rotation_fit=np.array([_flag(row.get('rotation_valid',0)) for row in rows],bool)
+    fit=np.array([_flag(row.get('fit_valid',row.get('valid',0))) and
+                  not _flag(row.get('center_scale_interpolated',0)) for row in rows],bool)
+    rotation_fit=np.array([_flag(row.get('rotation_fit_valid',row.get('rotation_valid',0))) and
+                           not _flag(row.get('rotation_interpolated',0)) for row in rows],bool)
     center=np.array([[_number(row,'x'),_number(row,'y')] for row in rows],float).reshape(count,2)
     scale=np.array([_number(row,'similarity_scale') if np.isfinite(_number(row,'similarity_scale'))
                     else _number(row,'scale') for row in rows])
@@ -100,7 +104,7 @@ def interpolate_pose_gaps(rows, *, fps, radius, gap_seconds=.1, gap_neighbors=2,
                 weight=(frames[first:stop]-frames[left])/(frames[right]-frames[left])
                 if component=='center_scale':
                     pixel_tolerance=max(2.,.15*radius*float(np.mean(scale[witnesses])))
-                    if (not _coherent(center[witnesses],sample_frames,neighbors,pixel_tolerance) or
+                    if neighbors>=2 and (not _coherent(center[witnesses],sample_frames,neighbors,pixel_tolerance) or
                             not _coherent(np.log(scale[witnesses]),sample_frames,neighbors,.05)):
                         continue
                     positions=center[left]+weight[:,None]*(center[right]-center[left])
@@ -131,7 +135,7 @@ def interpolate_pose_gaps(rows, *, fps, radius, gap_seconds=.1, gap_neighbors=2,
                             np.any(np.abs(np.diff(values[:neighbors]))>=rotation_period/2) or
                             np.any(np.abs(np.diff(values[neighbors:]))>=rotation_period/2) or
                             abs(values[neighbors]-values[neighbors-1])>=rotation_period/2 or
-                            not _coherent(values,sample_frames,neighbors,min(5.,rotation_period/12))):
+                            (neighbors>=2 and not _coherent(values,sample_frames,neighbors,min(5.,rotation_period/12)))):
                         continue
                     interpolated=values[neighbors-1]+weight*(values[neighbors]-values[neighbors-1])
                     for offset,index in enumerate(range(first,stop)):
@@ -150,7 +154,9 @@ def interpolate_pose_gaps(rows, *, fps, radius, gap_seconds=.1, gap_neighbors=2,
         rotation_interpolated=rotation_filled,fit_valid_frames=int(fit.sum()),rotation_fit_valid_frames=int(rotation_fit.sum()),
         usable_center_scale_frames=sum(row['valid'] for row in result),usable_rotation_frames=sum(row['rotation_valid'] for row in result),
         method='short bracketed linear XY, log-scale and unwrapped-angle interpolation; source-visible rows only; no extrapolation',
-        motion_checks='consecutive original reliable neighbors; bidirectional linear trend agreement: max(2px,15% scaled radius), .05 log-scale, min(5deg,period/12); reject half-period angle ambiguity')
+        motion_checks=('consecutive original reliable neighbors; reject half-period angle ambiguity; '
+            + ('one raw good neighbor per side; no trend test' if neighbors==1 else
+               'bidirectional linear trend agreement: max(2px,15% scaled radius), .05 log-scale, min(5deg,period/12)')))
 
 
 def finalize_pose_csv(raw_path, output_path, **options):

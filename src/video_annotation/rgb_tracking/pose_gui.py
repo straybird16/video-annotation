@@ -41,6 +41,9 @@ METHOD_FIELDS = (
     ('ic_iters', 'IC-LK iterations', int, 20),
     ('ic_stride', 'IC-LK pixel stride', int, 2),
     ('min_gain', 'Minimum geometric score gain', float, .0025),
+    ('klt_max_points', 'KLT maximum features (≥8)', int, 200),
+    ('klt_min_distance', 'KLT feature spacing (px; ≥1)', float, 4.),
+    ('klt_window', 'KLT window (odd px; ≥3)', int, 21),
 )
 
 
@@ -71,8 +74,6 @@ def parse_options(values):
         raise ValueError('Maximum frames must be positive or blank')
     if not 0 <= gap_seconds < float('inf') or gap_neighbors < 0:
         raise ValueError('Gap duration and gap neighbors must be finite and nonnegative; zero disables filling')
-    if gap_neighbors == 1:
-        raise ValueError('Gap neighbors must be at least two per side, or zero to disable filling')
     config = Config(support='circle', radius_blend=0., tracker_scale_weight=0., registration_scale_weight=1.)
     config_fields = FIELDS if method == 'anchored' else LOCAL_FIELDS
     for name, label, kind in config_fields:
@@ -161,7 +162,7 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
         basics = [('point_ids', 'Point IDs (blank = all)'), ('radius', 'Patch radius override (px; blank = saved)'),
                   ('max_frames', 'Maximum source frames (blank = all)'),
                   ('gap_seconds', 'Fill gaps up to (source seconds; 0 = off)'),
-                  ('gap_neighbors', 'Good neighbors per side (≥2; 0 = off)')]
+                  ('gap_neighbors', 'Raw accepted neighbors per side (≥1; 0 = off)')]
         for index, (name, label) in enumerate(basics):
             self.field(form, index//2, (index % 2)*2, label, self.variables[name])
         form.columnconfigure(1, weight=1); form.columnconfigure(3, weight=1)

@@ -312,12 +312,16 @@ def _roi_image(image, lo, hi):
 
 class SparseKLT:
     """Pyramidal LK, forward/backward check and reference-coordinate RANSAC H."""
-    def __init__(self, frame0, mask, max_points=200):
+    def __init__(self, frame0, mask, max_points=200, *, min_distance=4., window=21):
         if frame0.ndim != 2 or frame0.dtype != np.uint8 or np.shape(mask) != frame0.shape:
             raise ValueError('Sparse KLT requires uint8 grayscale and matching foreground mask')
         self.prev = frame0.copy()
         self.mask0 = (np.asarray(mask) != 0).astype(np.uint8) * 255
         self.max_points = int(max_points)
+        if (not np.isfinite(min_distance) or min_distance<1 or type(window) is not int or window<3 or window%2!=1):
+            raise ValueError('KLT feature distance must be >=1 and window must be odd and >=3')
+        self.min_distance=float(min_distance)
+        self.padding=max(96, (window//2+2)*8)
         yy, xx = np.nonzero(self.mask0)
         if not len(xx) or self.max_points < 8:
             raise ValueError('Sparse KLT needs at least eight foreground features')
@@ -327,13 +331,13 @@ class SparseKLT:
         self.mask_lo, self.mask_hi = _bounded_roi(self.support_corners, frame0.shape)
         self.mask_patch = _roi_image(self.mask0, self.mask_lo, self.mask_hi).copy()
         initial = cv2.goodFeaturesToTrack(_roi_image(frame0, self.mask_lo, self.mask_hi), maxCorners=self.max_points,
-                    qualityLevel=.008, minDistance=4, blockSize=5, mask=self.mask_patch)
+                    qualityLevel=.008, minDistance=self.min_distance, blockSize=5, mask=self.mask_patch)
         if initial is None or len(initial) < 8:
             raise ValueError('Sparse KLT needs at least eight foreground features')
         self.reference = (initial.reshape(-1, 2) + self.mask_lo).astype(np.float32)
         self.tracked = self.reference.copy()
         self.H = np.eye(3)
-        self.opts = dict(winSize=(21, 21), maxLevel=3,
+        self.opts = dict(winSize=(window, window), maxLevel=3,
                         criteria=(cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 20, .01))
 
     def estimate(self, current):
@@ -348,10 +352,11 @@ class SparseKLT:
         if len(self.tracked) < 8:
             return finish(reason='insufficient_features', matches=len(self.tracked))
         try:
-            # 96 source pixels conservatively cover a 21px LK window through
-            # pyramid level 3. Both frames share one crop origin; all retained
+            # At least96 source pixels cover the default21px LK window through
+            # pyramid level3; larger windows increase this guard. Both frames
+            # share one crop origin; all retained
             # points and the fitted H remain in full source coordinates.
-            lo, hi = _bounded_roi(self.tracked, current.shape, padding=96, align=8)
+            lo, hi = _bounded_roi(self.tracked, current.shape, padding=self.padding, align=8)
             previous_roi, current_roi = _roi_image(self.prev, lo, hi), _roi_image(current, lo, hi)
             local_points = (self.tracked-lo).astype(np.float32).reshape(-1, 1, 2)
             nxt, ok, _ = cv2.calcOpticalFlowPyrLK(previous_roi, current_roi, local_points, None, **self.opts)
@@ -404,10 +409,10 @@ class SparseKLT:
             candidate_mask = cv2.warpPerspective(self.mask_patch, to_roi @ H @ from_patch,
                 tuple((mask_hi-mask_lo).tolist()), flags=cv2.INTER_NEAREST)
             for point in self.tracked:
-                cv2.circle(candidate_mask, tuple(np.rint(point-mask_lo).astype(int)), 6, 0, -1)
+                cv2.circle(candidate_mask, tuple(np.rint(point-mask_lo).astype(int)), max(2,round(self.min_distance+2)), 0, -1)
             capacity = self.max_points - len(self.tracked)
             new = cv2.goodFeaturesToTrack(_roi_image(current, mask_lo, mask_hi), maxCorners=capacity, qualityLevel=.008,
-                                          minDistance=5, mask=candidate_mask, blockSize=5)
+                                          minDistance=self.min_distance+1, mask=candidate_mask, blockSize=5)
             if new is not None:
                 added = (new.reshape(-1, 2) + mask_lo).astype(np.float32)
                 canonical = warp_points(np.linalg.inv(H), added)

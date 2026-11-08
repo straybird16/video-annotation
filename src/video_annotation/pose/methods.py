@@ -24,12 +24,19 @@ METHOD_FIELDS = ('pose_method','pose_model','homography_valid',*H_FIELDS,'candid
 
 
 def method_options(value=None):
-    result = dict(ecc_iters=45,ic_iters=20,ic_stride=2,min_gain=.0025)
+    result = dict(ecc_iters=45,ic_iters=20,ic_stride=2,min_gain=.0025,
+                  klt_max_points=200,klt_min_distance=4.,klt_window=21)
     value = dict(value or {})
     if set(value)-set(result):raise ValueError('Unknown geometric method options: '+', '.join(sorted(set(value)-set(result))))
     result.update(value)
-    for key in ('ecc_iters','ic_iters','ic_stride'):
+    for key in ('ecc_iters','ic_iters','ic_stride','klt_max_points','klt_window'):
         if type(result[key]) is not int or result[key]<1:raise ValueError(key+' must be a positive integer')
+    if result['klt_max_points']<8 or result['klt_window']<3 or result['klt_window']%2!=1:
+        raise ValueError('KLT needs at least eight features and an odd window >=3')
+    distance=result['klt_min_distance']
+    if isinstance(distance,bool) or not isinstance(distance,(int,float)) or not np.isfinite(distance) or distance<1:
+        raise ValueError('klt_min_distance must be finite and >=1')
+    result['klt_min_distance']=float(distance)
     if isinstance(result['min_gain'],bool) or not isinstance(result['min_gain'],(int,float)) or not np.isfinite(result['min_gain']) or not 0<=result['min_gain']<2:
         raise ValueError('min_gain must be finite and in [0,2)')
     result['min_gain']=float(result['min_gain'])
@@ -73,7 +80,8 @@ class GeometricEstimator:
             support=np.zeros(gray.shape,np.uint8)
             cv2.circle(support,tuple(np.rint(self.center).astype(int)),max(1,round(min(box[2:])/2)),1,-1)
             if mask is not None:support &= np.asarray(mask,bool).astype(np.uint8)
-            try:self.sparse=SparseKLT(gray,support)
+            try:self.sparse=SparseKLT(gray,support,max_points=options['klt_max_points'],
+                min_distance=options['klt_min_distance'],window=options['klt_window'])
             except cv2.error as error:raise ValueError('KLT initialization: '+str(error)) from error
         else:
             self.base=base_factory(gray,box,config,mask=mask)
@@ -125,7 +133,8 @@ class GeometricEstimator:
             if not int(row['valid']):return {**row,'pose_method':self.method,'homography_valid':0}
             seed=similarity_matrix(row,self.reference_center)
             if self.dense is not None:
-                H,stats=self.dense.estimate(gray,seed,self.method,mask=mask,**{k:v for k,v in self.options.items() if k!='ic_stride'})
+                H,stats=self.dense.estimate(gray,seed,self.method,mask=mask,
+                    **{k:self.options[k] for k in ('ecc_iters','ic_iters','min_gain')})
             else:H,stats=None,dict(reason=self.dense_error,used=0,runtime=0.)
             score=stats.get('score_after',-1.)
             accepted=H is not None # Preserve the supplied solver's geometric/gain gates.

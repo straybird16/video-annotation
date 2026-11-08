@@ -105,6 +105,21 @@ class GeometricPoseTests(unittest.TestCase):
         self.assertEqual(stats['reason'], 'insufficient_features')
         json.dumps(stats, allow_nan=False)
 
+    def test_sparse_tunable_density_window_and_validation(self):
+        from video_annotation.pose.methods import method_options, create_estimator
+        defaults=SparseKLT(self.initial,self.mask)
+        sparse=SparseKLT(self.initial,self.mask,max_points=300,min_distance=2.5,window=31)
+        self.assertGreaterEqual(len(sparse.reference),len(defaults.reference))
+        self.assertEqual(sparse.opts['winSize'],(31,31))
+        self.assertGreaterEqual(sparse.padding,128)
+        estimator=create_estimator(self.initial,[40,40,64,64],Config(),mask=self.mask,
+            method='klt_ransac',options={'klt_max_points':300,'klt_min_distance':2.5,'klt_window':31})
+        self.assertEqual(estimator.sparse.opts['winSize'],(31,31))
+        self.assertEqual(estimator.sparse.min_distance,2.5)
+        for values in ({'klt_max_points':7},{'klt_window':20},{'klt_min_distance':.5},
+                       {'klt_min_distance':float('nan')},{'klt_window':True}):
+            with self.subTest(values=values),self.assertRaises(ValueError):method_options(values)
+
     def test_sparse_large_source_uses_bounded_crops_interior_and_at_border(self):
         rng = np.random.default_rng(21)
         initial = np.rint(cv2.GaussianBlur(rng.uniform(0, 255, (720, 1280)).astype(np.float32),

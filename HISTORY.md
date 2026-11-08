@@ -2,6 +2,12 @@
 
 Newest entries first. See PROVENANCE.md for the original workspace history.
 
+- 2026-11-08 — Added one-neighbor bracketed pose-gap interpolation and KLT
+  feature-density/window controls in GUI/CLI. Checked two additional presets
+  per fast/geometric method on corrected Ball02 tracks, preserving native fits,
+  annotations and separate inferred-component flags. Codex coordinator with
+  resumed gap/GUI workers. [Policy and controls](docs/POSE_REFINEMENT.md).
+
 - 2026-11-08 — Integrated the supplied ECC affine/homography, IC-LK and sparse
   KLT/RANSAC pose alternatives, two guarded homography corrections and the
   original fast route. Added GUI/CLI method selection, full source-coordinate

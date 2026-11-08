@@ -147,6 +147,9 @@ def parser():
     refine.add_argument("--ic-iters", type=positive, default=20, help="inverse-compositional iteration limit")
     refine.add_argument("--ic-stride", type=positive, default=2, help="inverse-compositional pixel sampling stride")
     refine.add_argument("--min-gain", type=float, default=.0025, help="minimum accepted geometric correlation gain")
+    refine.add_argument("--klt-max-points", type=positive, default=200, help="KLT maximum features, at least 8")
+    refine.add_argument("--klt-min-distance", type=float, default=4., help="KLT feature spacing in source pixels, at least 1")
+    refine.add_argument("--klt-window", type=positive, default=21, help="KLT optical-flow window in pixels, odd and at least 3")
     refine.add_argument("--min-score", type=float, default=.75)
     refine.add_argument("--full-search", action="store_true", help="disable the cheaper guarded local path")
     refine.add_argument("--reference-interval", type=positive, default=10)
@@ -177,9 +180,9 @@ def parser():
     anchor.add_argument("--recovery-scale-step", type=float, default=1.25,
                         help="coarse original-reference recovery multiplicative scale step")
     refine.add_argument("--gap-seconds", type=float, default=.1,
-                        help="maximum short gap to interpolate in source-video seconds; 0 disables")
+                        help="maximum bracketed gap in source-video seconds; no extrapolation; 0 disables")
     refine.add_argument("--gap-neighbors", type=nonnegative, default=2,
-                        help="trusted samples per side of a filled gap, at least 2; 0 disables")
+                        help="raw accepted samples per side of a filled gap, at least 1; 0 disables")
     refine.add_argument("--opencv-threads", type=positive, default=1)
     refine.add_argument("--overlay", action="store_true", help="render a combined bounding-circle/rotation MP4")
     refine.add_argument("--overlay-fps", type=float, help="preview speed only; source frame IDs/timestamps are preserved")
@@ -407,7 +410,8 @@ def refine_command(args):
         overlay_fps=args.overlay_fps, max_width=args.max_width, force=args.force,
         render_options=rendering_configuration(args), opencv_threads=args.opencv_threads,
         gap_seconds=args.gap_seconds, gap_neighbors=args.gap_neighbors,
-        method=args.pose_method, method_options={name:getattr(args, name) for name in ('ecc_iters','ic_iters','ic_stride','min_gain')},
+        method=args.pose_method, method_options={name:getattr(args, name) for name in
+            ('ecc_iters','ic_iters','ic_stride','min_gain','klt_max_points','klt_min_distance','klt_window')},
         progress=lambda value: print(value, flush=True))
     print(json.dumps(result, indent=2))
 
