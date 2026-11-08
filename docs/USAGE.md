@@ -10,7 +10,9 @@ outside its root. The GUI contains separate **Annotate points**, **Review tracks
 Click to add points, select one or several list rows to remove them or change
 their radii, and save references with **Save points** or **Save & next**. Source
 coordinates follow the displayed video orientation. Thin circles show intended
-patch support; resizing and zooming the view do not change saved coordinates.
+patch support. Main point and mask views support wheel or +/− zoom, middle-drag
+or Shift-left-drag pan, and **Fit** / F to reset. Click the image before using
+keyboard shortcuts. Saved coordinates/radii remain source pixels.
 
 **Edit patch mask** provides brush, polygon, box, import and optional SAM preview.
 Left-drag adds foreground; right-drag erases. Zoom with the wheel or +/− and pan
@@ -100,6 +102,21 @@ Render settings for quality, FPS, size and frame limit. Open-folder buttons loca
 the data and MP4. See [pose settings and output definitions](POSE_REFINEMENT.md).
 
 ## SAM objects and masks
+
+For several objects on one frame, select **Clicks**, click foreground points for
+one object and press **N**. This queues that object's prompt and clears the
+clicks for the next object; repeat. Right-click adds background clicks to the
+current object. **Ctrl+Enter** / **Segment queued** processes the objects one at
+a time with the same lazy model. A final unqueued prompt is included automatically.
+Queue markers identify pending objects; **Undo queued** restores the last prompt.
+
+Results remain separate in **Preview objects**. Review/deselect masks, then use
+**Save selected masks as ROIs** to save them independently. Segmentation does not
+write annotations until you save. Ordinary failed prompts remain queued for
+retry; cancellation/allocation errors stop safely and retain the prompts. The
+queue belongs to the displayed video/frame and is a session draft; navigation
+asks before discarding it. Zoom/crop never changes the full-frame SAM input.
+
 
 Use the separate SAM views for object masks. Each ROI/reference and object ID
 remains independently identifiable even when objects run in one native pass.

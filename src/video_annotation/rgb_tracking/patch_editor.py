@@ -15,7 +15,7 @@ import numpy as np
 from video_annotation.mask_tracking.annotations import MaskController, validate_prompt
 from video_annotation.mask_tracking.labeler import MaskLabeler
 from video_annotation.mask_tracking.workflow import Processor, _event, _result_masks, native_prompt
-from video_annotation.rgb_tracking.annotations import DisplayTransform
+from .viewport import PatchViewportTransform
 from video_annotation.rgb_tracking.tapnextpp import ROOT
 from video_annotation.rgb_tracking.workflow import Cancelled, check_cancel
 
@@ -119,33 +119,6 @@ class PatchMaskResult:
     mask: np.ndarray
     point_xy: tuple
     radius: int
-
-
-class PatchViewportTransform:
-    """Offset-aware DisplayTransform for only the visible source crop."""
-
-    def __init__(self, width, height, canvas_width, canvas_height, center, zoom):
-        crop_width = min(width, max(1, int(np.ceil(canvas_width / zoom))))
-        crop_height = min(height, max(1, int(np.ceil(canvas_height / zoom))))
-        self.x0 = int(np.clip(round(center[0]-(crop_width-1)/2), 0, width-crop_width))
-        self.y0 = int(np.clip(round(center[1]-(crop_height-1)/2), 0, height-crop_height))
-        self.width, self.height = crop_width, crop_height
-        self.base = DisplayTransform(crop_width, crop_height, canvas_width, canvas_height)
-
-    @property
-    def geometry(self):
-        return self.base.geometry
-
-    @property
-    def slices(self):
-        return (slice(self.y0, self.y0+self.height), slice(self.x0, self.x0+self.width))
-
-    def to_source(self, x, y):
-        point = self.base.to_source(x, y)
-        return None if point is None else [point[0]+self.x0, point[1]+self.y0]
-
-    def to_canvas(self, x, y):
-        return self.base.to_canvas(x-self.x0, y-self.y0)
 
 
 class _PatchController(MaskController):
@@ -274,7 +247,7 @@ class PointPatchEditor(MaskLabeler):
         controller = _PatchController(np.asarray(image_bgr), self.point_xy, self.radius, mask)
         window = tk.Toplevel(parent)
         previous_afters = set(window.tk.call("after", "info"))
-        super().__init__(controller, self.patch_session.bind_image(controller.image), root=window)
+        super().__init__(controller, self.patch_session.bind_image(controller.image), root=window, annotation_tools=False)
         self.brush_var.set(str(max(1, min(12, round(self.radius/8)))))
         # MaskLabeler schedules its first poll; own that callback for modal close.
         for callback in set(window.tk.call("after", "info"))-previous_afters:

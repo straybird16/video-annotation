@@ -2,6 +2,11 @@
 
 Newest entries first. See PROVENANCE.md for the original workspace history.
 
+- 2026-11-08 — Added N-to-queue separate SAM objects and sequential Ctrl+Enter
+  segmentation, plus shared main point/mask zoom and pan. Existing patch-editor
+  viewport reused; source-coordinate references unchanged. Codex coordinator,
+  continued SAM GUI job. [Usage](docs/USAGE.md).
+
 - 2026-11-07 — Added immutable-original/local-recent pose fusion with independent
   coarse recovery, interpretable exponential weights and audited short-gap
   interpolation. GUI/CLI expose controls and timing; raw fits remain separate.

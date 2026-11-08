@@ -6,7 +6,6 @@ import threading
 import cv2
 import numpy as np
 
-from video_annotation.rgb_tracking.annotations import DisplayTransform
 from video_annotation.rgb_tracking.labeler import PointLabeler
 from video_annotation.rgb_tracking.workflow import Cancelled
 from video_annotation.rgb_tracking.tapnextpp import contained_path
@@ -44,7 +43,7 @@ class MaskLabeler(PointLabeler):
     """Reuse PointLabeler navigation, cancel-safe polling, close and event dispatch."""
 
     def __init__(self, controller, processor, *, track=False, overlay=False,
-                 overlay_fps=None, max_width=1280, joint=True, root=None, embedded=False):
+                 overlay_fps=None, max_width=1280, joint=True, root=None, embedded=False, annotation_tools=True):
         try:
             import tkinter as tk
             from tkinter import ttk, messagebox, filedialog, simpledialog
@@ -75,6 +74,7 @@ class MaskLabeler(PointLabeler):
         self.tool_var, self.label_var = tk.StringVar(value="Clicks"), tk.IntVar(value=1)
         self.brush_var, self.text_var = tk.StringVar(value="12"), tk.StringVar()
         self.preview_masks = {}
+        self.queued_prompts = []
         self.region_cache, self.region_cache_ready = None, False
         self.drag_start = self.drag_end = self.brush_mask = self.brush_last = None
         self.vertices, self.roi_ids, self.loading_fields = [], [], False
@@ -121,6 +121,16 @@ class MaskLabeler(PointLabeler):
         self.canvas.bind("<B1-Motion>", lambda event: self.action(lambda: self.motion(event)))
         self.canvas.bind("<ButtonRelease-1>", lambda event: self.action(lambda: self.release(event)))
         self.canvas.bind("<Button-3>", lambda event: self.action(lambda: self.click(event, label=0)))
+        if annotation_tools:
+            self.setup_viewport(bar)
+            self.queue_info = ttk.Label(side,text='No queued objects',wraplength=180)
+            self.queue_info.pack(fill='x',pady=4)
+            self._button(side,'Queue object [N]',self.queue_object,side='top')
+            self._button(side,'Undo queued',self.undo_queued,side='top')
+            self._button(side,'Segment queued [Ctrl+Enter]',self.preview_queued,side='top')
+            self.canvas.bind('<n>',lambda event:self.queue_shortcut(self.queue_object))
+            self.canvas.bind('<N>',lambda event:self.queue_shortcut(self.queue_object))
+            self.canvas.bind('<Control-Return>',lambda event:self.queue_shortcut(self.preview_queued))
         tools = ttk.Frame(self.root, padding=4)
         tools.pack(fill="x")
         ttk.Label(tools, text="Tool:").pack(side="left")
@@ -195,7 +205,7 @@ class MaskLabeler(PointLabeler):
             self.messages.showerror("Mask annotation failed", str(error), parent=self.root)
 
     def _discard(self):
-        return not self.controller.dirty or self.messages.askyesno("Unsaved ROI", "Discard unsaved prompt edits? Saved references remain on disk.", parent=self.root)
+        return not (self.controller.dirty or self.queued_prompts) or self.messages.askyesno("Unsaved ROI", "Discard unsaved prompts and queued objects? Saved references remain on disk.", parent=self.root)
 
     def _base(self):
         return {"object_id": self.controller.prompt.get("object_id", 1)}
@@ -217,6 +227,8 @@ class MaskLabeler(PointLabeler):
 
     def show(self):
         c = self.controller
+        self.queued_prompts = []
+        self.sync_queue()
         self.frame_var.set(str(c.frame))
         self.label_var.set(1)
         self.load_prompt_fields()
@@ -360,18 +372,27 @@ class MaskLabeler(PointLabeler):
     def redraw(self):
         c = self.controller
         h, w = c.image.shape[:2]
-        self.transform = DisplayTransform(w, h, max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height()))
+        self.transform = self.view_transform()
         left, top, dw, dh = self.transform.geometry
-        image = c.image.copy()
+        crop = getattr(self.transform,'slices',(slice(None),slice(None)))
+        image = c.image[crop].copy()
         region = self.brush_mask if self.brush_mask is not None else self.region_mask()
         if region is not None:
+            region = region[crop]
             image[region] = (image[region]*.75 + np.array([30, 220, 240])*.25).astype(np.uint8)
         if self.preview_masks:
             from .render import draw_masks
-            image = draw_masks(image, self.preview_masks)
+            image = draw_masks(image, {key:mask[crop] for key,mask in self.preview_masks.items()})
         self.photo = self.ImageTk.PhotoImage(self.Image.fromarray(image[..., ::-1]).resize((dw, dh), self.Image.Resampling.BILINEAR), master=self.root)
         self.canvas.delete("all")
         self.canvas.create_image(left, top, image=self.photo, anchor="nw")
+        for identity,reference in enumerate(getattr(self,'queued_prompts',()),1):
+            prompt = reference['prompt']
+            for point,label in zip(prompt.get('points_xy',()),prompt.get('point_labels',())):
+                if label:
+                    x,y = self.transform.to_canvas(*point)
+                    self.canvas.create_text(x+6,y-6,text=f'Q{identity}',fill='#80e0ff',anchor='sw')
+                    self.canvas.create_oval(x-4,y-4,x+4,y+4,outline='#80e0ff',width=2)
         prompt = c.prompt
         for point, label in zip(prompt.get("points_xy", []), prompt.get("point_labels", [])):
             x, y = self.transform.to_canvas(*point)
@@ -399,6 +420,7 @@ class MaskLabeler(PointLabeler):
     def press(self, event):
         if self.controller.busy:
             return
+        if hasattr(self,'canvas'):self.canvas.focus_set()
         point = self.transform.to_source(event.x, event.y)
         if point is None:
             return
@@ -564,7 +586,13 @@ class MaskLabeler(PointLabeler):
         return self.controller.current_reference()
 
     def save(self):
-        self._prompt_ready()
+        if self.preview_masks:
+            self._frame_matches()
+            self.controller._idle()
+        else:
+            if self.queued_prompts:
+                raise ValueError('Segment queued objects first, then Save selected masks as ROIs')
+            self._prompt_ready()
         if self.preview_masks:
             if len(self.preview_masks) == 1:
                 selected = [next(iter(self.preview_masks))]
@@ -627,9 +655,86 @@ class MaskLabeler(PointLabeler):
             return {"kind":"preview", "preview":result, "output":f"preview: {len(result.masks)} separate object mask(s)"}
         self._launch(work)
 
+    def sync_queue(self):
+        if hasattr(self,'queue_info'):
+            count = len(self.queued_prompts)
+            self.queue_info.configure(text=f'{count} object(s) queued. N: next object; Ctrl+Enter: segment.')
+
+    def queue_shortcut(self,function):
+        self.action(function)
+        return 'break'
+
+    def queue_object(self):
+        self.controller._idle()
+        reference = deepcopy(self._prompt_ready())
+        self.queued_prompts.append(reference)
+        self.controller.edit({})
+        self.vertices,self.preview_masks = [],{}
+        self.drag_start=self.drag_end=self.brush_mask=self.brush_last=None
+        self.region_cache_ready=False
+        self.load_prompt_fields()
+        self.tool_var.set('Clicks')
+        self.label_var.set(1)
+        self.sync_queue()
+        self.sync_motion_controls()
+        self.redraw()
+        self.canvas.focus_set()
+        self.status.set(f'Queued object {len(self.queued_prompts)}. Click the next object and press N; Ctrl+Enter segments the queue.')
+
+    def undo_queued(self):
+        self.controller._idle()
+        if not self.queued_prompts:
+            return
+        if self.controller.prompt:
+            raise ValueError('Clear or queue the current prompt before restoring the last queued object')
+        reference=self.queued_prompts.pop()
+        self.edit(deepcopy(reference['prompt']))
+        self.load_prompt_fields()
+        self.sync_queue()
+
+    def preview_queued(self):
+        self.controller._idle()
+        self._frame_matches()
+        # Include the last drawn object even when its N press was omitted.
+        if self.controller.prompt:
+            self.queue_object()
+        if not self.queued_prompts:
+            raise ValueError('Click an object and press N to queue it first')
+        references=deepcopy(self.queued_prompts)
+        video=self.controller.video
+        def work():
+            masks,failed,errors={},{},[]
+            for index,reference in enumerate(references,1):
+                if self.cancel.is_set():
+                    raise Cancelled('Queued segmentation cancelled')
+                self.events.put(('progress',f'Segmenting queued object {index}/{len(references)}'))
+                try:
+                    result=self.processor.preview(video,reference,cancel=self.cancel.is_set,
+                        progress=lambda message:self.events.put(('progress',message)))
+                    found=[np.asarray(mask,bool).copy() for _,mask in sorted(result.masks.items()) if np.asarray(mask).any()]
+                    if not found:raise ValueError('No nonempty object mask found')
+                except Cancelled:
+                    raise
+                except Exception as error:
+                    from .memory import is_allocation_error
+                    if is_allocation_error(error):raise
+                    failed[index]=reference
+                    errors.append(f'Q{index}: {error}')
+                    continue
+                for mask in found:
+                    masks[len(masks)+1]=mask
+            return dict(kind='queued_preview',masks=masks,failed=list(failed.values()),
+                output=f'{len(masks)} separate mask(s); {len(failed)} queued object(s) failed'+
+                       (': '+'; '.join(errors[:3]) if errors else ''))
+        self._launch(work)
+
     def job_completed(self, result):
-        if result.get("kind") == "preview":
-            self.preview_masks = {int(identity):np.asarray(mask,bool).copy() for identity,mask in result["preview"].masks.items()}
+        if result.get("kind") in ('preview','queued_preview'):
+            if result['kind']=='queued_preview':
+                self.queued_prompts=result['failed']
+                self.sync_queue()
+            masks=result['masks'] if result['kind']=='queued_preview' else result['preview'].masks
+            self.preview_masks = {int(identity):np.asarray(mask,bool).copy() for identity,mask in masks.items()}
             if self.preview_masks:
                 self.controller.dirty = True
             self.preview_info.configure(text="Preview object IDs: " + (", ".join(map(str,self.preview_masks)) or "none") + "\nObjects remain separate; refine prompts to correct selection.")

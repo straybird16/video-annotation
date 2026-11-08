@@ -217,6 +217,7 @@ class PointLabeler:
         self.canvas.bind("<Configure>", lambda event: self.redraw())
         self.canvas.bind("<Button-1>", self.click)
         self.canvas.bind("<Button-3>", self.remove_nearest)
+        self.setup_viewport(toolbar)
         footer = ttk.Frame(annotation_parent)
         footer.pack(side="bottom", fill="x")
         tracker_bar = ttk.Frame(footer, padding=5)
@@ -802,13 +803,14 @@ class PointLabeler:
     def redraw(self):
         c = self.controller
         h, w = c.image.shape[:2]
-        self.transform = DisplayTransform(w, h, max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height()))
+        self.transform = self.view_transform()
         left, top, dw, dh = self.transform.geometry
         visible = self.mask_visible_var.get() if hasattr(self, "mask_visible_var") else True
         color = self.mask_color_var.get() if hasattr(self, "mask_color_var") else None
         alpha = self.mask_alpha_var.get() if hasattr(self, "mask_alpha_var") else .3
         preview = mask_preview(c.image, c.points, getattr(c, "patches", []), color=color, alpha=alpha) if visible else c.image
-        image = self.Image.fromarray(preview[..., ::-1]).resize((dw, dh), self.Image.Resampling.BILINEAR)
+        crop = getattr(self.transform, 'slices', (slice(None), slice(None)))
+        image = self.Image.fromarray(preview[crop][..., ::-1]).resize((dw, dh), self.Image.Resampling.BILINEAR)
         self.photo = self.ImageTk.PhotoImage(image, master=self.root)
         self.canvas.delete("all")
         self.canvas.create_image(left, top, image=self.photo, anchor="nw")
@@ -820,7 +822,7 @@ class PointLabeler:
             x, y = self.transform.to_canvas(*xy)
             patch = getattr(c, "patches", [])
             if identity < len(patch):
-                rx, ry = patch[identity]["radius"] * dw / w, patch[identity]["radius"] * dh / h
+                rx, ry = patch[identity]["radius"] * dw / self.transform.width, patch[identity]["radius"] * dh / self.transform.height
                 self.canvas.create_oval(x-rx, y-ry, x+rx, y+ry,
                                         outline="#80e0e0" if identity in selected else "#a0a0a0", width=1)
             self.canvas.create_oval(x-5, y-5, x+5, y+5, outline="black", width=4)
@@ -835,10 +837,69 @@ class PointLabeler:
     def click(self, event):
         if self.controller.busy:
             return
+        if hasattr(self,'canvas'):self.canvas.focus_set()
         point = self.transform.to_source(event.x, event.y)
         if point is not None:
             self.controller.add(point)
             self.redraw()
+
+    def setup_viewport(self, toolbar):
+        from .viewport import AnnotationViewport
+        self.viewport = AnnotationViewport()
+        self.pan_start = None
+        for text,command in (('−',lambda:self.zoom_view(1/1.4)),('+',lambda:self.zoom_view(1.4)),('Fit',self.fit_view)):
+            self.ttk.Button(toolbar,text=text,command=command,width=4).pack(side='left',padx=2)
+        self.ttk.Label(toolbar,text='Wheel: zoom · middle/Shift-drag: pan').pack(side='left',padx=6)
+        self.canvas.bind('<MouseWheel>',lambda e:self.zoom_view(1.4 if e.delta>0 else 1/1.4,e))
+        self.canvas.bind('<Button-4>',lambda e:self.zoom_view(1.4,e))
+        self.canvas.bind('<Button-5>',lambda e:self.zoom_view(1/1.4,e))
+        for button in ('Button-2','Shift-Button-1'):
+            self.canvas.bind('<'+button+'>',self.start_view_pan)
+        self.canvas.bind('<B2-Motion>',self.pan_view)
+        self.canvas.bind('<Shift-B1-Motion>',self.pan_view)
+        for key in ('plus','equal'):
+            self.canvas.bind('<'+key+'>',lambda e:self.zoom_view(1.4))
+        self.canvas.bind('<minus>',lambda e:self.zoom_view(1/1.4))
+        self.canvas.bind('<f>',lambda e:self.fit_view())
+
+    def view_transform(self):
+        h,w = self.controller.image.shape[:2]
+        cw,ch = max(1,self.canvas.winfo_width()),max(1,self.canvas.winfo_height())
+        if hasattr(self,'viewport'):
+            return self.viewport.transform(self.controller.image,str(self.controller.video),cw,ch)
+        return DisplayTransform(w,h,cw,ch)
+
+    def zoom_view(self,factor,event=None):
+        import numpy as np
+        anchor = self.transform.to_source(event.x,event.y) if event is not None else None
+        self.viewport.zoom = float(np.clip(self.viewport.zoom*factor,1.,64.))
+        self.redraw()
+        if anchor is not None:
+            moved = self.transform.to_source(event.x,event.y)
+            if moved is not None:
+                self.viewport.center += np.asarray(anchor)-moved
+                self.redraw()
+        return 'break'
+
+    def fit_view(self):
+        self.viewport.key = None
+        self.redraw()
+        return 'break'
+
+    def start_view_pan(self,event):
+        self.canvas.focus_set()
+        self.pan_start = (event.x,event.y,self.viewport.center.copy())
+        return 'break'
+
+    def pan_view(self,event):
+        import numpy as np
+        if self.pan_start is not None:
+            x,y,center = self.pan_start
+            _,_,dw,dh = self.transform.geometry
+            self.viewport.center = center-np.array([(event.x-x)*self.transform.width/dw,
+                                                    (event.y-y)*self.transform.height/dh])
+            self.redraw()
+        return 'break'
 
     def remove_nearest(self, event):
         if self.controller.busy or not self.controller.points:
