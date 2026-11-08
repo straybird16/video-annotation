@@ -297,8 +297,10 @@ class PointController:
             reference, notice = None, str(exc)
         self.index, self.frame, self.image = index, frame, image
         self.points = reference["points_xy"] if reference else []
-        self.point_ids = reference['point_ids'] if reference else []
-        self._next_point_id = max(self.point_ids, default=-1) + 1
+        self.point_ids = list(range(len(self.points)))
+        if reference and reference['point_ids'] != self.point_ids:
+            notice += ' Point IDs compacted to 0..N-1 in this draft; Save to confirm, or use reindex for linked saved tracks.'
+        self._next_point_id = len(self.points)
         if reference:
             from .regions import load_patch_regions
             radii, masks = load_patch_regions(reference, video, self.default_radius)
@@ -329,15 +331,15 @@ class PointController:
         self._idle()
         previous = self.patches
         self._remember()
-        old_ids = self.point_ids
         self.patches = [deepcopy(previous[index]) if index < len(self.points) and list(point) == self.points[index]
                         else {"radius": self.default_radius, "mask": None} for index, point in enumerate(points)]
         self.points = [list(p) for p in points]
-        self.point_ids = old_ids[:len(points)]
-        while len(self.point_ids) < len(points):
-            self.point_ids.append(self._next_point_id)
-            self._next_point_id += 1
+        self._compact_ids()
         self.dirty = True
+
+    def _compact_ids(self):
+        self.point_ids = list(range(len(self.points)))
+        self._next_point_id = len(self.points)
 
     def add(self, point):
         h, w = self.image.shape[:2]
@@ -362,12 +364,14 @@ class PointController:
             self.points.pop(index)
             self.patches.pop(index)
             self.point_ids.pop(index)
+        self._compact_ids()
         self.dirty = True
 
     def undo(self):
         self._idle()
         if self.undo_stack:
             self.points, self.patches, self.point_ids = self.undo_stack.pop()
+            self._compact_ids()
             self.dirty = True
 
     def set_patch(self, index, radius=None, mask=..., point_xy=None):

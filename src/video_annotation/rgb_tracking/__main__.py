@@ -129,6 +129,9 @@ def parser():
     clean.add_argument("--reacquire-seconds", type=float, default=.5,
                        help="recovery window in source-video seconds (default 0.5; 0 ends immediately)")
     clean.add_argument("--dry-run", action="store_true", help="report changes without writing files")
+    reindex = sub.add_parser('reindex',help='compact saved point IDs, including linked corrections/poses, with backups')
+    reindex.add_argument('--data-dir',type=Path,help='workspace data directory; default data/')
+    reindex.add_argument('--dry-run',action='store_true')
     refine = sub.add_parser("refine", help="refine point patches with anchored correlation and short-gap interpolation")
     refine.add_argument("--tracks", type=Path, required=True, help="original or corrected point CSV")
     refine.add_argument("--output-dir", type=Path, help="data-local pose folder; default beside the input tracks")
@@ -490,6 +493,9 @@ def main(argv=None):
                                            max_width=args.max_width, force=args.force,
                                            render_options=rendering_configuration(args),
                                            reacquire_seconds=args.reacquire_seconds), indent=2))
+        elif args.command == 'reindex':
+            from .reindex import reindex_saved_points
+            print(json.dumps(reindex_saved_points(args.data_dir,dry_run=args.dry_run),indent=2))
         elif args.command == "clean":
             from .cleanup_tracks import cleanup_saved_tracks
             print(json.dumps(cleanup_saved_tracks(saved_track_files(args.master),

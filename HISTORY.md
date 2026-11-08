@@ -2,6 +2,12 @@
 
 Newest entries first. See PROVENANCE.md for the original workspace history.
 
+- 2026-11-08 — Fixed per-instance SAM preview brushing/undo without discarding
+  peer masks. Point draft deletion/undo now compacts labels; added a backed-up
+  ID migration for references, original/corrected tracks, quality and refined
+  poses with verified dependency rebasing. Codex coordinator and resumed SAM
+  editor worker. [Usage](docs/USAGE.md).
+
 - 2026-11-08 — Added N-to-queue separate SAM objects and sequential Ctrl+Enter
   segmentation, plus shared main point/mask zoom and pan. Existing patch-editor
   viewport reused; source-coordinate references unchanged. Codex coordinator,

@@ -26,7 +26,13 @@ Point reference CSV columns are `frame,point_id,x,y,radius,mask`. Coordinates an
 radii are native displayed-image pixels; frame indices are zero-based. A query
 set uses one reference frame. The JSON sidecar records source/root paths,
 dimensions and orientation, without duplicating point rows. Optional masks are
-full-frame binary PNGs referenced relative to the CSV. Point IDs remain stable.
+full-frame binary PNGs referenced relative to the CSV. Annotation labels are
+consecutive `0..N-1` in saved row order; deleting/undoing draft points compacts
+the list. Saved track IDs remain fixed across frames, including visibility gaps.
+`video-annotate reindex` migrates older labels across references, predictions,
+corrections and point poses together, with adjacent `.pre-reindex` backups and
+`id_reindex` provenance. It invalidates old opaque inference/refinement cache
+signatures rather than claiming they were recomputed; no model is run.
 
 Point predictions mirror RGB folders under
 `data/pseudo-ground-truths/point_tracks/<source-relative-folder>/<tracker>/<motion>/`.

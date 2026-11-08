@@ -9,7 +9,9 @@ outside its root. The GUI contains separate **Annotate points**, **Review tracks
 
 Click to add points, select one or several list rows to remove them or change
 their radii, and save references with **Save points** or **Save & next**. Source
-coordinates follow the displayed video orientation. Thin circles show intended
+coordinates follow the displayed video orientation. Point labels use consecutive
+IDs starting at zero in list order. Undo/cancel reuses the removed ID; deleting
+a point compacts the remaining labels before saving. Thin circles show intended
 patch support. Main point and mask views support wheel or +/− zoom, middle-drag
 or Shift-left-drag pan, and **Fit** / F to reset. Click the image before using
 keyboard shortcuts. Saved coordinates/radii remain source pixels.
@@ -62,6 +64,19 @@ Render-only without `--clean-existing` still leaves CSVs unchanged. The policy
 uses reported visibility and in-frame positions; it cannot detect an object that
 has disappeared when the tracker continues to report a valid visible position.
 
+To renumber existing references and tracks together, including saved corrections,
+quality rows and refined poses, run once from the workspace:
+
+```bash
+video-annotate reindex --dry-run
+video-annotate reindex
+```
+
+This changes labels only, preserves `.pre-reindex` backups, rebases verified
+correction hashes and safely renames linked `point_<ID>` pose folders. Each ID
+stays fixed across source frames; hidden/ended points do not cause per-frame
+renumbering. Old overlay videos retain their old labels until rerendered.
+
 ## Review and batch actions
 
 **Review tracks** opens predictions, permits sparse manual labels and interpolates
@@ -110,7 +125,12 @@ current object. **Ctrl+Enter** / **Segment queued** processes the objects one at
 a time with the same lazy model. A final unqueued prompt is included automatically.
 Queue markers identify pending objects; **Undo queued** restores the last prompt.
 
-Results remain separate in **Preview objects**. Review/deselect masks, then use
+Results remain separate in **Preview objects**. Select exactly one mask and
+press **Edit selected mask** (or choose a Brush tool) to revise its pixels.
+Left-drag adds; right-drag erases. **Undo** affects only that selected mask;
+other masks and SAM prompts stay intact. To edit another mask, select its list
+row. New prompts or regenerated previews replace these draft edits.
+Review/deselect masks, then use
 **Save selected masks as ROIs** to save them independently. Segmentation does not
 write annotations until you save. Ordinary failed prompts remain queued for
 retry; cancellation/allocation errors stop safely and retain the prompts. The

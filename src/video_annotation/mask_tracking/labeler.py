@@ -56,6 +56,7 @@ class MaskLabeler(PointLabeler):
         self.files, self.dialogs = filedialog, simpledialog
         self.Image, self.ImageTk = Image, ImageTk
         self.controller, self.processor = controller, processor
+        self.annotation_tools = annotation_tools
         self.overlay_fps, self.max_width = overlay_fps, max_width
         self.root = root or tk.Tk()
         if not embedded:
@@ -74,6 +75,7 @@ class MaskLabeler(PointLabeler):
         self.tool_var, self.label_var = tk.StringVar(value="Clicks"), tk.IntVar(value=1)
         self.brush_var, self.text_var = tk.StringVar(value="12"), tk.StringVar()
         self.preview_masks = {}
+        self.reset_preview_edits()
         self.queued_prompts = []
         self.region_cache, self.region_cache_ready = None, False
         self.drag_start = self.drag_end = self.brush_mask = self.brush_last = None
@@ -114,13 +116,18 @@ class MaskLabeler(PointLabeler):
         self.preview_list = tk.Listbox(side, width=24, height=4, selectmode="extended", exportselection=False)
         self.preview_list.pack(fill="x")
         self.controls.append(self.preview_list)
+        if annotation_tools:
+            self.preview_list.bind('<<ListboxSelect>>', lambda event: self.action(self.preview_selection_changed))
+            self.edit_mask_button = self._button(side, 'Edit selected mask', self.edit_selected_mask, side='top')
         self.save_masks_button = self._button(side, "Save selected masks as ROIs", self.save_preview_references)
         self.all_rois_button = self._button(side, "Track all saved ROIs", lambda:self.start_processing(all_saved=True))
         self.canvas.bind("<Configure>", lambda event: self.redraw())
         self.canvas.bind("<Button-1>", lambda event: self.action(lambda: self.press(event)))
         self.canvas.bind("<B1-Motion>", lambda event: self.action(lambda: self.motion(event)))
         self.canvas.bind("<ButtonRelease-1>", lambda event: self.action(lambda: self.release(event)))
-        self.canvas.bind("<Button-3>", lambda event: self.action(lambda: self.click(event, label=0)))
+        self.canvas.bind("<Button-3>", lambda event: self.action(lambda: self.right_press(event)))
+        self.canvas.bind("<B3-Motion>", lambda event: self.action(lambda: self.motion(event)) if self.tool_var.get().startswith('Brush') else None)
+        self.canvas.bind("<ButtonRelease-3>", lambda event: self.action(lambda: self.release(event)) if self.tool_var.get().startswith('Brush') else None)
         if annotation_tools:
             self.setup_viewport(bar)
             self.queue_info = ttk.Label(side,text='No queued objects',wraplength=180)
@@ -214,6 +221,7 @@ class MaskLabeler(PointLabeler):
         self.controller.edit(prompt)
         self.region_cache_ready = False
         self.preview_masks = {}
+        self.reset_preview_edits()
         self.preview_info.configure(text="Prompt changed; preview again")
         self.sync_motion_controls()
         self.redraw()
@@ -233,6 +241,7 @@ class MaskLabeler(PointLabeler):
         self.label_var.set(1)
         self.load_prompt_fields()
         self.vertices, self.preview_masks = [], {}
+        self.reset_preview_edits()
         self.region_cache_ready = False
         self.drag_start = self.drag_end = self.brush_mask = self.brush_last = None
         self.title.configure(text=f"{c.index+1}/{len(c.videos)} · {c.video}\nROI {c.roi_id}: {c.reference_file}")
@@ -284,6 +293,8 @@ class MaskLabeler(PointLabeler):
                         self.preview_list.selection_set(index)
             self.save_masks_button.configure(state="normal" if ids and not busy else "disabled")
             self.all_rois_button.configure(state="disabled" if busy else "normal")
+            if hasattr(self, 'edit_mask_button'):
+                self.edit_mask_button.configure(state='normal' if len(self.preview_list.curselection()) == 1 and not busy else 'disabled')
 
     def select_tracker(self):
         previous, selected = self.processor.backend, self.tracker_var.get()
@@ -299,6 +310,7 @@ class MaskLabeler(PointLabeler):
             self.tracker_var.set(previous)
             raise
         self.preview_masks = {}
+        self.reset_preview_edits()
         self.preview_info.configure(text="Tracker changed; preview again")
         self.sync_motion_controls()
         self.redraw()
@@ -315,6 +327,7 @@ class MaskLabeler(PointLabeler):
             self.sync_motion_controls()
             raise
         self.preview_masks = {}
+        self.reset_preview_edits()
         self.preview_info.configure(text="Initialization changed; preview again")
         self.sync_motion_controls()
         self.redraw()
@@ -335,6 +348,7 @@ class MaskLabeler(PointLabeler):
             self.sync_motion_controls()
             raise
         self.preview_masks = {}
+        self.reset_preview_edits()
         self.preview_info.configure(text="Cleanup changed; preview again")
         self.sync_motion_controls()
         self.redraw()
@@ -346,7 +360,45 @@ class MaskLabeler(PointLabeler):
         if self.tool_var.get() == "Text" and self.processor.backend != "sam31":
             self.tool_var.set("Clicks")
             raise ValueError("Text prompts require SAM3.1")
+        if self.tool_var.get().startswith('Brush') and self.preview_masks and getattr(self, 'annotation_tools', False):
+            self.edit_selected_mask(tool=self.tool_var.get())
+            return
+        self.editing_preview_id = None
         self.status.set(f"Tool: {self.tool_var.get()}. Drawing/clicking replaces the current prompt type; right-click in Clicks adds background.")
+
+    def reset_preview_edits(self):
+        self.editing_preview_id = self._brush_preview_id = None
+        self.preview_undo = {}
+        self._brush_erase = False
+
+    def selected_preview_id(self):
+        selected = self.preview_list.curselection()
+        if len(selected) != 1:
+            raise ValueError('Select exactly one preview object to edit its mask')
+        identity = self.preview_ids[int(selected[0])]
+        if identity not in self.preview_masks:
+            raise ValueError('Preview that object before editing its mask')
+        return identity
+
+    def preview_selection_changed(self):
+        if self.controller.busy:
+            return
+        if getattr(self, 'editing_preview_id', None) is not None:
+            selected = self.preview_list.curselection()
+            self.editing_preview_id = self.preview_ids[int(selected[0])] if len(selected) == 1 else None
+        self.sync_motion_controls()
+
+    def edit_selected_mask(self, *, tool='Brush +'):
+        """Edit one instance's pixels without replacing its SAM prompt or peers."""
+        self.controller._idle()
+        self._frame_matches()
+        identity = self.selected_preview_id()
+        self.editing_preview_id = identity
+        self.brush_mask = self.brush_last = self._brush_preview_id = None
+        self.vertices = []
+        self.tool_var.set(tool)
+        self.status.set(f'Editing object {identity}. Brush adds/erases; right-drag erases. Undo affects only this object. Save selected masks keeps the edits.')
+        self.redraw()
 
     def text_changed(self, *args):
         if not self.loading_fields and not self.controller.busy and self.processor.backend == "sam31":
@@ -376,13 +428,18 @@ class MaskLabeler(PointLabeler):
         left, top, dw, dh = self.transform.geometry
         crop = getattr(self.transform,'slices',(slice(None),slice(None)))
         image = c.image[crop].copy()
-        region = self.brush_mask if self.brush_mask is not None else self.region_mask()
+        preview_brush = self.brush_mask is not None and getattr(self, '_brush_preview_id', None) is not None
+        if preview_brush or getattr(self, 'editing_preview_id', None) is not None:
+            region = None
+        else:
+            region = self.brush_mask if self.brush_mask is not None else self.region_mask()
         if region is not None:
             region = region[crop]
             image[region] = (image[region]*.75 + np.array([30, 220, 240])*.25).astype(np.uint8)
         if self.preview_masks:
             from .render import draw_masks
-            image = draw_masks(image, {key:mask[crop] for key,mask in self.preview_masks.items()})
+            image = draw_masks(image, {key:(self.brush_mask if preview_brush and key == self._brush_preview_id else mask)[crop]
+                                      for key,mask in self.preview_masks.items()})
         self.photo = self.ImageTk.PhotoImage(self.Image.fromarray(image[..., ::-1]).resize((dw, dh), self.Image.Resampling.BILINEAR), master=self.root)
         self.canvas.delete("all")
         self.canvas.create_image(left, top, image=self.photo, anchor="nw")
@@ -424,6 +481,8 @@ class MaskLabeler(PointLabeler):
         point = self.transform.to_source(event.x, event.y)
         if point is None:
             return
+        if getattr(event, 'num', 1) != 3:
+            self._brush_erase = False
         tool = self.tool_var.get()
         if tool == "Clicks":
             self.click(event)
@@ -437,17 +496,30 @@ class MaskLabeler(PointLabeler):
                 self.controller.edit({**self._base(), "polygon_xy": deepcopy(self.vertices)})
                 self.region_cache_ready = False
                 self.preview_masks = {}
+                self.reset_preview_edits()
                 self.preview_info.configure(text="Prompt changed; preview again")
                 self.sync_motion_controls()
         elif tool.startswith("Brush"):
             self.brush_radius()  # Reject invalid settings before opening a stroke.
-            self.brush_mask = self.region_mask()
+            if self.preview_masks and getattr(self, 'annotation_tools', False):
+                self.editing_preview_id = self._brush_preview_id = self.selected_preview_id()
+                self.brush_mask = self.preview_masks[self._brush_preview_id]
+            else:
+                self._brush_preview_id = None
+                self.brush_mask = self.region_mask()
             if self.brush_mask is None:
                 self.brush_mask = np.zeros(self.controller.image.shape[:2], bool)
             self.brush_mask = self.brush_mask.copy()
             self.brush_last = point
             self.paint(point)
         self.redraw()
+
+    def right_press(self, event):
+        if self.tool_var.get().startswith('Brush'):
+            self._brush_erase = True
+            self.press(event)
+        else:
+            self.click(event, label=0)
 
     def brush_radius(self):
         radius = int(self.brush_var.get())
@@ -459,7 +531,7 @@ class MaskLabeler(PointLabeler):
         radius = self.brush_radius()
         raster = self.brush_mask.astype(np.uint8)
         start, end = np.rint(self.brush_last).astype(int), np.rint(point).astype(int)
-        value = int(self.tool_var.get() == "Brush +")
+        value = int(self.tool_var.get() == "Brush +" and not getattr(self, '_brush_erase', False))
         cv2.line(raster, tuple(start), tuple(end), value, radius*2)
         cv2.circle(raster, tuple(end), radius, value, -1)
         self.brush_mask = raster.astype(bool)
@@ -490,7 +562,20 @@ class MaskLabeler(PointLabeler):
         elif self.brush_mask is not None:
             mask = self.brush_mask
             self.brush_mask = self.brush_last = None
-            self.edit({**self._base(), "mask": mask})
+            identity = getattr(self, '_brush_preview_id', None)
+            self._brush_preview_id = None
+            self._brush_erase = False
+            if identity is not None:
+                if identity not in self.preview_masks:
+                    raise ValueError('The preview changed during this stroke; select its mask again')
+                if not np.array_equal(mask, self.preview_masks[identity]):
+                    self.preview_undo.setdefault(identity, []).append(self.preview_masks[identity].copy())
+                    self.preview_masks[identity] = mask.copy()
+                    self.controller.dirty = True
+                self.preview_info.configure(text=f'Object {identity} edited. Other preview masks retained; save selected masks to keep changes.')
+                self.sync_motion_controls()
+            else:
+                self.edit({**self._base(), "mask": mask})
         self.redraw()
 
     def close_polygon(self):
@@ -521,11 +606,25 @@ class MaskLabeler(PointLabeler):
         self.edit({**self._base(), "mask": mask})
 
     def undo(self):
+        if self.preview_masks and getattr(self, 'annotation_tools', False):
+            self.controller._idle()
+            identity = self.selected_preview_id()
+            history = self.preview_undo.get(identity, [])
+            if history:
+                self.preview_masks[identity] = history.pop()
+                self.controller.dirty = True
+                self.status.set(f'Undid mask edit for object {identity}; other masks retained.')
+            else:
+                self.status.set(f'No brush edits to undo for object {identity}.')
+            self.editing_preview_id = identity
+            self.redraw()
+            return
         self.controller.undo()
         self.load_prompt_fields()
         self.region_cache_ready = False
         self.vertices = deepcopy(self.controller.prompt.get("polygon_xy", [])) if self.vertices else []
         self.preview_masks = {}
+        self.reset_preview_edits()
         self.sync_motion_controls()
         self.redraw()
 
@@ -535,6 +634,7 @@ class MaskLabeler(PointLabeler):
         self.region_cache_ready = False
         self.label_var.set(1)
         self.vertices, self.preview_masks = [], {}
+        self.reset_preview_edits()
         self.sync_motion_controls()
         self.redraw()
 
@@ -670,6 +770,7 @@ class MaskLabeler(PointLabeler):
         self.queued_prompts.append(reference)
         self.controller.edit({})
         self.vertices,self.preview_masks = [],{}
+        self.reset_preview_edits()
         self.drag_start=self.drag_end=self.brush_mask=self.brush_last=None
         self.region_cache_ready=False
         self.load_prompt_fields()
@@ -735,9 +836,10 @@ class MaskLabeler(PointLabeler):
                 self.sync_queue()
             masks=result['masks'] if result['kind']=='queued_preview' else result['preview'].masks
             self.preview_masks = {int(identity):np.asarray(mask,bool).copy() for identity,mask in masks.items()}
+            self.reset_preview_edits()
             if self.preview_masks:
                 self.controller.dirty = True
-            self.preview_info.configure(text="Preview object IDs: " + (", ".join(map(str,self.preview_masks)) or "none") + "\nObjects remain separate; refine prompts to correct selection.")
+            self.preview_info.configure(text="Preview object IDs: " + (", ".join(map(str,self.preview_masks)) or "none") + "\nSelect one and Edit selected mask to revise pixels; other objects stay separate.")
             self.sync_motion_controls()
             self.redraw()
 
