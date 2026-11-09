@@ -35,8 +35,10 @@ QUALITY_COLUMNS = ("frame", "point_id", "valid", "fb_error", "lk_error", "featur
                    "fit_margin", "tracking_status", "recovery_attempts", "failure_reason",
                    "motion_accepted", "motion_reason", "rotation_innovation_degrees", "scale_innovation",
                    "shape_innovation", "motion_penalty", "recent_template_updated", "recovery_dof",
-                   "recovery_shape_count", "recovery_bank_truncated", "search_candidates")
-QUALITY_SCHEMA_VERSION = 5
+                   "recovery_shape_count", "recovery_bank_truncated", "search_candidates",
+                   "foreground_match_fraction", "foreground_observable_pixels", "feature_retention_ratio",
+                   "occluded", "occlusion_suspected", "center_smoothing_alpha", "center_correction_px", "raw_center_x", "raw_center_y")
+QUALITY_SCHEMA_VERSION = 6
 
 
 def file_digest(path):

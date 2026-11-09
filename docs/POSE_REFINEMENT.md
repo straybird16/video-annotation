@@ -6,10 +6,30 @@ first. Leave point IDs/radius/frame limit blank to use all saved points and
 supports. Select the **Method**; the default is **Shared patch tracker**
 (`patch_hybrid`), using the same KLT/correlation engine as point tracking. Refinement and rendering run in a cancellable background job.
 
-**Render overlay** reuses matching poses and draws each fitted patch circle plus
-a clockwise rotation indicator when `rotation_valid=1`. The zero-angle direction
+Unified `points.csv` files can carry centers and pose together. Leave **Keep
+existing poses; fit missing poses only** enabled to fill missing estimates;
+disable it to refine existing estimates again. **Render existing pose (no
+fitting)** reads the selected CSV directly and never starts an estimator. Its
+optional **Interpolate short gaps** checkbox uses the gap settings without
+changing the source CSV. **Review tracks → Patch pose** toggles these outlines
+while keeping center markers and correction tools visible.
+
+Refinement writes one canonical **`points.csv` + `points.json`** in its result
+folder, including all source IDs/centers, visibility, pose/component flags,
+rotation/scale and `warp_h00`…`warp_h22`. Required reference masks are copied beside
+the CSV. Review/rendering needs no per-point pose folders; those remain optional
+compatibility diagnostics. Source files are unchanged. Fully posed input skips
+estimation. Filling a partial sequence may fit neighboring frames for context,
+but preserves existing accepted poses. Full recomputation clears old pose when
+the replacement fit is rejected. A frame limit bounds estimation; the canonical
+file preserves source centers outside that interval.
+
+Pose overlays draw the full-H warped reference circle and clockwise indicator
+when available, with a local circle fallback for interpolated scalar pose.
+The arrow requires `rotation_valid=1`. The zero-angle direction
 is upward, matching the existing pose overlays. Unreliable rotations retain their candidate angle in the CSV, but have no
-arrow. Lost or rejected points are hidden. Open-folder buttons locate the
+arrow. Lost source points are hidden; missing/rejected pose retains its visible
+point marker. Open-folder buttons locate the
 refined data and portable H.264 MP4. Render settings control FPS, width, CRF,
 encoding preset and preview frame limit; FPS changes only preview speed.
 **Render settings → Pose circles, rotation and labels** controls line width,
@@ -37,6 +57,15 @@ video-annotate refine \
   --pose-method patch_hybrid --overlay
 ```
 
+Render saved unified pose without fitting:
+
+```bash
+video-annotate refine --tracks data/path/to/points.csv --render-only --overlay-fps 120
+```
+
+Add `--interpolate-existing` to fill short gaps for this preview, or
+`--no-fill-missing` to re-estimate saved poses during normal refinement.
+
 Add `--point-ids 0 3`, `--max-frames 60` for a short check, or
 `--output-dir data/pseudo-ground-truths/point_tracks/SEQUENCE/my_pose_run` for
 another run. Matching results are reused; changed settings require **Force
@@ -47,7 +76,7 @@ managed derived pose folder, never the original point predictions/references.
 
 | `--pose-method` | Behavior |
 |---|---|
-| `patch_hybrid` | **Default:** batched KLT/RANSAC or masked direct proposals, foreground correlation, temporal acceptance and bounded joint center/shape recovery. |
+| `patch_hybrid` | **Default:** batched KLT/RANSAC or masked direct proposals, foreground correlation and temporal acceptance; expensive recovery is optional. |
 | `similarity` | Original fast correlation, immutable original plus one updated recent canonical template. No original-biased fusion. |
 | `similarity_ic_homography` | recent IC-LK homography, periodic original checks and broader correlation recovery. A photometrically validated seed can survive a rejected or unhelpful correction. |
 | `similarity_homography` | Same guarded policy with OpenCV ECC homography. |
@@ -71,14 +100,15 @@ A strong center can survive ambiguous pose with blank rotation/scale/H. These ar
 plausibility checks, not calibrated probabilities or proof of material rotation.
 Perfect symmetry after a gap can remain unobservable.
 
-Recovery begins near the accepted temporal prediction, expands with uncertainty
+**Allow expensive pose recovery** / `--recovery-enabled` is off by default for
+the shared patch tracker. When enabled, recovery begins near the accepted temporal prediction, expands with uncertainty
 and image disagreement, and coarse-scores joint shape/center banks. **Search shape
 budget** is per reference/independent seed: 9 similarity shapes, then up to 81
 affine shapes by default; 729 enables the full optional projective bank. Coarse
 scoring uses batched remapping for small grids and native correlation maps for
 larger ones. Only bounded top-K distinct candidates receive direct fine fits.
 `--center-search --search-radius 64 --center-trust 0.5` permits wider recovery;
-normal shared-engine recovery stays within 12 source pixels by default. Radius
+enabled shared-engine recovery stays within 12 source pixels by default. Radius
 is a hard cap. **Use recent validated template** / `--no-recent-template` toggles
 recent appearance; high-quality accepted raw RGB alone refreshes it.
 
@@ -154,8 +184,8 @@ library implementation or the paper's modified IC-LK. ECC and KLT call OpenCV.
 For projective/affine output, center maps the reference query through `H`,
 clockwise rotation is the polar angle of its **local Jacobian at that query**,
 and scale is `sqrt(det(J))`, an area-equivalent local scale. A homography has no
-single global rotation/scale. Circle/arrow overlays summarize this local pose;
-the circle is not the exact projective image of the reference circle. Keep the
+single global rotation/scale. Unified overlays warp reference geometry with the
+full H when valid; scalar-only poses use a local circle/arrow summary. Keep the
 full exported warp for geometric evaluation. Fixed radii are support, never
 measured zoom. Source visibility, endings and reference-frame IDs stay intact.
 

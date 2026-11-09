@@ -50,7 +50,8 @@ class CorrelationTrackingTests(unittest.TestCase):
 
     def test_dense_search_recovers_without_a_sparse_fit(self):
         image = texture()
-        tracker = KLTTracker("klt-template", win_size=5, correlation_margin=0.02)
+        tracker = KLTTracker("klt-template", win_size=5, correlation_margin=0.02,
+                             recovery_enabled=True, stop_on_occlusion=False)
         tracker.set_patch_regions([20])
         tracker.infer([bgr(image)], [[70.0, 70.0]])
         tracker.features[0] = np.empty((0, 2), np.float32)
@@ -66,7 +67,8 @@ class CorrelationTrackingTests(unittest.TestCase):
         image = texture()
         blank = np.full_like(image, 110)
         for grace, recover in [(0.5, True), (0.05, False)]:
-            tracker = KLTTracker("klt-template", win_size=5)
+            tracker = KLTTracker("klt-template", win_size=5,
+                                 recovery_enabled=True, stop_on_occlusion=False)
             tracker.set_stream_timing(10, grace)
             tracker.infer([bgr(image)], [[80.0, 80.0]])
             original = tracker.templates[0].copy()
@@ -177,6 +179,8 @@ class CorrelationTrackingTests(unittest.TestCase):
             motion_model="similarity",
             min_scale_step=0.8,
             max_scale_step=1.25,
+            recovery_enabled=True,
+            stop_on_occlusion=False,
         )
         tracker.infer([bgr(image)], [point])
         tracker.features[0] = np.empty((0, 2), np.float32)

@@ -40,6 +40,8 @@ class PointPoseGuiTests(unittest.TestCase):
         self.assertEqual((config.recovery_scale_min, config.recovery_scale_max), (.25, 4.))
         self.assertEqual((result['gap_seconds'], result['gap_neighbors']), (.1, 2))
         self.assertEqual(result['method'], DEFAULT_METHOD)
+        self.assertTrue(result['fill_missing'])
+        self.assertFalse(parse_options(dict(values(),fill_missing=False))['fill_missing'])
         self.assertEqual(result['method_options'], method_options())
         self.assertIs(result['method_options']['use_recent'], True)
         self.assertIs(result['method_options']['center_search'], False)
@@ -123,6 +125,7 @@ class PointPoseGuiTests(unittest.TestCase):
                 self.assertEqual(kwargs['render_options'], tab.owner.render_options)
                 self.assertIsNot(kwargs['render_options'], tab.owner.render_options)
                 self.assertTrue(kwargs['overlay'])
+                self.assertTrue(kwargs['fill_missing'])
                 self.assertEqual((kwargs['gap_seconds'], kwargs['gap_neighbors']), (.1, 2))
                 self.assertEqual(kwargs['config'].anchor_preference, .8)
                 self.assertEqual(kwargs['method'], DEFAULT_METHOD)
@@ -145,6 +148,50 @@ class PointPoseGuiTests(unittest.TestCase):
             self.assertIn('1.250 ms/point-frame', tab.timings.get())
             self.assertIn('Interpolation: 0.004 s', tab.timings.get())
             self.assertTrue(tab.can_leave())
+
+    def test_render_existing_is_async_without_parsing_or_fitting(self):
+        tab = PoseRefinementTab.__new__(PoseRefinementTab)
+        tab.closed = tab.busy = tab._owns_controller_busy = False
+        tab.owner = SimpleNamespace(controller=SimpleNamespace(busy=False), overlay_fps=120,
+            max_width=640, render_options={'crf':18})
+        tab.events, tab.cancel = queue.Queue(), threading.Event()
+        tab.status, tab.timings = Value(''), Value('')
+        tab.variables = {name:Value(value) for name,value in dict(values(),
+            interpolate_existing=False, patch_size='not a fitting setting').items()}
+        tab.controls, tab.cancel_button, tab.after = [], Mock(), lambda *args:'poll'
+        with tempfile.TemporaryDirectory() as directory:
+            tracks = Path(directory)/'points.csv'; tracks.touch()
+            tab.tracks_var = Value(str(tracks))
+            module = ModuleType('video_annotation.pose.workflow')
+            response = {'output_dir':str(tracks.parent), 'overlay':'mock.mp4', 'timing':{'render_seconds':.01}}
+            module.render_existing_point_poses = Mock(return_value=response)
+            module.refine_point_tracks = Mock(side_effect=AssertionError('render must never fit'))
+            with patch.dict('sys.modules', {'video_annotation.pose.workflow':module}), \
+                 patch('video_annotation.rgb_tracking.pose_gui.contained_path', side_effect=lambda path,*args:Path(path)):
+                tab.render_existing(); tab.worker.join(2)
+                self.assertFalse(tab.worker.is_alive())
+                self.assertTrue(tab.busy)
+                tab.poll()
+                self.assertFalse(tab.busy)
+                self.assertFalse(tab.owner.controller.busy)
+                call = module.render_existing_point_poses.call_args
+                self.assertEqual(call.args, (tracks,))
+                self.assertEqual((call.kwargs['gap_seconds'],call.kwargs['gap_neighbors']), (0.,0))
+                self.assertEqual(call.kwargs['fps'],120)
+                self.assertNotIn('method',call.kwargs)
+                self.assertNotIn('config',call.kwargs)
+                module.refine_point_tracks.assert_not_called()
+                refined=Path(directory)/'refined.csv';refined.touch()
+                response['tracks']=str(refined)
+                tab.variables['interpolate_existing'].set(True)
+                tab.render_existing(); tab.worker.join(2); tab.poll()
+                call=module.render_existing_point_poses.call_args
+                self.assertEqual(call.args,(refined,))
+                self.assertEqual(tab.tracks_var.get(),str(tracks))
+                self.assertEqual((call.kwargs['gap_seconds'],call.kwargs['gap_neighbors']),(.1,2))
+                other=Path(directory)/'other.csv';other.touch();tab.tracks_var.set(str(other))
+                tab.render_existing();tab.worker.join(2);tab.poll()
+                self.assertEqual(module.render_existing_point_poses.call_args.args,(other,))
 
     def test_timing_keeps_unknown_separate_from_zero_and_marks_cache(self):
         text = timing_text({'reused':True, 'timing':{'render_seconds':0.}})
@@ -221,8 +268,12 @@ class PointPoseGuiTests(unittest.TestCase):
             dict(kind='rgb_overlay_settings',schema_version=1)))
         self.assertEqual(normalize_pose_settings(document),document)
         self.assertIs(document['refinement']['motion_gate'],False)
+        self.assertIs(document['refinement']['fill_missing'],True)
+        self.assertIs(document['refinement']['interpolate_existing'],False)
+        self.assertIs(document['refinement']['recovery_enabled'],False)
         for key,value in (('motion_gate','false'),('motion_sigma',True),('motion_sigma','0'),
                           ('motion_noise_px','nan'),('motion_memory_seconds','0'),
+                          ('recovery_enabled','false'),('fill_missing','false'),
                           ('search_shapes','0'),('search_shapes','730')):
             with self.subTest(key=key,value=value),self.assertRaises(ValueError):
                 parse_options(dict(setting,**{key:value}))
@@ -246,9 +297,36 @@ class PointPoseGuiTests(unittest.TestCase):
         self.assertIs(fields['motion_gate']['type'],bool)
         self.assertIs(fields['use_recent_template']['type'],bool)
         for key in ('motion_gate','motion_sigma','motion_noise_px','motion_memory_seconds','center_trust',
-                    'use_recent_template','correlation_top_k','correlation_max_shapes','template_update_score'):
+                    'use_recent_template','correlation_top_k','correlation_max_shapes','template_update_score',
+                    'recovery_enabled','stop_on_occlusion','min_foreground_fraction',
+                    'center_smoothing','center_smoothing_px'):
             self.assertIn(key,fields)
             self.assertGreater(len(parameter_help(key)),30)
+        for key in ('recovery_enabled','stop_on_occlusion','center_smoothing'):
+            self.assertIs(fields[key]['type'],bool)
+
+    def test_cli_render_existing_skips_fit_and_new_tracking_booleans_forward(self):
+        from video_annotation.rgb_tracking.__main__ import parser,refine_command,tracking_configuration
+        args=parser().parse_args(['refine','--tracks','points.csv','--render-only','--no-fill-missing'])
+        self.assertFalse(args.fill_missing)
+        module=ModuleType('video_annotation.pose.workflow')
+        module.render_existing_point_poses=Mock(return_value={'overlay':'mock.mp4'})
+        module.refine_point_tracks=Mock(side_effect=AssertionError('render must never fit'))
+        with patch.dict('sys.modules',{'video_annotation.pose.workflow':module}),redirect_stdout(io.StringIO()):
+            refine_command(args)
+            self.assertEqual(module.render_existing_point_poses.call_args.kwargs['gap_seconds'],0.)
+            args.interpolate_existing=True
+            refine_command(args)
+            self.assertEqual(module.render_existing_point_poses.call_args.kwargs['gap_seconds'],.1)
+            module.refine_point_tracks.assert_not_called()
+        args=parser().parse_args(['process','--source-dir','data/videos','--tracker','klt-template',
+            '--recovery-enabled','--no-stop-on-occlusion','--min-foreground-fraction','.6',
+            '--no-center-smoothing','--center-smoothing-px','1.5'])
+        options,_=tracking_configuration(args)
+        self.assertEqual({name:options[name] for name in ('recovery_enabled','stop_on_occlusion',
+            'min_foreground_fraction','center_smoothing','center_smoothing_px')},
+            dict(recovery_enabled=True,stop_on_occlusion=False,min_foreground_fraction=.6,
+                 center_smoothing=False,center_smoothing_px=1.5))
 
 
 if __name__ == '__main__':

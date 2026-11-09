@@ -129,7 +129,7 @@ class PointPoseTests(unittest.TestCase):
         images=[np.zeros((128,128,3),np.uint8) for _ in range(5)]
         from video_annotation.pose import workflow
         with patch.object(workflow,'PoseEstimator',Estimator),patch.object(workflow,'H264Writer',Writer), \
-             patch('video_annotation.pose.overlay.circle_geometry',wraps=workflow.circle_geometry) as geometry:
+             patch('video_annotation.pose.overlay.draw_tracks',wraps=workflow.draw_tracks) as geometry:
             result,decode=self.run_refinement(images,overlay=True,overlay_path=overlay)
         self.assertEqual(result['frames'],5)
         self.assertEqual(decode.call_args.args[1:],(200,5))
@@ -140,7 +140,7 @@ class PointPoseTests(unittest.TestCase):
         self.assertEqual([row['reference_frame'] for row in output[1:]],['201']*4)
         np.testing.assert_allclose([float(output[-1]['x']),float(output[-1]['y'])],points[4])
         self.assertAlmostEqual(float(output[-1]['circle_radius']),38.4)
-        self.assertIsNone(geometry.call_args_list[-1].args[2])
+        self.assertEqual(len(geometry.call_args_list[-1].args[1][0]['arrow']),0)
         # Last visible mask uses the preceding accepted similarity across the gap.
         initial=mask>0
         yy,xx=np.indices(initial.shape)

@@ -66,6 +66,16 @@ def parser():
             s.add_argument('--motion-sigma', type=float, help='temporal innovation limit in uncertainty standard deviations')
             s.add_argument('--motion-noise-px', type=float, help='motion uncertainty floor in source pixels')
             s.add_argument('--motion-memory-seconds', type=float, help='accepted motion memory in source-video seconds')
+            s.add_argument('--recovery-enabled', action=argparse.BooleanOptionalAction, default=None,
+                           help='allow expensive patch recovery search (default: disabled)')
+            s.add_argument('--stop-on-occlusion', action=argparse.BooleanOptionalAction, default=None,
+                           help='end a patch track on definite occlusion (default: enabled)')
+            s.add_argument('--min-foreground-fraction', type=float,
+                           help='minimum visible foreground fraction for occlusion acceptance (default: 0.5)')
+            s.add_argument('--center-smoothing', action=argparse.BooleanOptionalAction, default=None,
+                           help='smooth small center jitter (default: enabled)')
+            s.add_argument('--center-smoothing-px', type=float,
+                           help='source-pixel center-smoothing range (default: 2)')
         s.add_argument("--repo", type=Path, default=DEFAULT_REPO if tap_only else None,
                        help="TAPNext++ checkout")
         s.add_argument("--checkpoint", type=Path, help="TAPNext++ checkpoint")
@@ -140,6 +150,12 @@ def parser():
     from ..pose.methods import METHODS, DEFAULT_METHOD
     refine = sub.add_parser("refine", help="refine saved point patches with selectable correlation/geometric methods")
     refine.add_argument("--tracks", type=Path, required=True, help="original or corrected point CSV")
+    refine.add_argument('--render-only', action='store_true',
+                        help='render poses already stored in the unified CSV; run no fitting')
+    refine.add_argument('--interpolate-existing', action='store_true',
+                        help='fill short pose gaps for --render-only, using gap settings')
+    refine.add_argument('--fill-missing', action=argparse.BooleanOptionalAction, default=True,
+                        help='keep existing valid poses and fit missing ones; --no-fill-missing refines them again')
     refine.add_argument("--pose-method", choices=METHODS, default=DEFAULT_METHOD,
                         help="pose algorithm; default shared patch-hybrid tracker")
     refine.add_argument("--output-dir", type=Path, help="data-local pose folder; default beside the input tracks")
@@ -182,6 +198,8 @@ def parser():
     refine.add_argument('--motion-sigma', type=float, default=4., help='motion acceptance limit in uncertainty standard deviations')
     refine.add_argument('--motion-noise-px', type=float, default=1., help='motion uncertainty floor in source pixels')
     refine.add_argument('--motion-memory-seconds', type=float, default=.1, help='accepted motion memory in source-video seconds')
+    refine.add_argument('--recovery-enabled', action=argparse.BooleanOptionalAction, default=False,
+                        help='allow expensive patch recovery search during refinement (default: disabled)')
     refine.add_argument("--min-score", type=float, default=.75)
     refine.add_argument("--full-search", action="store_true", help="disable the cheaper guarded local path")
     refine.add_argument("--reference-interval", type=positive, default=10)
@@ -246,7 +264,9 @@ def tracking_configuration(args):
                  "patch_radius": args.patch_radius, "reanchor_interval": args.reanchor_interval,
                  "motion_model": args.motion_model, "keyframe_interval": args.keyframe_interval}
     overrides.update({name:getattr(args,name,None) for name in
-                     ('motion_gate','motion_sigma','motion_noise_px','motion_memory_seconds')})
+                     ('motion_gate','motion_sigma','motion_noise_px','motion_memory_seconds',
+                      'recovery_enabled','stop_on_occlusion','min_foreground_fraction',
+                      'center_smoothing','center_smoothing_px')})
     options.update({key: value for key, value in overrides.items() if value is not None})
     tap_flags = ("repo", "checkpoint", "resolution", "device", "precision", "compile")
     explicit = ["--" + key.replace("_", "-") for key in tap_flags if getattr(args, key) is not None]
@@ -430,6 +450,16 @@ def saved_track_files(master):
 
 
 def refine_command(args):
+    if args.render_only:
+        from ..pose.workflow import render_existing_point_poses
+        result = render_existing_point_poses(args.tracks, fps=args.overlay_fps, max_width=args.max_width,
+            render_options=rendering_configuration(args), force=args.force,
+            gap_seconds=args.gap_seconds if args.interpolate_existing else 0.,
+            gap_neighbors=args.gap_neighbors if args.interpolate_existing else 0,
+            point_ids=args.point_ids,max_frames=args.max_frames,
+            progress=lambda value: print(value, flush=True))
+        print(json.dumps(result, indent=2))
+        return
     from ..pose.registration import Config
     from ..pose.workflow import refine_point_tracks
     config = Config(support="circle", radius_blend=0., tracker_scale_weight=0., registration_scale_weight=1.,
@@ -443,13 +473,13 @@ def refine_command(args):
         config=config, radius=args.patch_radius, max_frames=args.max_frames, overlay=args.overlay,
         overlay_fps=args.overlay_fps, max_width=args.max_width, force=args.force,
         render_options=rendering_configuration(args), opencv_threads=args.opencv_threads,
-        gap_seconds=args.gap_seconds, gap_neighbors=args.gap_neighbors,
+        gap_seconds=args.gap_seconds, gap_neighbors=args.gap_neighbors, fill_missing=args.fill_missing,
         method=args.pose_method, method_options={name:getattr(args, name) for name in
             ('ecc_iters','ic_iters','ic_stride','min_gain','klt_max_points','klt_min_distance','klt_window',
              'use_recent','geometric_min_score','original_score_slack','template_min_overlap',
              'template_update_score','original_check_interval','center_search','search_radius',
              'search_trigger','search_top_k','search_shapes','center_trust','search_interval',
-             'motion_gate','motion_sigma','motion_noise_px','motion_memory_seconds')},
+             'motion_gate','motion_sigma','motion_noise_px','motion_memory_seconds','recovery_enabled')},
         progress=lambda value: print(value, flush=True))
     print(json.dumps(result, indent=2))
 

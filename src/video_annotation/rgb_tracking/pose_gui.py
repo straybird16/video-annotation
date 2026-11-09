@@ -99,7 +99,8 @@ def parse_options(values):
     config.fast = bool(values.get('fast', True))
     config.validate()
     method_options = {'use_recent':values.get('use_recent', True), 'center_search':values.get('center_search', False),
-                      'motion_gate':values.get('motion_gate', True)}
+                      'motion_gate':values.get('motion_gate', True),
+                      'recovery_enabled':values.get('recovery_enabled', False)}
     for name, label, kind, default in METHOD_FIELDS:
         try:
             value = values.get(name, default)
@@ -109,11 +110,15 @@ def parse_options(values):
         except (ValueError, TypeError) as error:
             raise ValueError(f'{label} must be {"an integer" if kind is int else "a number"}') from error
     method_options = validate_method_options(method_options)
-    return dict(point_ids=point_ids, radius=radius, max_frames=max_frames, config=config,
+    fill_missing = values.get('fill_missing', True)
+    if type(fill_missing) is not bool:
+        raise ValueError('Fill missing poses must be boolean')
+    return dict(point_ids=point_ids, radius=radius, max_frames=max_frames, config=config, fill_missing=fill_missing,
                 gap_seconds=gap_seconds, gap_neighbors=gap_neighbors, method=method, method_options=method_options)
 
 
-_PRESET_BOOLEANS = ('fast', 'overlay', 'use_recent', 'center_search', 'motion_gate')
+_PRESET_BOOLEANS = ('fast', 'overlay', 'use_recent', 'center_search', 'motion_gate',
+                    'recovery_enabled', 'fill_missing', 'interpolate_existing')
 _PRESET_FIELDS = {name for name, _, _ in FIELDS} | {name for name, _, _, _ in METHOD_FIELDS} | {
     'point_ids', 'radius', 'max_frames', 'gap_seconds', 'gap_neighbors', 'method', *_PRESET_BOOLEANS}
 
@@ -133,7 +138,8 @@ def normalize_pose_settings(value):
     settings = {name: getattr(config, name) for name, _, _ in FIELDS}
     settings.update({name: default for name, _, _, default in METHOD_FIELDS})
     settings.update(point_ids='', radius='', max_frames='', gap_seconds=.1, gap_neighbors=2,
-                    method=DEFAULT_METHOD, fast=True, overlay=True, use_recent=True, center_search=False, motion_gate=True)
+                    method=DEFAULT_METHOD, fast=True, overlay=True, use_recent=True, center_search=False, motion_gate=True,
+                    recovery_enabled=False, fill_missing=True, interpolate_existing=False)
     settings.update(supplied)
     for name in _PRESET_BOOLEANS:
         if type(settings[name]) is not bool:
@@ -173,7 +179,7 @@ def timing_text(result):
             f"Interpolation: {number('interpolation_seconds', 's')} · "
             f"Render: {number('render_seconds', 's')} · Wall: {number('wall_seconds', 's')}")
     if result.get('reused'):
-        text += '\nSaved refinement reused; its recorded refinement measurements are shown.'
+        text += '\nSaved results reused; fitting and rendering measurements are shown separately.'
     return text
 
 
@@ -192,7 +198,7 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
         self.cancel, self.events = threading.Event(), queue.Queue()
         self.controls, self.last_result = [], None
         self.tracks_var = tk.StringVar()
-        self.status = tk.StringVar(value='Choose saved point tracks. Refines circular patches into center, rotation and scale.')
+        self.status = tk.StringVar(value='Choose saved point tracks. Refine missing poses or render their existing pose directly.')
         self.timings = tk.StringVar(value='Measured refinement and rendering time appears after completion.')
         config = Config()
         self.variables = {name: tk.StringVar(value=str(getattr(config, name))) for name, _, _ in FIELDS}
@@ -201,7 +207,8 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
                               method=tk.StringVar(value=methods.DEFAULT_METHOD),
                               fast=tk.BooleanVar(value=True), overlay=tk.BooleanVar(value=True), force=tk.BooleanVar(value=False),
                               use_recent=tk.BooleanVar(value=True), center_search=tk.BooleanVar(value=False),
-                              motion_gate=tk.BooleanVar(value=True))
+                              motion_gate=tk.BooleanVar(value=True), recovery_enabled=tk.BooleanVar(value=False),
+                              fill_missing=tk.BooleanVar(value=True), interpolate_existing=tk.BooleanVar(value=False))
         self.variables.update({name:tk.StringVar(value=str(default)) for name, _, _, default in METHOD_FIELDS})
         labels = getattr(methods, 'METHOD_LABELS', {})
         self.method_choices = {labels.get(name, name):name for name in methods.METHODS}
@@ -263,6 +270,12 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
         widget = ttk.Checkbutton(search, text='Search for a refined center', variable=self.variables['center_search'])
         widget.grid(row=(len(search_fields)+1)//2, column=0, columnspan=4, sticky='w', pady=4)
         self.controls.append(widget)
+        recovery_widget = ttk.Checkbutton(search, text='Allow expensive pose recovery (off = local fitting only)',
+                                         variable=self.variables['recovery_enabled'])
+        recovery_widget.grid(row=(len(search_fields)+1)//2+1, column=0, columnspan=4, sticky='w', pady=4)
+        self.controls.append(recovery_widget)
+        if hasattr(self.owner, 'parameter_tooltip'):
+            self.owner.parameter_tooltip(recovery_widget, 'recovery_enabled')
         search.columnconfigure(1, weight=1); search.columnconfigure(3, weight=1)
         motion = group('Temporal motion acceptance')
         motion_fields = [field for field in METHOD_FIELDS if field[0].startswith('motion_')]
@@ -284,9 +297,14 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
                             ('force', 'Force recompute')]:
             widget = ttk.Checkbutton(options, text=label, variable=self.variables[name])
             widget.pack(side='left', padx=(0, 14)); self.controls.append(widget)
+        workflow = ttk.Frame(self); workflow.pack(fill='x', pady=3)
+        for name, label in [('fill_missing', 'Keep existing poses; fit missing poses only'),
+                            ('interpolate_existing', 'Interpolate short gaps when rendering existing pose')]:
+            widget = ttk.Checkbutton(workflow, text=label, variable=self.variables[name])
+            widget.pack(side='left', padx=(0, 14)); self.controls.append(widget)
         actions = ttk.Frame(self); actions.pack(fill='x', pady=7)
         self.button(actions, 'Run refinement', self.run, row=0, column=0)
-        self.button(actions, 'Render overlay', lambda: self.run(overlay=True), row=0, column=1)
+        self.button(actions, 'Render existing pose (no fitting)', self.render_existing, row=0, column=1)
         self.cancel_button = ttk.Button(actions, text='Cancel', command=self.cancel_processing, state='disabled')
         self.cancel_button.grid(row=0, column=2, padx=4, pady=3, sticky='w')
         self.button(actions, 'Open refined-track folder', lambda: self.open_folder('tracks'), row=1, column=0)
@@ -432,17 +450,58 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
                        force=values['force'], overlay_fps=getattr(self.owner, 'overlay_fps', None),
                        max_width=getattr(self.owner, 'max_width', 1280),
                        render_options=deepcopy(getattr(self.owner, 'render_options', None)))
+        self.launch_pose_job(tracks, options)
+
+    def render_existing(self):
+        """Render saved unified poses independently of all fitting settings."""
+        self.require_idle()
+        if not self.tracks_var.get().strip():
+            self.use_current_tracks()
+        tracks = contained_path(self.tracks_var.get().strip(), 'data')
+        if not tracks.is_file():
+            raise ValueError(f'Point CSV does not exist: {tracks}')
+        selected_input = tracks
+        previous = getattr(self, 'last_result', None) or {}
+        if getattr(self, '_last_result_input', None) == str(tracks.resolve()) and previous.get('tracks'):
+            saved = contained_path(previous['tracks'], 'data')
+            if saved.is_file():
+                tracks = saved
+        interpolate = self.variables['interpolate_existing'].get()
+        gap_seconds = float(self.variables['gap_seconds'].get()) if interpolate else 0.
+        gap_neighbors = int(self.variables['gap_neighbors'].get()) if interpolate else 0
+        if not 0 <= gap_seconds < float('inf') or gap_neighbors < 0:
+            raise ValueError('Gap duration and neighbors must be finite and nonnegative')
+        text = self.variables['point_ids'].get().strip()
+        point_ids = list(dict.fromkeys(int(value) for value in re.split(r'[\s,]+', text))) if text else None
+        text = self.variables['max_frames'].get().strip()
+        max_frames = int(text) if text else None
+        if (point_ids is not None and any(value < 0 for value in point_ids)) or (max_frames is not None and max_frames < 1):
+            raise ValueError('Point IDs must be nonnegative and maximum frames positive or blank')
+        options = dict(fps=getattr(self.owner, 'overlay_fps', None),
+                       max_width=getattr(self.owner, 'max_width', 1280),
+                       render_options=deepcopy(getattr(self.owner, 'render_options', None)),
+                       gap_seconds=gap_seconds, gap_neighbors=gap_neighbors,
+                       force=self.variables['force'].get(), point_ids=point_ids, max_frames=max_frames)
+        self.launch_pose_job(tracks, options, render_only=True, selected_input=selected_input)
+
+    def launch_pose_job(self, tracks, options, *, render_only=False, selected_input=None):
+        """Share cancellation and Tk busy-state handling for fit and render jobs."""
+        self._job_input = str(Path(selected_input or tracks).resolve())
         self.busy = self._owns_controller_busy = self.owner.controller.busy = True
         self.cancel.clear()
         for widget in self.controls:
             widget.configure(state='disabled')
         self.cancel_button.configure(state='normal')
-        self.status.set(f'Refining {tracks.name}…')
+        action = 'Rendering saved pose (no fitting)' if render_only else 'Refining'
+        self.status.set(f'{action}: {tracks}…')
         self.timings.set('Running; measured timing will appear when the job finishes.')
         def work():
             try:
-                from video_annotation.pose.workflow import refine_point_tracks
-                result = refine_point_tracks(tracks, **options, cancel=self.cancel.is_set,
+                if render_only:
+                    from video_annotation.pose.workflow import render_existing_point_poses as function
+                else:
+                    from video_annotation.pose.workflow import refine_point_tracks as function
+                result = function(tracks, **options, cancel=self.cancel.is_set,
                     progress=lambda message: self.events.put(('progress', message)))
                 self.events.put(('done', result))
             except BaseException as error:
@@ -450,7 +509,7 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
             finally:
                 if self.closed:
                     self.release_busy()
-        self.worker = threading.Thread(target=work, name='point-pose-refinement', daemon=False)
+        self.worker = threading.Thread(target=work, name='point-pose-render' if render_only else 'point-pose-refinement', daemon=False)
         self.worker.start()
 
     def release_busy(self):
@@ -476,10 +535,11 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
                 self.cancel_button.configure(state='disabled')
                 if kind == 'done':
                     self.last_result = value
+                    self._last_result_input = self._job_input
                     self.timings.set(timing_text(value))
                     self.status.set(f'Completed: {value.get("output_dir", value.get("output", ""))}')
                 else:
-                    self.status.set(f'Refinement stopped: {value}')
+                    self.status.set(f'Pose task stopped: {value}')
         except queue.Empty:
             pass
         self._poll_after = self.after(75, self.poll)
@@ -487,21 +547,23 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
     def cancel_processing(self):
         self.cancel.set()
         if self.busy and not self.closed:
-            self.status.set('Cancelling at the next safe refinement boundary…')
+            self.status.set('Cancelling at the next safe task boundary…')
 
     def can_leave(self):
         if self.busy:
-            self.status.set('Refinement is running. Cancel it or wait for completion before leaving.')
+            self.status.set('A pose task is running. Cancel it or wait for completion before leaving.')
             return False
         return True
 
     def open_folder(self, kind):
         if not self.last_result:
             raise ValueError('Run refinement first')
-        path = self.last_result.get('output_dir', self.last_result.get('output')) if kind == 'tracks' else self.last_result.get('overlay')
+        path = (self.last_result.get('tracks') or self.last_result.get('output_dir') or self.last_result.get('output')) if kind == 'tracks' else self.last_result.get('overlay')
         if not path:
-            raise ValueError('No overlay was rendered; use Render overlay first')
-        path = Path(path) if kind == 'tracks' else Path(path).parent
+            raise ValueError('No overlay was rendered; use Render existing pose first')
+        path = Path(path)
+        if kind != 'tracks' or path.is_file():
+            path = path.parent
         if not path.is_dir():
             raise ValueError(f'Folder does not exist: {path}')
         if sys.platform == 'win32':

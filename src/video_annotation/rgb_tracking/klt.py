@@ -99,6 +99,11 @@ class KLTConfig:
     motion_sigma: float = 4.
     motion_noise_px: float = 1.
     motion_memory_seconds: float = .1
+    recovery_enabled: bool = False
+    stop_on_occlusion: bool = True
+    min_foreground_fraction: float = .5
+    center_smoothing: bool = True
+    center_smoothing_px: float = 2.
 
     def __post_init__(self):
         if self.template_mode not in ("correlation", "legacy_ecc"):
@@ -118,11 +123,13 @@ class KLTConfig:
             raise ValueError("win_size must be odd and at least 5")
         if self.patch_radius < 4 or self.max_features < self.min_inliers or self.min_inliers < 3:
             raise ValueError("need patch_radius >= 4, max_features >= min_inliers >= 3")
-        for name in ("use_recent_template", "motion_gate"):
+        booleans = ("use_recent_template", "motion_gate", "recovery_enabled",
+                    "stop_on_occlusion", "center_smoothing")
+        for name in booleans:
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be boolean")
         for item in fields(self):
-            if item.name in ("motion_model", "adaptive_max_model", "template_mode", "use_recent_template", "motion_gate"):
+            if item.name in ("motion_model", "adaptive_max_model", "template_mode", *booleans):
                 continue
             value = getattr(self, item.name)
             if isinstance(value, bool) or not isinstance(value, Real) or not np.isfinite(value):
@@ -130,7 +137,7 @@ class KLTConfig:
         unit = ("feature_quality", "min_inlier_ratio", "min_support_coverage", "min_visible_fraction", "min_patch_overlap", "registration_min_overlap",
                 "registration_max_anisotropy", "registration_min_observability", "adaptive_min_improvement",
                 "keyframe_min_ncc", "keyframe_min_inlier_ratio", "adaptive_registration_min_ncc",
-                "adaptive_registration_min_gain")
+                "adaptive_registration_min_gain", "min_foreground_fraction")
         for name in unit:
             if not 0 < getattr(self, name) <= 1:
                 raise ValueError(f"{name} must be in (0,1]")
@@ -142,7 +149,7 @@ class KLTConfig:
                     "max_rotation_step", "registration_max_translation", "registration_max_rotation",
                     "registration_max_scale", "registration_epsilon", "min_scale_total", "max_scale_total",
                     "max_anisotropy_step", "max_anisotropy_total", "max_shear_step", "max_shear_total",
-                    "max_perspective_step", "max_perspective_total", "max_corner_extra_step", "max_corner_extra_total")
+                    "max_perspective_step", "max_perspective_total", "max_corner_extra_step", "max_corner_extra_total", "center_smoothing_px")
         if any(getattr(self, name) <= 0 for name in positive):
             raise ValueError("tracking/registration thresholds must be positive")
         if self.min_scale_step > 1 or self.max_scale_step < 1 or self.registration_max_scale < 1:
@@ -320,19 +327,19 @@ class KLTTracker:
         return np.sum(self._grid(radius)**2, axis=-1) <= radius**2
 
     def provenance(self):
-        return {"algorithm": self.name, "engine_revision": 3, "template_mode": self.config.template_mode, "implementation": "OpenCV pyramidal LK for circles; inverse-compositional foreground alignment for explicit masks",
+        return {"algorithm": self.name, "engine_revision": 4, "template_mode": self.config.template_mode, "implementation": "OpenCV pyramidal LK for circles; inverse-compositional foreground alignment for explicit masks",
                 "opencv": cv2.__version__, "config": asdict(self.config),
                 "patch_regions": self.patch_regions_used,
                 "support_policy": "per-query source-pixel circle intersected with optional reference foreground mask; transported by accepted warp",
                 "lk_support_policy": ("batched circle LK uses native context for proposals; correlation validates real transported support; explicit masks use foreground-only direct fitting" if self.algorithm == "klt-template" and self.config.template_mode == "correlation" else "unmasked queries use supported LK footprints; explicit masks use foreground-only inverse-compositional patch alignment, sampled through each candidate warp"),
                 "border_policy": "immutable real reference pixels; reference/current visibility intersection for appearance; in-frame center and min_visible_fraction; plain edge uses supported-corner translation and LK windows shrink with visible circle area",
-                "reference_policy": ("immutable original plus latest accepted raw RGB on fixed reference support; rejected fits never refresh; optional original-validated bank" if self.algorithm == "klt-template" and self.config.template_mode == "correlation" else "immutable original plus optional bounded original-validated native-pixel keyframes; no unchecked template promotion"),
+                "reference_policy": ("immutable original foreground guard plus accepted recent raw RGB restricted to matching foreground; rejected/occluded fits never refresh" if self.algorithm == "klt-template" and self.config.template_mode == "correlation" else "immutable original plus optional bounded original-validated native-pixel keyframes; no unchecked template promotion"),
                 "validity_policy": "positive local tracking gates do not certify an original anchor or a drift bound; inspect registration_status separately",
                 "registration_policy": "original/recent proposals share source-time acceptance; center-only ambiguity never updates pose or templates; immutable original",
                 "registration_convergence": ("masked NCC and temporal guard; progressive joint shape/center banks, automatic CPU map/remap scoring and bounded top-K IC-LK fits" if self.algorithm == "klt-template" and self.config.template_mode == "correlation" else "local ECC needs an already close prior; innovation limits are rejection gates, not a guaranteed capture range"),
-                "registration_budget": ("bounded coarse/fine candidate bank only on weak evidence or original drift checks; one final direct fit per searched reference" if self.algorithm == "klt-template" and self.config.template_mode == "correlation" else "original first; adaptive can try one higher original model, then at most one validated-keyframe fallback (at most three ECC hypotheses per due query)"),
+                "registration_budget": ("no broad recovery by default; explicit recovery enables bounded coarse/fine banks on weak evidence; one final direct fit per searched reference" if self.algorithm == "klt-template" and self.config.template_mode == "correlation" else "original first; adaptive can try one higher original model, then at most one validated-keyframe fallback (at most three ECC hypotheses per due query)"),
                 "warp_convention": "full native original-to-current homography; pose from polar decomposition of its Jacobian at the original query",
-                "loss_policy": ("correlation recovery within source-time grace; finite last-known coordinates while invalid" if self.algorithm == "klt-template" and self.config.template_mode == "correlation" else "permanent until explicit reset; finite last-known coordinates with nonpositive quality"),
+                "loss_policy": ("stop on lost original foreground; local tracking only by default; explicit recovery uses source-time grace; finite last-known invalid coordinates" if self.algorithm == "klt-template" and self.config.template_mode == "correlation" else "permanent until explicit reset; finite last-known coordinates with nonpositive quality"),
                 "rotation_convention": "clockwise degrees in image XY; scale relative to initialization"}
 
     def environment(self):

@@ -112,6 +112,7 @@ class PatchMotionTests(unittest.TestCase):
             min_inliers=4,
             correlation_max_shapes=9,
             correlation_margin=0.005,
+            recovery_enabled=True,
         )
         tracker.infer([frame(0), frame(2)], [[80.0, 80.0]])
         self.assertGreater(tracker.last_diagnostics[-1]["fit_score"], 0.9)

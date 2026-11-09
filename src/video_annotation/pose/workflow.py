@@ -44,7 +44,7 @@ FIELDS = ('frame','timestamp_us','x','y','rotation_degrees','rotation_unwrapped_
     'tracker_x','tracker_y','tracker_w','tracker_h','fit_mode','circle_x','circle_y','circle_radius',
     'geometry_source',*EXTENT_FIELDS,*ROTATION_QUALITY_FIELDS,
     'reference_frame','point_id','point_visible','point_prediction_x','point_prediction_y',
-    'mask_registration_center_x','mask_registration_center_y',*FUSION_FIELDS,*METHOD_FIELDS)
+    'mask_registration_center_x','mask_registration_center_y','pose_reference_x','pose_reference_y',*FUSION_FIELDS,*METHOD_FIELDS)
 
 
 def _config(value):
@@ -67,16 +67,37 @@ def _overlay_path(tracks, video, method):
     return ROOT/'outputs/videos/point_pose'/relative/('refined-'+method+'.mp4')
 
 
-def _draw(frame, rows, source_frame, *, source_size=None, render_options=None):
-    return draw_pose_overlay(frame,rows,source_frame,source_size=source_size,render_options=render_options)
+def _draw(frame, rows, source_frame, *, supports=None,source_size=None, render_options=None):
+    return draw_pose_overlay(frame,rows,source_frame,supports=supports,source_size=source_size,render_options=render_options)
 
 
 def _invalid(reason):
     return dict(valid=0,reason=reason,rotation_valid=0,rotation_reason=reason,template_updated=0,fit_mode='none')
 
 
+def _consolidate_saved_point_poses(folder,data,selected,*,prefer_existing,method,destination=None):
+    from ..rgb_tracking.track_pose import write_point_pose_tracks,pose_matrix,number
+    poses={};references={}
+    for identity in selected:
+        path=folder/f'point_{identity}/pose.csv'
+        if not path.is_file():continue
+        with path.open(newline='') as stream:rows=list(csv.DictReader(stream))
+        poses.update({(int(row['frame']),identity):row for row in rows})
+        for row in rows:
+            if not int(row.get('valid') or 0):continue
+            query=[number(row.get('pose_reference_x')),number(row.get('pose_reference_y'))]
+            H=pose_matrix(row)
+            if not np.isfinite(query).all() and H is not None:
+                p=np.linalg.solve(H,np.array([float(row['x']),float(row['y']),1.]));query=(p[:2]/p[2]).tolist()
+            if not np.isfinite(query).all():query=data['supports'][identity]['pose_query'].tolist()
+            references[str(identity)]=dict(frame=int(row.get('reference_frame') or data['metadata']['query_frame']),query_xy=query)
+            break
+    return write_point_pose_tracks(folder/'points.csv',data,pose_rows=poses,references=references,
+                                   prefer_existing=prefer_existing,method=method,destination=destination)
+
+
 def _render_saved_poses(paths, video, source, start, count, target, fps, max_width, options,
-                        times, progress, cancel):
+                        times, progress, cancel,supports=None):
     """Replay finalized CSVs; used for fresh gap-filled output and cached overlays."""
     target.parent.mkdir(parents=True,exist_ok=True)
     temporary=target.with_name('.'+target.stem+'.'+uuid4().hex+'.mp4')
@@ -110,7 +131,7 @@ def _render_saved_poses(paths, video, source, start, count, target, fps, max_wid
                 clock=time.perf_counter()
                 if (dw,dh)!=(source['width'],source['height']):
                     image=cv2.resize(image,(dw,dh),interpolation=cv2.INTER_AREA)
-                _draw(image,rows,frame,source_size=(source['width'],source['height']),render_options=options)
+                _draw(image,rows,frame,supports=supports,source_size=(source['width'],source['height']),render_options=options)
                 image=cv2.copyMakeBorder(image,0,size[1]-dh,0,size[0]-dw,cv2.BORDER_CONSTANT)
                 writer.write(image)
                 times['render_seconds']+=time.perf_counter()-clock
@@ -127,11 +148,63 @@ def _render_saved_poses(paths, video, source, start, count, target, fps, max_wid
         if writer is not None:writer.close()
 
 
+def render_existing_point_poses(tracks,*,output=None,video=None,fps=None,max_width=1280,render_options=None,
+                                gap_seconds=.1,gap_neighbors=2,force=False,progress=None,cancel=None,
+                                point_ids=None,max_frames=None):
+    """Render saved point+pose rows without creating or invoking any estimator."""
+    from ..rgb_tracking.track_pose import read_point_pose_tracks
+    begin=time.perf_counter();tracks=contained_path(tracks,'data')
+    check_cancel(cancel)
+    render_source=probe_video(video)[0] if video is not None else None
+    data=read_point_pose_tracks(tracks,video=video,source=render_source,gap_seconds=gap_seconds,gap_neighbors=gap_neighbors)
+    source=data['source'];video=data['video'];options=normalize_render_options(render_options)
+    fps=source['fps'] if fps is None else fps
+    if not np.isfinite(fps) or fps<=0 or isinstance(max_width,bool) or max_width<1:
+        raise ValueError('Overlay FPS and maximum width must be positive')
+    if max_frames is not None and (type(max_frames) is not int or max_frames<1):raise ValueError('max_frames must be positive')
+    ids=set(data['metadata']['point_ids'] if point_ids is None else point_ids)
+    if not ids or not ids.issubset(data['metadata']['point_ids']):raise ValueError('Select existing point IDs')
+    output=contained_path(output or _overlay_path(tracks,video,'existing'),'outputs')
+    if output.suffix.lower()!='.mp4':raise ValueError('Overlay must be a portable .mp4 file')
+    output.parent.mkdir(parents=True,exist_ok=True)
+    signature=dict(version=1,renderer_version=4,tracks=file_digest(tracks),metadata=data['metadata'],fps=float(fps),max_width=max_width,
+        render_options=options,gap_seconds=gap_seconds,gap_neighbors=gap_neighbors,point_ids=sorted(ids),max_frames=max_frames)
+    sidecar=output.with_suffix('.json');old=json.loads(sidecar.read_text()) if sidecar.is_file() else {}
+    reused=bool(not force and output.is_file() and old.get('settings')==signature and old.get('output_bytes')==output.stat().st_size)
+    count=min(len(data['frames']),options['max_frames'] or len(data['frames']),max_frames or len(data['frames']))
+    times=dict(refinement_seconds=0.,setup_seconds=0.,decode_seconds=0.,render_seconds=0.)
+    temporary=output.with_name('.'+output.stem+'.'+uuid4().hex+'.mp4');writer=None
+    try:
+        if not reused:
+            ratio=min(1.,max_width/source['width']);dw,dh=max(1,round(source['width']*ratio)),max(1,round(source['height']*ratio))
+            size=dw+dw%2,dh+dh%2
+            writer=H264Writer(temporary,size,fps,crf=options['crf'],preset=options['preset'])
+            stream=iter(video_frames(video,data['metadata']['query_frame'],count,source=source))
+            for index,frame in enumerate(data['frames'][:count]):
+                check_cancel(cancel);clock=time.perf_counter();image=next(stream,None)
+                if image is None:raise ValueError('Source video ended during existing-pose rendering')
+                times['decode_seconds']+=time.perf_counter()-clock;clock=time.perf_counter()
+                if (dw,dh)!=(source['width'],source['height']):image=cv2.resize(image,(dw,dh),interpolation=cv2.INTER_AREA)
+                rows={identity:row for identity,row in data['rows_by_frame'][frame].items() if identity in ids}
+                _draw(image,rows,frame,supports=data['supports'],source_size=(source['width'],source['height']),render_options=options)
+                writer.write(cv2.copyMakeBorder(image,0,size[1]-dh,0,size[0]-dw,cv2.BORDER_CONSTANT))
+                times['render_seconds']+=time.perf_counter()-clock
+                if progress and ((index+1)%30==0 or index+1==count):progress(f'Rendering saved points/poses: {index+1}/{count} frames')
+            writer.close();writer=None;check_cancel(cancel);temporary.replace(output)
+            write_json(sidecar,dict(settings=signature,output_bytes=output.stat().st_size))
+        times['wall_seconds']=time.perf_counter()-begin
+        return dict(tracks=str(tracks),input=str(tracks),output=str(output),overlay=str(output),output_dir=str(output.parent),
+                    frames=count,reused=reused,timing=times,gap_processing=data['gap_reports'])
+    finally:
+        if writer is not None:writer.close()
+        temporary.unlink(missing_ok=True)
+
+
 def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None, radius=None,
                         max_frames=None, overlay=True, overlay_fps=None, max_width=1280,
                         render_options=None, force=False, progress=None, cancel=None,
                         overlay_path=None, opencv_threads=1, gap_seconds=.1, gap_neighbors=2,
-                        method=DEFAULT_METHOD, method_options=None):
+                        method=DEFAULT_METHOD, method_options=None,fill_missing=True,video=None):
     """Decode once for independent point fits; preserve IDs, gaps and source time.
 
     Reference foreground moves with the accepted warp about the selected query.
@@ -139,6 +212,8 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
     Constant point-circle dimensions never act as a measured image-scale prior.
     """
     if method not in METHODS:raise ValueError('Unknown pose method: '+str(method))
+    if type(fill_missing) is not bool:raise ValueError('fill_missing must be boolean')
+    prefer_existing=fill_missing and not force
     method_options=normalize_method_options(method_options)
     begin = time.perf_counter()
     times = dict(adaptation_seconds=0.,setup_seconds=0.,decode_seconds=0.,refinement_seconds=0.,render_seconds=0.,interpolation_seconds=0.)
@@ -146,11 +221,14 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
     defer_overlay=bool(gap_seconds and gap_neighbors)
     check_cancel(cancel)
     tracks = contained_path(tracks,'data')
-    metadata = json.loads(tracks.with_suffix('.json').read_text())
+    from ..rgb_tracking.track_pose import point_track_metadata,read_point_pose_tracks,write_point_pose_tracks,flag
+    metadata = json.loads(tracks.with_suffix('.json').read_text()) if tracks.with_suffix('.json').is_file() else None
+    if metadata is None and video is None:raise ValueError('Tracks have no metadata; provide the source video')
+    video=contained_path(video or tracks.parent/metadata['source_video'],'data')
+    source=probe_video(video)[0]
+    metadata,video,source=point_track_metadata(tracks,video=video,source=source)
     if metadata.get('kind') != 'rgb_point_tracks' or metadata.get('coordinate_space') != DISPLAY_COORDINATE_SPACE:
         raise ValueError('Point refinement requires displayed-coordinate rgb_point_tracks metadata')
-    video = contained_path(tracks.parent/metadata['source_video'],'data')
-    source = probe_video(video)[0]
     if metadata.get('source_size_px',[source['width'],source['height']]) != [source['width'],source['height']]:
         raise ValueError('Source video dimensions changed since point tracking')
     if metadata.get('source_file_stat',[video.stat().st_size,video.stat().st_mtime_ns]) != [video.stat().st_size,video.stat().st_mtime_ns]:
@@ -184,6 +262,10 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
     count = max(ends)-start+1 if ends else 0
     frames,xy,visible = frames[:count],xy[:count],visible[:count]
     supports = patch_supports(tracks,metadata,video,source,selected,radius)
+    track_data=read_point_pose_tracks(tracks,video=video,source=source)
+    track_data['supports'].update(supports)
+    # Rendering and consumers use one point+pose CSV; per-point files remain
+    # compatibility diagnostics and are not required by the canonical output.
     proposals={}
     if method=='patch_hybrid':
         from .hybrid import track_warp_proposals
@@ -201,6 +283,9 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
     fps = source['fps'] if overlay_fps is None else overlay_fps
     if not np.isfinite(fps) or fps<=0 or max_width<1:
         raise ValueError('Overlay FPS and maximum width must be positive')
+    missing={identity for identity in selected if any(flag(rows[identity]['visible']) and
+        not flag(rows[identity].get('pose_valid')) for frame,rows in track_data['rows_by_frame'].items()
+        if frame<start+requested_count)}
     # Added KLT controls must not invalidate older runs using identical defaults.
     recent_policy=method in GEOMETRIC_METHODS and method_options['use_recent']
     signature_options={k:v for k,v in method_options.items() if not k.startswith('klt_') and k not in RECENT_DEFAULTS}
@@ -215,8 +300,8 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
         for key,default in dict(klt_max_points=200,klt_min_distance=4.,klt_window=21).items():
             if method_options[key]!=default:signature_options[key]=method_options[key]
     if method=='patch_hybrid':signature_options=dict(method_options)
-    signature = hashlib.sha256(json.dumps(dict(version=6,source_fps=source['fps'],method=method,method_options=signature_options,gap_seconds=gap_seconds,gap_neighbors=gap_neighbors,tracks=file_digest(tracks),
-        metadata=file_digest(tracks.with_suffix('.json')),source=[video.stat().st_size,video.stat().st_mtime_ns],
+    signature = hashlib.sha256(json.dumps(dict(version=7,fill_missing=prefer_existing,source_fps=source['fps'],method=method,method_options=signature_options,gap_seconds=gap_seconds,gap_neighbors=gap_neighbors,tracks=file_digest(tracks),
+        metadata=metadata,source=[video.stat().st_size,video.stat().st_mtime_ns],
         point_ids=selected,config=asdict(cfg),frames=count,
         supports={str(i):dict(radius=s['radius'],query=None if s['query'] is None else s['query'].tolist(),
                               mask=None if s['mask'] is None else hashlib.sha256(s['mask'].tobytes()).hexdigest())
@@ -230,6 +315,36 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
     if output_dir.exists() and not old:
         raise ValueError('Existing point refinement directory has no manifest; choose a fresh directory')
     times['adaptation_seconds'] = time.perf_counter()-begin
+    if prefer_existing and not missing:
+        consolidated=output_dir/'points.csv'
+        valid=sum(flag(row.get('pose_valid')) for frame,rows in track_data['rows_by_frame'].items()
+                  if frame<start+requested_count for identity,row in rows.items() if identity in selected)
+        if not reused:
+            output_dir.parent.mkdir(parents=True,exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix='.point-pose-',dir=output_dir.parent) as temporary:
+                stage=Path(temporary)/'export';stage.mkdir()
+                copied=read_point_pose_tracks(tracks,video=video,source=source,gap_seconds=gap_seconds,gap_neighbors=gap_neighbors)
+                copied['supports'].update(supports)
+                write_point_pose_tracks(stage/'points.csv',copied,method=method,destination=consolidated)
+                manifest=dict(schema_version=1,kind='point_pose_refinement',input_signature=signature,
+                    point_tracks=os.path.relpath(tracks,output_dir),video=os.path.relpath(video,output_dir),
+                    point_ids=selected,method=method,method_options=method_options,frames=count,valid_point_rows=valid,
+                    fit_valid_point_rows=valid,point_frames=0,config=asdict(cfg),timing=times,
+                    existing_pose_copy=True,artifacts={name:file_digest(stage/name) for name in ('points.csv','points.json')})
+                require_no_output_references(manifest);write_json(stage/'refinement.json',manifest)
+                check_cancel(cancel);stage.rename(output_dir)
+        rendered=(render_existing_point_poses(consolidated,output=overlay_target,video=video,fps=fps,max_width=max_width,
+            render_options=options,gap_seconds=0.,force=force,point_ids=selected,max_frames=requested_count,
+            progress=progress,cancel=cancel) if overlay_target else None)
+        timing=dict(times,wall_seconds=time.perf_counter()-begin,mean_ms_per_point_frame=0.,mean_ms_per_source_frame=0.)
+        if rendered:
+            timing['decode_seconds']=rendered['timing']['decode_seconds'];timing['render_seconds']=rendered['timing']['render_seconds']
+        if not reused:
+            manifest['timing']=timing;write_json(manifest_path,manifest)
+        return dict(output=str(output_dir),output_dir=str(output_dir),tracks=str(consolidated),poses={},
+            overlay=rendered['overlay'] if rendered else None,method=method,method_options=method_options,timing=timing,
+            current_run_timing=timing,timing_source='existing point poses',reused=True,frames=count,
+            requested_source_frames=requested_count,point_frames=0,valid_point_rows=valid)
     overlay_signature = dict(renderer_version=4,input_signature=signature,fps=float(fps),max_width=max_width,render_options=options)
     overlay_sidecar = overlay_target.with_suffix('.json') if overlay_target else None
     overlay_reused = bool(overlay_target and overlay_target.is_file() and overlay_sidecar.is_file() and
@@ -246,11 +361,12 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
             for key in ('adaptation_seconds','setup_seconds','decode_seconds','refinement_seconds',
                         'mean_ms_per_point_frame','mean_ms_per_source_frame','interpolation_seconds'):
                 timing[key] = old.get('timing',{}).get(key,0.)
-        return dict(output=str(output_dir),output_dir=str(output_dir),poses={str(i):str(p) for i,p in poses.items()},
+        return dict(output=str(output_dir),output_dir=str(output_dir),tracks=str(output_dir/'points.csv'),poses={str(i):str(p) for i,p in poses.items()},
                     overlay=str(overlay_target) if overlay_target else None,method=method,method_options=method_options,timing=timing,reused=reused,
                     timing_source='recorded refinement' if reused else 'current run',current_run_timing=current_run_timing,
                     frames=count,requested_source_frames=requested_count,point_frames=point_frames,valid_point_rows=valid)
     if reused and (not overlay_target or overlay_reused):
+        if not (output_dir/'points.csv').is_file():_consolidate_saved_point_poses(output_dir,track_data,selected,prefer_existing=prefer_existing,method=method)
         return result(old['valid_point_rows'],0)
     output_dir.parent.mkdir(parents=True,exist_ok=True)
     previous_threads = cv2.getNumThreads()
@@ -259,11 +375,11 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
     temporary_overlay = None
     try:
         if reused:
-            temporary_overlay=_render_saved_poses(poses,video,source,start,count,overlay_target,fps,max_width,
-                                                  options,times,progress,cancel)
-            temporary_overlay.replace(overlay_target)
-            write_json(overlay_sidecar,dict(settings=overlay_signature,output_bytes=overlay_target.stat().st_size,
-                                           source_video=str(video),point_tracks=str(tracks)))
+            if not (output_dir/'points.csv').is_file():_consolidate_saved_point_poses(output_dir,track_data,selected,prefer_existing=prefer_existing,method=method)
+            rendered=render_existing_point_poses(output_dir/'points.csv',output=overlay_target,video=video,fps=fps,
+                max_width=max_width,render_options=options,gap_seconds=0.,point_ids=selected,max_frames=count,
+                progress=progress,cancel=cancel)
+            times['decode_seconds']+=rendered['timing']['decode_seconds'];times['render_seconds']+=rendered['timing']['render_seconds']
             return result(old['valid_point_rows'],0)
         with tempfile.TemporaryDirectory(prefix='.point-pose-',dir=output_dir.parent) as temporary, ExitStack() as stack:
             stage = Path(temporary)/'export'; stage.mkdir()
@@ -278,12 +394,6 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
             ratio = min(1.,max_width/w)
             dw,dh = max(1,round(w*ratio)),max(1,round(h*ratio))
             size = dw+dw%2,dh+dh%2
-            if overlay_target and not defer_overlay:
-                overlay_target.parent.mkdir(parents=True,exist_ok=True)
-                temporary_overlay = overlay_target.with_name('.'+overlay_target.stem+'.'+uuid4().hex+'.mp4')
-                clock = time.perf_counter()
-                writer = H264Writer(temporary_overlay,size,fps,crf=options['crf'],preset=options['preset'])
-                times['render_seconds'] += time.perf_counter()-clock
             stream = iter(video_frames(video,start,count,source=source))
             valid_total = point_frames = 0
             hybrid_groups=[]
@@ -440,6 +550,8 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                     row.update(frame=int(frame_id),timestamp_us=float(frame_id*1e6/source['fps']),object_id=i,point_id=i,
                                reference_frame=state['reference_frame'] if state['reference_frame'] is not None else '',
                                point_visible=int(visible[index,point]),point_prediction_x=float(center[0]),point_prediction_y=float(center[1]))
+                    if state['reference_query'] is not None:
+                        row.update(pose_reference_x=float(state['reference_query'][0]),pose_reference_y=float(state['reference_query'][1]))
                     row.setdefault('pose_method',method)
                     row.setdefault('homography_valid',0)
                     writers[i].writerow(row)
@@ -449,7 +561,7 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                 if writer is not None and (options['max_frames'] is None or index<options['max_frames']):
                     clock = time.perf_counter()
                     if (dw,dh)!=(w,h): image=cv2.resize(image,(dw,dh),interpolation=cv2.INTER_AREA)
-                    _draw(image,rows,int(frame_id),source_size=(w,h),render_options=options)
+                    _draw(image,rows,int(frame_id),supports=supports,source_size=(w,h),render_options=options)
                     image=cv2.copyMakeBorder(image,0,size[1]-dh,0,size[0]-dw,cv2.BORDER_CONSTANT)
                     writer.write(image)
                     times['render_seconds'] += time.perf_counter()-clock
@@ -476,9 +588,6 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                 times['interpolation_seconds']+=time.perf_counter()-clock
                 counts[i]=gap_reports[i]['usable_center_scale_frames']
             valid_total=sum(counts.values())
-            if overlay_target and defer_overlay:
-                temporary_overlay=_render_saved_poses({i:stage/f'point_{i}/pose.csv' for i in selected},
-                    video,source,start,count,overlay_target,fps,max_width,options,times,progress,cancel)
             if not reused:
                 artifacts = {}
                 for i in selected:
@@ -512,6 +621,8 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                     for filename in ('pose.csv','pose.raw.csv','pose.json'):
                         relative=str(Path(f'point_{i}')/filename)
                         artifacts[relative]=file_digest(folder/filename)
+                _consolidate_saved_point_poses(stage,track_data,selected,prefer_existing=prefer_existing,method=method,destination=output_dir/'points.csv')
+                artifacts.update({'points.csv':file_digest(stage/'points.csv'),'points.json':file_digest(stage/'points.json')})
                 manifest=dict(schema_version=1,kind='point_pose_refinement',input_signature=signature,
                     point_tracks=os.path.relpath(tracks,output_dir),video=os.path.relpath(video,output_dir),
                     point_ids=selected,method=method,method_options=method_options,frames=count,valid_point_rows=valid_total,fit_valid_point_rows=raw_valid_total,point_frames=point_frames,
@@ -525,10 +636,11 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                 except BaseException:
                     if previous.exists(): previous.rename(output_dir)
                     raise
-            if temporary_overlay is not None:
-                temporary_overlay.replace(overlay_target)
-                write_json(overlay_sidecar,dict(settings=overlay_signature,output_bytes=overlay_target.stat().st_size,
-                    source_video=str(video),point_tracks=str(tracks)))
+            if overlay_target:
+                rendered=render_existing_point_poses(output_dir/'points.csv',output=overlay_target,video=video,fps=fps,
+                    max_width=max_width,render_options=options,gap_seconds=0.,force=force,point_ids=selected,max_frames=count,
+                    progress=progress,cancel=cancel)
+                times['decode_seconds']+=rendered['timing']['decode_seconds'];times['render_seconds']+=rendered['timing']['render_seconds']
             completed = result(old['valid_point_rows'] if reused else valid_total,point_frames)
             if not reused:
                 manifest['timing'] = completed['timing']

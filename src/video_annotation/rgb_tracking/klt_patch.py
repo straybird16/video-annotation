@@ -38,6 +38,7 @@ class State:
     original: object = None
     center_only: bool = False
     anchor_scale: float = 1.0
+    foreground: object = None
 
 
 def initialize(tracker, gray, rows):
@@ -75,6 +76,7 @@ def initialize(tracker, gray, rows):
         )
         state = tracker._hybrid[-1]
         state.original = Reference(tracker.templates[i], tracker.support_masks[i], 0)
+        state.foreground = tracker.support_masks[i].copy()
         state.motion = PatchMotion(
             tracker.initial_points[i],
             c.patch_radius,
@@ -301,7 +303,7 @@ def _features(tracker, gray, i, transform):
         project_points(np.linalg.inv(transform), xy) - tracker.initial_points[i] + r
     )
     mask = cv2.remap(
-        tracker.support_masks[i].astype(np.uint8),
+        tracker._hybrid[i].foreground.astype(np.uint8),
         original[..., 0].astype(np.float32),
         original[..., 1].astype(np.float32),
         cv2.INTER_NEAREST,
@@ -571,6 +573,70 @@ def _search(tracker, gray, i, base, reference, *, original=False):
     return best, {**best_info, "search_candidates": total}
 
 
+def _foreground(tracker, gray, i, candidate, row):
+    """Immutable original foreground evidence; never learn an occluding surface."""
+    c = tracker.patch_configs[i]
+    if not c.stop_on_occlusion:
+        return tracker.support_masks[i], True
+    from ..common.patch_evidence import foreground_evidence
+
+    fixed = _prepared(tracker, i, tracker._hybrid[i].original)
+    pixels, visible = _sampled_patch(tracker, gray, i, candidate)
+    if row.get("original_score", -1.0) >= 0.9:
+        row.update(
+            foreground_match_fraction=1.0,
+            occluded=False,
+            occlusion_suspected=False,
+            foreground_reason="strong_original_global_fit",
+        )
+        return fixed.mask & visible, True
+    foreground, evidence = foreground_evidence(
+        fixed.pixels,
+        pixels,
+        fixed.mask,
+        visible,
+        min_std=c.min_patch_std,
+        min_ncc=c.min_patch_ncc,
+    )
+    row.update(evidence)
+    fraction = evidence.get("foreground_match_fraction")
+    low_foreground = fraction is not None and fraction < c.min_foreground_fraction
+    # Small pose/texture changes can lower local original NCC even while flow
+    # remains well supported. Require independent failure evidence before an
+    # irreversible stop; do not call local appearance disagreement semantic
+    # occlusion. An uncertain patch may continue, but cannot refresh appearance.
+    retention = row.get("feature_retention_ratio")
+    corroborated = (
+        (retention is not None and retention < c.min_foreground_fraction)
+        or row.get("recent_score", 1.0) < c.min_patch_ncc
+        or tracker.explicit_masks[i]
+        and row.get("original_score", 1.0) < c.min_patch_ncc
+    )
+    lost = low_foreground and corroborated
+    row["occlusion_suspected"] = bool(low_foreground)
+    row["occluded"] = bool(lost)
+    if lost:
+        tracker.alive[i] = False
+        reason = "foreground_support_lost"
+        row.update(
+            reason=reason,
+            failure_reason=reason,
+            tracking_status="terminated",
+            recent_template_updated=False,
+        )
+        tracker.first_failures.setdefault(
+            i,
+            {
+                "frame": int(tracker.frames_seen),
+                "reason": reason,
+                "feature_count": int(row["feature_count"]),
+            },
+        )
+    if low_foreground and not lost:
+        foreground = tracker._hybrid[i].foreground & visible
+    return foreground, not lost
+
+
 def _geometry(tracker, i, candidate, last, *, reanchor=False):
     c = tracker.patch_configs[i]
     p = tracker.initial_points[i]
@@ -739,6 +805,33 @@ def advance(tracker, gray, offset):
                     if k not in ("reason", "rotation_degrees", "scale")
                 }
             )
+        if (
+            not local_valid
+            and not tracker.explicit_masks[i]
+            and state.missing_since is None
+            and not c.recovery_enabled
+        ):
+            # Sparse support can be temporarily insufficient without an actual
+            # disappearance. One local fit is cheap; broad shape/center banks
+            # remain an explicit recovery option.
+            model = "similarity" if c.motion_model == "adaptive" else c.motion_model
+            proposal, direct = _prepared(tracker, i, state.recent).fit(
+                gray,
+                predicted,
+                model=model,
+                iterations=c.correlation_refine_iterations,
+                min_overlap=c.min_visible_fraction,
+                min_std=c.min_patch_std,
+                max_displacement=c.max_displacement,
+                epsilon=c.registration_epsilon,
+            )
+            if proposal is not None:
+                local_valid = True
+                row.update(
+                    {k: v for k, v in direct.items() if k != "reason"},
+                    alignment_method="local_direct",
+                    motion_model=model,
+                )
         candidate = proposal if proposal is not None else predicted
         if (
             tracker._warp_hints is not None
@@ -763,7 +856,7 @@ def advance(tracker, gray, offset):
         original = state.original
         original_score = (
             float(_score(tracker, gray, i, [candidate], original)[0][0])
-            if due or not local_valid
+            if due or not local_valid or c.stop_on_occlusion
             else None
         )
         # Trigger a supported geometric upgrade on actual patch disagreement.
@@ -787,6 +880,64 @@ def advance(tracker, gray, offset):
                     inliers = keep
                     row.update(extra)
                     local_valid = True
+                    if c.stop_on_occlusion:
+                        original_score = float(
+                            _score(tracker, gray, i, [candidate], original)[0][0]
+                        )
+        # A local original fit is distinct from recovery: no center/shape bank,
+        # at most four iterations around the measured H. It corrects gradual
+        # reference drift before confusing bad pose with foreground occlusion.
+        if (
+            c.stop_on_occlusion
+            and local_valid
+            and original_score < c.registration_min_ncc
+        ):
+            model = "similarity" if c.motion_model == "adaptive" else c.motion_model
+            anchored, _ = _prepared(tracker, i, original).fit(
+                gray,
+                candidate,
+                model=model,
+                iterations=min(4, c.correlation_refine_iterations),
+                min_overlap=c.min_visible_fraction,
+                min_std=c.min_patch_std,
+                max_displacement=c.max_displacement,
+                epsilon=c.registration_epsilon,
+            )
+            if anchored is not None:
+                score = float(_score(tracker, gray, i, [anchored], original)[0][0])
+                if (
+                    score
+                    >= max(
+                        c.min_patch_ncc,
+                        original_score + c.adaptive_registration_min_gain,
+                    )
+                    and state.motion.check(anchored, tracker.frames_seen, hint)[
+                        "motion_accepted"
+                    ]
+                ):
+                    candidate = anchored
+                    original_score = score
+                    recent_score = float(
+                        _score(tracker, gray, i, [candidate], state.recent)[0][0]
+                    )
+                    row["model_selection"] = "original:local_drift_guard"
+        # Original support cannot gradually be replaced by an occluder in the
+        # recent appearance. Recheck below if recovery/smoothing changes H.
+        row["feature_retention_ratio"] = (
+            len(pp) / max(1, len(tracker.features[i]))
+            if not tracker.explicit_masks[i]
+            else None
+        )
+        row.update(original_score=original_score, recent_score=recent_score)
+        evidence_matrix = candidate.copy()
+        foreground, survives = _foreground(tracker, gray, i, candidate, row)
+        if not survives:
+            row.update(
+                recent_score=recent_score,
+                original_score=original_score,
+                fit_score=recent_score,
+            )
+            continue
         temporal = state.motion.check(candidate, tracker.frames_seen, hint)
         recovery = (
             not local_valid
@@ -803,7 +954,7 @@ def advance(tracker, gray, offset):
         margin = None
         origin_confirmed = False
         used_original = False
-        if recovery:
+        if recovery and c.recovery_enabled:
             state.attempts += 1
             fitted, search_info = _search(tracker, gray, i, candidate, state.recent)
             margin = search_info.get("fit_margin")
@@ -842,7 +993,7 @@ def advance(tracker, gray, offset):
             ):
                 local_valid = True
                 used_original = True
-            if original_score < c.registration_min_ncc:
+            if original_score < c.registration_min_ncc and c.recovery_enabled:
                 fitted, search_info = _search(
                     tracker, gray, i, candidate, original, original=True
                 )
@@ -922,7 +1073,9 @@ def advance(tracker, gray, offset):
                     },
                 )
             if (
-                (tracker.frames_seen - state.missing_since) / tracker.stream_fps
+                not c.recovery_enabled
+                and hint is None
+                or (tracker.frames_seen - state.missing_since) / tracker.stream_fps
                 > tracker.reacquire_seconds + 1e-12
                 or tracker.reacquire_seconds == 0
             ):
@@ -930,13 +1083,85 @@ def advance(tracker, gray, offset):
                 row["tracking_status"] = "terminated"
             continue
         anchor_scale = state.anchor_scale
+        recovered = state.missing_since is not None
+        # Regularize only small center innovations, in source pixels. Compare
+        # real image evidence at the measured and predicted centers; a clearly
+        # better fit wins. Apply any correction to the full H, then revalidate
+        # its score, so stored center/warp/template coordinates stay identical.
+        if c.center_smoothing and state.motion.updates and gap == 1:
+            from ..common.patch_evidence import center_blend
+
+            raw_center = project_points(candidate, p)
+            expected_center = project_points(predicted, p)
+            innovation = float(np.linalg.norm(raw_center - expected_center))
+            row.update(
+                raw_center_x=float(raw_center[0]),
+                raw_center_y=float(raw_center[1]),
+                center_smoothing_alpha=1.0,
+                center_correction_px=0.0,
+            )
+            if 1e-5 < innovation <= 3 * c.center_smoothing_px:
+                reference = original if used_original else state.recent
+                shift = np.eye(3)
+                shift[:2, 2] = expected_center - raw_center
+                prior_score = float(
+                    _score(tracker, gray, i, [shift @ candidate], reference)[0][0]
+                )
+                alpha = center_blend(
+                    accepted_score,
+                    prior_score,
+                    innovation,
+                    radius_px=c.center_smoothing_px,
+                    score_margin=max(0.001, c.correlation_margin),
+                )
+                if alpha < 1:
+                    shift[:2, 2] *= 1 - alpha
+                    smoothed = shift @ candidate
+                    smoothed_score = float(
+                        _score(tracker, gray, i, [smoothed], reference)[0][0]
+                    )
+                    # Smoothing cannot turn a valid measurement into a failed
+                    # image fit or bypass the accepted shape/geometry bounds.
+                    checked, smooth_geometry, _ = _geometry(
+                        tracker, i, smoothed, last, reanchor=used_original
+                    )
+                    if checked is not None and smoothed_score >= c.min_patch_ncc:
+                        candidate, geometry = checked, smooth_geometry
+                        accepted_score = smoothed_score
+                        row.update(
+                            center_smoothing_alpha=float(alpha),
+                            center_correction_px=float((1 - alpha) * innovation),
+                        )
+        if not np.array_equal(evidence_matrix, candidate):
+            if c.stop_on_occlusion:
+                row.update(
+                    original_score=float(
+                        _score(tracker, gray, i, [candidate], original)[0][0]
+                    ),
+                    recent_score=float(
+                        _score(tracker, gray, i, [candidate], state.recent)[0][0]
+                    ),
+                )
+            foreground, survives = _foreground(tracker, gray, i, candidate, row)
+            if not survives:
+                continue
+        if used_original:
+            original_score = accepted_score
+        else:
+            recent_score = accepted_score
+        if origin_confirmed:
+            original_score = float(
+                _score(tracker, gray, i, [candidate], original)[0][0]
+            )
+            origin_confirmed = original_score >= c.registration_min_ncc and not row.get(
+                "occlusion_suspected", False
+            )
         scale_reliable = (
             origin_confirmed
             or 1 / c.registration_max_scale
             <= geometry["scale"] / anchor_scale
             <= c.registration_max_scale
         )
-        recovered = state.missing_since is not None
         state.motion.commit(candidate, tracker.frames_seen, hint)
         state.center_only = False
         state.delta = candidate @ np.linalg.inv(last)
@@ -956,21 +1181,36 @@ def advance(tracker, gray, offset):
             c.use_recent_template
             and accepted_score >= c.template_update_score
             and tracker.observability[i] >= c.registration_min_observability
+            and not row.get("occlusion_suspected", False)
         )
         if refresh:
             pixels, visible = _sampled_patch(tracker, gray, i, candidate)
-            mask = tracker.support_masks[i] & visible
+            mask = tracker.support_masks[i] & visible & foreground
             state.recent = Reference(
                 pixels.astype(np.float32), mask.copy(), tracker.frames_seen
             )
         state.last_frame = tracker.frames_seen
         state.missing_since = None
+        state.foreground = foreground
         if not tracker.explicit_masks[i]:
             retain = (
                 qq[inliers]
                 if inliers is not None and len(inliers) == len(qq)
                 else np.empty((0, 2), np.float32)
             )
+            if len(retain):
+                coordinates = (
+                    project_points(np.linalg.inv(candidate), retain)
+                    - p
+                    + c.patch_radius
+                )
+                indices = np.rint(coordinates).astype(int)
+                inside = np.all(
+                    (indices >= 0) & (indices < foreground.shape[::-1]), axis=1
+                )
+                supported = np.zeros(len(retain), bool)
+                supported[inside] = foreground[indices[inside, 1], indices[inside, 0]]
+                retain = retain[supported]
             if (
                 recovery
                 or used_original
@@ -985,7 +1225,7 @@ def advance(tracker, gray, offset):
             valid=True,
             reason=(
                 "recovered_correlation"
-                if recovered or recovery
+                if recovered or recovery and c.recovery_enabled
                 else "reanchored_original" if used_original else "passed_correlation"
             ),
             pose_valid=True,
@@ -1019,7 +1259,7 @@ def advance(tracker, gray, offset):
                 for x in range(3)
             }
         )
-        if origin_confirmed:
+        if origin_confirmed and not row.get("occlusion_suspected", False):
             tracker._promote_keyframe(gray, i, candidate, row)
         scores[i] = max(0.001, min(1.0, max(0.0, accepted_score)))
     if previous_index is not None:

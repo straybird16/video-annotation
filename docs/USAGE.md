@@ -27,13 +27,22 @@ KLT uses the circle intersected with the optional mask. Explicit masks use
 foreground-only direct alignment, transporting support with the accepted warp.
 Unmasked patches use sparse pyramidal KLT. `klt-affine` adds geometric fitting;
 `klt-template` defaults to correlation-guarded motion proposals: masked patch
-scores validate the proposal, and weak evidence triggers bounded center/pose
-recovery against the original and accepted recent appearance. Similarity,
+scores validate the proposal. Broad center/pose recovery is **off by default**;
+enable `recovery_enabled` for a deliberate recovery pass. Similarity,
 affine, homography and adaptive models are selectable. `template_mode=legacy_ecc`
 keeps the former periodic iterative-registration route. TAPNext++ uses point
 coordinates only; patch annotations remain editable for other trackers.
 Adaptive is the default for new KLT patch runs; existing configs retain their
 explicit model choice.
+
+The default foreground guard compares local appearance with the immutable
+original support. Too little agreement plus weak global appearance or feature
+survival ends the track immediately; uncertain occlusion freezes template updates.
+It excludes offscreen pixels and cannot prove object identity against a similar
+occluder. `stop_on_occlusion` and `min_foreground_fraction` control this policy.
+`center_smoothing` suppresses weak small translation innovations; a sufficient
+NCC improvement or larger motion passes through. `center_smoothing_px` is the
+source-pixel jitter range (default2). Center and full H are corrected together.
 
 Classical `points.csv` keeps the original first six columns and appends initial
 rotation/scale estimates, component-validity flags, selected motion model,
@@ -56,9 +65,11 @@ See the [parameter guide](../src/video_annotation/guides/KLT_PARAMETERS.md).
 Lost points disappear and trails clear. Native reacquisition is accepted within
 `reacquire_seconds` (default 0.5 source-video seconds); later automatic returns
 are suppressed. Zero ends immediately. Correlation-mode KLT template tracking
-attempts bounded recovery during this window; other backends retain their own
-native recovery behavior. New CSVs omit unrecovered tails; readers preserve full
-source timing.
+attempts bounded recovery during this window only with `recovery_enabled`.
+Otherwise its first unrecoverable local failure ends tracking; a confirmed
+foreground loss ends it even when recovery is enabled. Other backends retain
+their native behavior. New CSVs omit unrecovered tails; readers preserve full
+source timing. Use review anchors to mark reappearance.
 
 For old predictions **and corrected tracks**, apply the rule to the stored CSVs:
 
@@ -105,6 +116,8 @@ positions between them. Tune every N frames (default 30). Choose whether to end
 at the last label or join the next original position. Originals remain preserved;
 the default correction name is `corrected/points.csv`. Explicit visible manual
 anchors can restart a point after a long gap.
+**Show pose** optionally draws the full-H transformed patch circle and arrow;
+edited centers never inherit stale pose geometry.
 
 **Reacquisition grace (seconds)** is directly above the review controls. Apply or
 press Enter to refresh the preview; Save also applies a pending value. The same
@@ -140,8 +153,13 @@ The method selector offers fast correlation, guarded ECC/IC-LK homography,
 ECC affine/homography, IC-LK homography, independent KLT/RANSAC, and the optional
 legacy original-biased fusion. The default is **Shared patch tracker** (`patch_hybrid`): the same
 batched KLT/correlation engine as point tracking, with shared temporal acceptance. Source radii/masks follow saved annotations; the resampling
-grid does not change their physical size. **Render overlay** reuses that method's
-saved poses and shared circle/arrow renderer. The tab shows measured costs and
+grid does not change their physical size. Track and refined pose share one
+`points.csv`; masks stay in separate reference assets. **Render existing pose
+(no fitting)** accepts that file directly and always shows visible centers, even
+when pose is missing. Its optional interpolation uses only short bracketed gaps.
+**Keep existing poses; fit missing poses only** preserves supplied valid poses;
+disable it to re-estimate them. Recovery remains an explicit extra effort.
+The tab shows measured costs and
 opens the pose/overlay folders. Labels stay readable at the final preview size,
 without background panels. **Render settings** offers pose line width, opacity,
 outline, labels and font scale (defaults1px/70%/no outline). Parameter groups

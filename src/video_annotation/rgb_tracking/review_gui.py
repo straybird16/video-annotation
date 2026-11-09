@@ -78,7 +78,7 @@ class TrackReview(ttk.Frame if ttk is not None else object):
         super().__init__(parent, padding=6)
         from PIL import Image, ImageTk
         self.owner, self.Image, self.ImageTk = owner, Image, ImageTk
-        self.model = self.cache = self.preview_data = None
+        self.model = self.cache = self.preview_data = self.pose_data = None
         self.last_saved_path = None
         self.frame_index, self.drag_xy = 0, None
         self.busy = self.closed = self.loading = False
@@ -91,6 +91,7 @@ class TrackReview(ttk.Frame if ttk is not None else object):
         self.x_var, self.y_var = tk.StringVar(), tk.StringVar()
         self.visible_var = tk.BooleanVar(value=True)
         self.show_trail, self.only_selected = tk.BooleanVar(value=True), tk.BooleanVar(value=False)
+        self.show_pose = tk.BooleanVar(value=False)
         self.reacquire_var = tk.StringVar(value=f"{getattr(getattr(owner, 'processor', None), 'reacquire_seconds', .5):g}")
         self.tail_var, self.join_var = tk.StringVar(value="Keep original tail"), tk.StringVar()
         self.save_mode = tk.StringVar(value="Named track")
@@ -201,6 +202,9 @@ class TrackReview(ttk.Frame if ttk is not None else object):
             widget = ttk.Checkbutton(view, text=title, variable=variable, command=lambda: self.action(self.redraw))
             widget.pack(side="left", padx=(0, 8))
             self.control(widget)
+        pose_view = ttk.Checkbutton(view, text='Patch pose (warped circle + arrow)', variable=self.show_pose,
+                                   command=lambda: self.action(self.toggle_pose))
+        pose_view.pack(side='left', padx=(0, 8)); self.control(pose_view)
         ttk.Label(view, text="Trail frames:").pack(side="left")
         self.entry(view, self.trail_var, 6, self.redraw)
         self.button(view, "Update view", self.redraw)
@@ -396,6 +400,9 @@ class TrackReview(ttk.Frame if ttk is not None else object):
         if self.cache is not None:
             self.cache.clear()
         self.model, self.cache, self.last_saved_path = model, cache, path
+        self.pose_data = None
+        if self.show_pose.get():
+            self.load_pose_preview()
         self.reacquire_var.set(f"{model.reacquire_seconds:g}")
         if self._seek_after is not None:
             self.after_cancel(self._seek_after)
@@ -625,6 +632,14 @@ class TrackReview(ttk.Frame if ttk is not None else object):
             return
         frame = int(self.model.frames[self.frame_index])
         image = self.cache.get(frame)
+        if getattr(self, 'show_pose', None) is not None and self.show_pose.get() and self.pose_data is not None:
+            from video_annotation.pose.overlay import draw_point_pose_rows
+            rows = self.pose_preview_rows(frame)
+            if rows:
+                image = image.copy()  # Keep the decoded source-frame cache immutable.
+                options = dict(getattr(self.owner, 'render_options', None) or {}, pose_labels=False)
+                draw_point_pose_rows(image, rows, frame, supports=self.pose_data['supports'],
+                    source_size=(self.model.width, self.model.height), render_options=options)
         navigation = getattr(self, 'navigation', None)
         self.transform = (navigation.transform(image, str(self.model.video)) if navigation is not None else
             DisplayTransform(self.model.width, self.model.height,
@@ -666,6 +681,34 @@ class TrackReview(ttk.Frame if ttk is not None else object):
                 self.canvas.create_text(px+9, py-9, text=str(point_id), fill="#ffffff", anchor="sw", font="TkDefaultFont")
         self.canvas.create_text(8, 8, text=f"Source frame {frame} · point {identity} · {labels[self.frame_index, column]}",
             fill="white", anchor="nw", font="TkDefaultFont")
+
+    def load_pose_preview(self):
+        from .track_pose import read_point_pose_tracks
+        self.pose_data = read_point_pose_tracks(self.last_saved_path,
+            video=self.model.video, source=self.cache.source)
+
+    def toggle_pose(self):
+        if self.show_pose.get() and self.model is not None and self.pose_data is None:
+            self.load_pose_preview()
+        self.redraw()
+
+    def pose_preview_rows(self, frame):
+        """Never attach an old fitted patch to a manually moved center."""
+        xy, visible, _ = self.preview_data
+        selected, _ = self.selected_point()
+        result = {}
+        for column, identity in enumerate(self.model.point_ids):
+            row = self.pose_data['rows_by_frame'].get(frame, {}).get(identity)
+            if row is None or not visible[self.frame_index, column]:
+                continue
+            if self.only_selected.get() and identity != selected:
+                continue
+            if identity == selected and self.drag_xy is not None:
+                continue
+            center = np.array([row.get('x', float('nan')), row.get('y', float('nan'))], float)
+            if np.allclose(center, xy[self.frame_index, column], atol=1e-4, rtol=0):
+                result[identity] = row
+        return result
 
     def save(self, output=None):
         model = self.require_model()

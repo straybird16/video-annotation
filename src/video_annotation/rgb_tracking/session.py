@@ -10,6 +10,11 @@ from .tapnextpp import ROOT, contained_path
 PARAMETER_GUIDE = Path(__file__).resolve().parents[1]/'guides/KLT_PARAMETERS.md'
 
 PARAMETER_HELP = {
+    'recovery_enabled': 'Allow expensive shape/center recovery after a local fit fails. Default off keeps the fast local path. Definite occlusion never triggers a recovery search.',
+    'stop_on_occlusion': 'End a patch track when foreground evidence indicates definite occlusion; default on. This is distinct from ordinary uncertain fits and the source-time reacquisition grace.',
+    'min_foreground_fraction': 'Minimum fraction of original foreground evidence required by the occlusion check, in (0,1]; default 0.5. Lower values permit more partial foreground.',
+    'center_smoothing': 'Reduce small accepted center jitter using source-pixel motion uncertainty; default on. Accepted rotation/scale and source timestamps remain unchanged.',
+    'center_smoothing_px': 'Source-pixel range used to smooth small center jitter; default 2 pixels. Larger values smooth more, independently of overlay resolution or FPS.',
     'reacquire_seconds': 'Maximum source-video seconds after first loss for native tracker recovery. Default 0.5; zero ends immediately. Lost points are hidden and unrecovered tails are omitted from new predictions.',
     'motion_model': 'Patch geometry: adaptive (default) upgrades only with evidence; fixed similarity, affine or homography are also available.',
     'motion_gate': 'Reject candidate pose jumps that disagree with recent accepted source-time motion and uncertainty. Rejected candidates cannot update the template or motion history.',

@@ -2,6 +2,14 @@
 
 Newest entries first. See PROVENANCE.md for the original workspace history.
 
+- 2026-11-09 — Disabled broad recovery by default, added original-foreground
+  survival checks, bounded original drift correction and confidence-aware center
+  smoothing. Unified tracking/refinement in `points.csv`, added full-H review and
+  direct pose rendering with visible centers and optional short-gap interpolation.
+  Codex coordinator with resumed evidence, export and GUI workers. Focused
+  model-free/native GUI checks and a bounded Amherst replay; original data kept.
+  [Usage](docs/USAGE.md), [pose files and rendering](docs/POSE_REFINEMENT.md).
+
 - 2026-11-09 — Unified point tracking and refinement with a shared patch engine,
   batched gray/LK streams, cached foreground matching and accepted-only source-time
   motion checks. Added symmetry-jump rejection, gradual external-track drift priors,

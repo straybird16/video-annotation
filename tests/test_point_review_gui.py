@@ -1,7 +1,7 @@
 """Focused model-free checks for review loss display and source-time policy."""
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock,patch
 
 import numpy as np
 
@@ -77,6 +77,27 @@ class PointReviewLossTests(unittest.TestCase):
             review.reacquire_var.set(value)
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'finite nonnegative'):
                 review.apply_reacquisition_policy()
+
+    def test_optional_pose_uses_shared_renderer_keeps_centers_and_source_cache(self):
+        review=self.review_canvas([True,True])
+        image=np.zeros((80,100,3),np.uint8)
+        review.cache.get=lambda frame:image
+        row=dict(x=21.,y=20.,visible=1,valid=1,homography_valid=1)
+        review.pose_data=dict(supports={7:dict(radius=12)},rows_by_frame={1:{7:row}})
+        review.show_pose=Value(True)
+        review.owner=SimpleNamespace(render_options={'pose_alpha':.7})
+        with patch('video_annotation.pose.overlay.draw_point_pose_rows',create=True) as draw:
+            draw.side_effect=lambda frame,*args,**kwargs:frame.fill(255)
+            review.redraw()
+        self.assertEqual(review.canvas.create_oval.call_count,2)  # Native + manual centers stay present.
+        self.assertEqual(draw.call_args.args[1],{7:row})
+        self.assertFalse(np.any(image))
+        self.assertFalse(draw.call_args.kwargs['render_options']['pose_labels'])
+        review.preview_data[0][1,0]=[30.,20.]
+        self.assertEqual(review.pose_preview_rows(1),{})  # A moved manual center cannot inherit its old H.
+        review.preview_data[0][1,0]=[21.,20.]
+        review.drag_xy=[23.,20.]
+        self.assertEqual(review.pose_preview_rows(1),{})
 
 
 if __name__ == '__main__':

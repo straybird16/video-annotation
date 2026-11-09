@@ -38,7 +38,7 @@ GEOMETRIC_METHODS = tuple(m for m in METHODS if m not in ('patch_hybrid','simila
 
 def method_options(value=None):
     result = dict(ecc_iters=45,ic_iters=20,ic_stride=2,min_gain=.0025,
-                  klt_max_points=200,klt_min_distance=4.,klt_window=21,**RECENT_DEFAULTS,**SEARCH_DEFAULTS,**MOTION_DEFAULTS)
+                  klt_max_points=200,klt_min_distance=4.,klt_window=21,recovery_enabled=False,**RECENT_DEFAULTS,**SEARCH_DEFAULTS,**MOTION_DEFAULTS)
     value = dict(value or {})
     if set(value)-set(result):raise ValueError('Unknown pose method options: '+', '.join(sorted(set(value)-set(result))))
     result.update(value)
@@ -54,7 +54,7 @@ def method_options(value=None):
     if isinstance(result['min_gain'],bool) or not isinstance(result['min_gain'],(int,float)) or not np.isfinite(result['min_gain']) or not 0<=result['min_gain']<2:
         raise ValueError('min_gain must be finite and in [0,2)')
     result['min_gain']=float(result['min_gain'])
-    for key in ('use_recent','center_search','motion_gate'):
+    for key in ('use_recent','center_search','motion_gate','recovery_enabled'):
         if type(result[key]) is not bool:raise ValueError(key+' must be boolean')
     v=result['search_radius']
     if isinstance(v,bool) or not isinstance(v,(int,float)) or not np.isfinite(v) or not 0<v<=1024:

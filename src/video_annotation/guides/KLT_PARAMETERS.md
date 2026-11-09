@@ -4,8 +4,9 @@ Without an explicit mask, the tracker follows local texture with pyramidal
 Lucas–Kanade optical flow and checks each match forwards and backwards.
 `klt-affine` fits motion to several support features; `klt-template` defaults to
 correlation-guarded proposals, retaining the original patch and accepted recent
-appearance. Weak correlation triggers bounded nearby center/pose recovery;
-only the best candidate receives fine alignment. `template_mode=legacy_ecc`
+appearance. Expensive nearby center/pose recovery is optional and off by default;
+enable `recovery_enabled` to search after a weak local fit. Only bounded top-K
+candidates receive fine alignment. `template_mode=legacy_ecc`
 selects the former periodic iterative registration. Similarity is the conservative
 rotation/uniform-scale model; affine adds shear and homography adds perspective.
 Adaptive is the new default: extra affine/projective freedom is tried only when
@@ -28,8 +29,9 @@ store the same budget as `correlation_max_shapes`.
 
 The shared `reacquire_seconds` runtime setting defaults to 0.5 source-video
 seconds (CLI `--reacquire-seconds`); zero ends a track immediately. It limits native
-recoveries such as TAPNext++ provides; correlation-mode template KLT also tries
-bounded patch recovery during that window. Lost markers
+recoveries such as TAPNext++ provides; template KLT can try bounded patch recovery
+during that window when recovery is enabled. Definite occlusion stops the track
+by default and never triggers search. Lost markers
 are hidden and unrecovered prediction tails are omitted. See
 [loss and reacquisition](../../../docs/USAGE.md).
 
@@ -72,6 +74,11 @@ that an iterative optimizer or a finite candidate grid finds the true motion.
 
 | Parameter | Default | Meaning |
 |---|---|---|
+| `recovery_enabled` | `false` | Permit expensive shape/center recovery after local failure. |
+| `stop_on_occlusion` | `true` | End a track on definite foreground occlusion; no occluded-frame search. |
+| `min_foreground_fraction` | `0.5` | Foreground fraction required by the occlusion check, in (0,1]. |
+| `center_smoothing` | `true` | Smooth small accepted center jitter. |
+| `center_smoothing_px` | `2` | Source-pixel smoothing range; independent of preview size/FPS. |
 | `motion_model` | `adaptive` | Start simple and upgrade with evidence; fixed similarity, affine or homography are also selectable. |
 | `motion_gate` | `true` | Reject temporally inconsistent motion before committing pose or template updates. |
 | `motion_sigma` | `4` | Motion innovation limit in uncertainty standard deviations. |

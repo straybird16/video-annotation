@@ -112,6 +112,8 @@ class HybridPoseEstimator:
             correlation_top_k=min(8, options["search_top_k"]),
             center_trust=options["center_trust"],
             use_recent_template=options["use_recent"],
+            recovery_enabled=options["recovery_enabled"],
+            stop_on_occlusion=False,
             **{
                 name: options[name]
                 for name in (
