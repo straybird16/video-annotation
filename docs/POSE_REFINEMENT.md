@@ -13,8 +13,8 @@ arrow. Lost or rejected points are hidden. Open-folder buttons locate the
 refined data and portable H.264 MP4. Render settings control FPS, width, CRF,
 encoding preset and preview frame limit; FPS changes only preview speed.
 Circle/arrow coordinates follow the resized image, while labels are drawn at
-the final video resolution: outlined white text on an opaque dark backing,
-wrapped and clamped at image edges. Smaller previews keep readable labels.
+the final video resolution: compact color-matched text with a thin dark outline and no background panel.
+Labels remain clamped at image edges and are not blurred by resizing.
 
 CLI equivalent from the workspace root:
 

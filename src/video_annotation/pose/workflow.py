@@ -224,7 +224,7 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
     if output_dir.exists() and not old:
         raise ValueError('Existing point refinement directory has no manifest; choose a fresh directory')
     times['adaptation_seconds'] = time.perf_counter()-begin
-    overlay_signature = dict(renderer_version=2,input_signature=signature,fps=float(fps),max_width=max_width,render_options=options)
+    overlay_signature = dict(renderer_version=3,input_signature=signature,fps=float(fps),max_width=max_width,render_options=options)
     overlay_sidecar = overlay_target.with_suffix('.json') if overlay_target else None
     overlay_reused = bool(overlay_target and overlay_target.is_file() and overlay_sidecar.is_file() and
         json.loads(overlay_sidecar.read_text()).get('settings')==overlay_signature and

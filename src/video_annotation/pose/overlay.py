@@ -11,13 +11,13 @@ from ..common.pose_rendering import circle_geometry, draw_tracks
 
 COLORS = ((0, 220, 255), (255, 180, 0), (80, 255, 80), (255, 80, 255), (80, 150, 255))
 FONT = cv2.FONT_HERSHEY_SIMPLEX
-FONT_SCALE = .7  # 16-pixel glyph height, independent of source/output scaling.
+FONT_SCALE = .4  # Original compact style, drawn after resizing for clarity.
 
 
-def _label(frame, text, anchor):
-    """Place an opaque, wrapped label inside the image without shrinking text."""
+def _label(frame, text, anchor, color=(255, 255, 255)):
+    """Place small outlined text inside the image without a background panel."""
     height, width = frame.shape[:2]
-    padding, margin = 4, 2
+    padding, margin = 1, 2
     available = max(1, width - 2*(margin + padding))
     lines, line = [], ''
     for word in text.split():
@@ -46,11 +46,10 @@ def _label(frame, text, anchor):
     x = int(np.clip(round(anchor[0]), margin, max(margin, width-box_width-margin)))
     y = int(np.clip(round(anchor[1]), margin, max(margin, height-box_height-margin)))
     x, y = min(x, width-box_width), min(y, height-box_height)
-    cv2.rectangle(frame, (x, y), (x+box_width-1, y+box_height-1), (18, 18, 18), cv2.FILLED)
     for index, item in enumerate(lines):
         origin = (x+padding, y+padding+glyph_height+index*line_height)
-        cv2.putText(frame, item, origin, FONT, FONT_SCALE, (0, 0, 0), 4, cv2.LINE_AA)
-        cv2.putText(frame, item, origin, FONT, FONT_SCALE, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(frame, item, origin, FONT, FONT_SCALE, (0, 0, 0), 2, cv2.LINE_AA)
+        cv2.putText(frame, item, origin, FONT, FONT_SCALE, color, 1, cv2.LINE_AA)
 
 
 def draw_pose_overlay(frame, rows, source_frame, *, source_size=None):
@@ -84,8 +83,8 @@ def draw_pose_overlay(frame, rows, source_frame, *, source_size=None):
                  else f'{identity}: rotation unavailable ({row.get("rotation_reason", "unreliable")})')
         if int(row.get('center_scale_interpolated') or 0) or int(row.get('rotation_interpolated') or 0):
             label += ' [interpolated]'
-        labels.append((label, position+np.array([5, -30])))
-    for label, anchor in labels:
-        _label(frame, label, anchor)
+        labels.append((label, position+np.array([5, -18]), COLORS[int(identity)%len(COLORS)]))
+    for label, anchor, color in labels:
+        _label(frame, label, anchor, color)
     _label(frame, f'Source frame {source_frame}', (8, 8))
     return frame

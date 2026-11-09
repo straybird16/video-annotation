@@ -2,6 +2,11 @@
 
 Newest entries first. See PROVENANCE.md for the original workspace history.
 
+- 2026-11-08 — Restored compact color-matched pose labels with a thin outline,
+  removed solid background panels, and kept drawing after resizing. Bumped only
+  the overlay cache version so saved fits can be rerendered without estimation.
+  Codex coordinator; two focused renderer checks and saved-fit preview.
+
 - 2026-11-08 — Added opt-in bounded masked center recovery with a supplied-point
   trust prior, coarse/fine NCC and one final solver fit; exposed GUI/CLI controls.
   Profiled and removed repeated failed original fits (17.9% faster in the
