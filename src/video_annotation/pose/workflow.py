@@ -29,7 +29,8 @@ from .input import patch_supports, transported_mask
 from .registration import Config, rotation, PoseEstimator
 from .anchored import FUSION_FIELDS
 from .methods import (METHODS, DEFAULT_METHOD, METHOD_LABELS, METHOD_FIELDS, create_estimator,
-                      method_options as normalize_method_options, row_matrix, attach_matrix)
+                      method_options as normalize_method_options, row_matrix, attach_matrix,
+                      RECENT_DEFAULTS, GEOMETRIC_METHODS)
 from .gaps import finalize_pose_csv, validate_gap_options
 
 FIELDS = ('frame','timestamp_us','x','y','rotation_degrees','rotation_unwrapped_degrees',
@@ -212,11 +213,13 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
     if not np.isfinite(fps) or fps<=0 or max_width<1:
         raise ValueError('Overlay FPS and maximum width must be positive')
     # Added KLT controls must not invalidate older runs using identical defaults.
-    signature_options={k:v for k,v in method_options.items() if not k.startswith('klt_')}
+    recent_policy=method in GEOMETRIC_METHODS and method_options['use_recent']
+    signature_options={k:v for k,v in method_options.items() if not k.startswith('klt_') and k not in RECENT_DEFAULTS}
+    if recent_policy:signature_options.update({k:method_options[k] for k in RECENT_DEFAULTS})
     if method=='klt_ransac':
         for key,default in dict(klt_max_points=200,klt_min_distance=4.,klt_window=21).items():
             if method_options[key]!=default:signature_options[key]=method_options[key]
-    signature = hashlib.sha256(json.dumps(dict(version=3,method=method,method_options=signature_options,gap_seconds=gap_seconds,gap_neighbors=gap_neighbors,tracks=file_digest(tracks),
+    signature = hashlib.sha256(json.dumps(dict(version=4 if recent_policy else 3,method=method,method_options=signature_options,gap_seconds=gap_seconds,gap_neighbors=gap_neighbors,tracks=file_digest(tracks),
         metadata=file_digest(tracks.with_suffix('.json')),source=[video.stat().st_size,video.stat().st_mtime_ns],
         point_ids=selected,config=asdict(cfg),frames=count,
         supports={str(i):dict(radius=s['radius'],query=None if s['query'] is None else s['query'].tolist(),
@@ -398,7 +401,9 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                 clock=time.perf_counter()
                 gap_reports[i]=finalize_pose_csv(folder/'pose.raw.csv',folder/'pose.csv',fps=source['fps'],
                     radius=supports[i]['radius'],gap_seconds=gap_seconds,gap_neighbors=gap_neighbors,
-                    rotation_period=cfg.rotation_period,fit_fields=(*FUSION_FIELDS,'candidate_score','candidate_gain'))
+                    rotation_period=cfg.rotation_period,fit_fields=(*FUSION_FIELDS,'candidate_score','candidate_gain',
+                        'reference_ncc','reference_overlap','original_ncc','recent_ncc',
+                        'geometric_inlier_ratio','geometric_fit_error','geometric_coverage'))
                 times['interpolation_seconds']+=time.perf_counter()-clock
                 counts[i]=gap_reports[i]['usable_center_scale_frames']
             valid_total=sum(counts.values())
@@ -411,6 +416,8 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                     folder = stage/f'point_{i}'
                     support = supports[i]
                     point_metadata = dict(schema_version=3,kind='rgb_point_pose',registration_method=method,
+                        reference_policy='original_and_accepted_recent_v1' if recent_policy else 'legacy_method_policy',
+                        score_semantics='foreground NCC; native sparse inlier diagnostics are separate' if recent_policy else 'legacy method-specific fit confidence',
                         method=METHOD_LABELS[method],method_options=method_options,config=asdict(cfg),
                         video=os.path.relpath(video,poses[i].parent),point_tracks=os.path.relpath(tracks,poses[i].parent),
                         point_id=i,object_id=i,coordinate_space=DISPLAY_COORDINATE_SPACE,

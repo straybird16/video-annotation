@@ -150,6 +150,18 @@ def parser():
     refine.add_argument("--klt-max-points", type=positive, default=200, help="KLT maximum features, at least 8")
     refine.add_argument("--klt-min-distance", type=float, default=4., help="KLT feature spacing in source pixels, at least 1")
     refine.add_argument("--klt-window", type=positive, default=21, help="KLT optical-flow window in pixels, odd and at least 3")
+    refine.add_argument("--no-recent-template", dest="use_recent", action="store_false", default=True,
+                        help="disable recent validated templates for geometric methods")
+    refine.add_argument("--geometric-min-score", type=float, default=.70,
+                        help="geometric acceptance NCC threshold, separate from the correlation seed score")
+    refine.add_argument("--original-score-slack", type=float, default=.03,
+                        help="geometric recent-template score allowance relative to the original")
+    refine.add_argument("--template-min-overlap", type=float, default=.6,
+                        help="geometric template minimum foreground overlap")
+    refine.add_argument("--template-update-score", type=float, default=.75,
+                        help="geometric template minimum NCC for accepting an update")
+    refine.add_argument("--original-check-interval", type=positive, default=10,
+                        help="geometric original-template check interval in source frames")
     refine.add_argument("--min-score", type=float, default=.75)
     refine.add_argument("--full-search", action="store_true", help="disable the cheaper guarded local path")
     refine.add_argument("--reference-interval", type=positive, default=10)
@@ -411,7 +423,9 @@ def refine_command(args):
         render_options=rendering_configuration(args), opencv_threads=args.opencv_threads,
         gap_seconds=args.gap_seconds, gap_neighbors=args.gap_neighbors,
         method=args.pose_method, method_options={name:getattr(args, name) for name in
-            ('ecc_iters','ic_iters','ic_stride','min_gain','klt_max_points','klt_min_distance','klt_window')},
+            ('ecc_iters','ic_iters','ic_stride','min_gain','klt_max_points','klt_min_distance','klt_window',
+             'use_recent','geometric_min_score','original_score_slack','template_min_overlap',
+             'template_update_score','original_check_interval')},
         progress=lambda value: print(value, flush=True))
     print(json.dumps(result, indent=2))
 

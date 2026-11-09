@@ -75,6 +75,29 @@ def remap_h(image, H, x, y, interpolation=cv2.INTER_LINEAR):
                      borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
 
+def _normalized_remap(current, H, x, y):
+    """Normalize only the source footprint, preserving global remap rounding."""
+    points = warp_points(H, np.c_[x.ravel(), y.ravel()])
+    points[~np.isfinite(points)] = -1
+    # Match remap_h's global float32 maps BEFORE changing their source origin.
+    # Rounding only after a float64 translation changes interpolation phases.
+    with np.errstate(over='ignore', invalid='ignore'):
+        points = points.astype(np.float32)
+    points[~np.isfinite(points)] = -1
+    size = np.array(current.shape[::-1])
+    touches = ((points > -1).all(axis=1) & (points < size).all(axis=1))
+    if not touches.any():
+        return np.zeros(x.shape, np.float32)
+    # A guard outside the bilinear neighborhood prevents an artificial ROI
+    # border; clipping retains the actual source's constant-zero border.
+    lo = np.maximum(np.floor(points[touches].min(axis=0)).astype(int)-1, 0)
+    hi = np.minimum(np.ceil(points[touches].max(axis=0)).astype(int)+2, size)
+    source = current[lo[1]:hi[1], lo[0]:hi[0]].astype(np.float32) / 255.
+    local = points - lo.astype(np.float32)
+    return cv2.remap(source, local[:,0].reshape(x.shape), local[:,1].reshape(y.shape),
+                     cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+
 def _source_valid(shape, H, x, y, mask=None):
     points = warp_points(H, np.c_[x.ravel(), y.ravel()])
     # Leave a one-pixel guard for bilinear image/gradient sampling.
@@ -137,9 +160,81 @@ class DenseReference:
             raise ValueError('IC stride must be a positive integer')
         self.ic_stride, self.ic = int(ic_stride), None
         self.last_stats = {}
+        self._original_ref = self.ref.copy()
+        self._original_keep = self.keep.copy()
+        self._original_ref.setflags(write=False)
+        self._original_keep.setflags(write=False)
 
     def aligned(self, current, Hsim):
-        return remap_h(current.astype(np.float32) / 255., homog(Hsim) @ self.P, self.x, self.y)
+        return _normalized_remap(current, homog(Hsim) @ self.P, self.x, self.y)
+
+    def visible_support(self, current, H, *, mask=None):
+        """Canonical fixed foreground visible under a source-coordinate H."""
+        if current.ndim != 2 or current.dtype != np.uint8:
+            raise ValueError('Reference scoring requires uint8 grayscale source frames')
+        try:
+            H = homog(H)
+        except ValueError:
+            return np.zeros_like(self.keep)
+        return self.keep & _source_valid(current.shape, H @ self.P, self.x, self.y, mask)
+
+    def score(self, current, H, *, mask=None, keep=None):
+        """NCC on visible fixed foreground; overlap is original-support fraction.
+
+        ``keep`` is an optional canonical mask for comparing references on a
+        common set of pixels. Invalid/flat/tiny support has score -1, never NaN.
+        """
+        if current.ndim != 2 or current.dtype != np.uint8:
+            raise ValueError('Reference scoring requires uint8 grayscale source frames')
+        support = self.visible_support(current, H, mask=mask)
+        if keep is not None:
+            if np.shape(keep) != self.keep.shape:
+                raise ValueError('Comparison support must match the canonical patch')
+            support &= np.asarray(keep, bool)
+        try:
+            H = homog(H)
+        except ValueError:
+            return dict(score=-1., support_pixels=0, overlap=0.)
+        count = int(support.sum())
+        overlap = count / max(1, int(self._original_keep.sum()))
+        if count < 32:
+            return dict(score=-1., support_pixels=count, overlap=overlap)
+        sampled = self.aligned(current, H)
+        value = ncc(self.ref[support], sampled[support])
+        return dict(score=value if np.isfinite(value) else -1., support_pixels=count, overlap=overlap)
+
+    def snapshot(self, current, H, *, mask=None, min_overlap=.6):
+        """Independent recent appearance sampled once from the raw source.
+
+        Canonical coordinates always retain the initial P, including when this
+        method is called on another snapshot. Visibility comes from immutable
+        original foreground, so repeated updates never accumulate erosion.
+        """
+        if current.ndim != 2 or current.dtype != np.uint8:
+            raise ValueError('Reference snapshots require uint8 grayscale source frames')
+        if not np.isfinite(min_overlap) or not 0 <= min_overlap <= 1:
+            raise ValueError('Minimum reference overlap must be in [0,1]')
+        try:
+            H = homog(H)
+        except ValueError:
+            return None
+        keep = self._original_keep & _source_valid(current.shape, H @ self.P, self.x, self.y, mask)
+        if int(keep.sum()) < max(32, min_overlap * int(self._original_keep.sum())):
+            return None
+        reference = self.aligned(current, H)
+        if np.std(reference[keep]) < 1e-4:
+            return None
+        snapshot = object.__new__(type(self))
+        snapshot.side = self.side
+        snapshot.P, snapshot.Pinv = self.P.copy(), self.Pinv.copy()
+        snapshot.x, snapshot.y = self.x.copy(), self.y.copy()
+        snapshot.ref, snapshot.keep = reference, keep.copy()
+        snapshot.support = snapshot.keep.astype(np.uint8) * 255
+        snapshot.ic_stride, snapshot.ic, snapshot.last_stats = self.ic_stride, None, {}
+        snapshot._original_ref, snapshot._original_keep = self._original_ref.copy(), self._original_keep.copy()
+        snapshot._original_ref.setflags(write=False)
+        snapshot._original_keep.setflags(write=False)
+        return snapshot
 
     def estimate(self, current, Hsim, method, ecc_iters=45, ic_iters=20, mask=None, min_gain=.0025):
         methods = ('ecc_affine', 'ecc_homography', 'similarity_homography',
@@ -200,7 +295,7 @@ class DenseReference:
         common = initial_valid & _source_valid(current.shape, candidate @ self.P, self.x, self.y, mask)
         if common.sum() < max(32, .5 * initial_valid.sum()):
             return finish(reason='insufficient_common_support')
-        corrected = remap_h(current.astype(np.float32) / 255., candidate @ self.P, self.x, self.y)
+        corrected = self.aligned(current, candidate)
         before = ncc(self.ref[common], aligned[common])
         after = ncc(self.ref[common], corrected[common])
         gain = after - before
@@ -339,6 +434,55 @@ class SparseKLT:
         self.H = np.eye(3)
         self.opts = dict(winSize=(window, window), maxLevel=3,
                         criteria=(cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 20, .01))
+
+    def reseed(self, current, H, *, mask=None):
+        """Atomically detect under an accepted H, preserving original coordinates.
+
+        This is an explicit operation for the caller's validated recovery policy;
+        normal estimate() never resets its temporal state or fabricates recovery.
+        """
+        if (current.ndim != 2 or current.dtype != np.uint8 or current.shape != self.prev.shape
+                or (mask is not None and np.shape(mask) != current.shape)):
+            return False
+        try:
+            H = homog(H)
+            denominators = np.c_[self.support_corners, np.ones(4)] @ H[2]
+            if np.abs(denominators).min() < 1e-5 or np.any(denominators*denominators[0] <= 0):
+                return False
+            for point in self.support_corners:
+                _, _, scale = local_pose(H, point)
+                if not .05 < scale*scale < 20:
+                    return False
+            lo, hi = _bounded_roi(warp_points(H, self.support_corners), current.shape)
+            from_patch, to_roi = np.eye(3), np.eye(3)
+            from_patch[:2, 2], to_roi[:2, 2] = self.mask_lo, -lo
+            foreground = cv2.warpPerspective(self.mask_patch, to_roi @ H @ from_patch,
+                                            tuple((hi-lo).tolist()), flags=cv2.INTER_NEAREST)
+            if mask is not None:
+                foreground &= (_roi_image(np.asarray(mask), lo, hi) != 0).astype(np.uint8)*255
+            features = cv2.goodFeaturesToTrack(_roi_image(current, lo, hi), maxCorners=self.max_points,
+                qualityLevel=.008, minDistance=self.min_distance, mask=foreground, blockSize=5)
+            if features is None or len(features) < 8:
+                return False
+            tracked = (features.reshape(-1, 2) + lo).astype(np.float32)
+            reference = warp_points(np.linalg.inv(H), tracked)
+            inside = (np.isfinite(reference).all(axis=1) & (reference >= 0).all(axis=1)
+                      & (reference < np.array(self.mask0.shape[::-1])).all(axis=1)
+                      & (tracked >= 1).all(axis=1)
+                      & (tracked < np.array(current.shape[::-1])-2).all(axis=1))
+            reference, tracked = reference[inside], tracked[inside]
+            indices = np.rint(reference).astype(int)
+            inside = ((indices >= 0).all(axis=1) & (indices < np.array(self.mask0.shape[::-1])).all(axis=1))
+            inside[inside] &= self.mask0[indices[inside, 1], indices[inside, 0]] != 0
+            reference, tracked = reference[inside], tracked[inside]
+            if len(reference) < 8:
+                return False
+        except (cv2.error, ValueError, np.linalg.LinAlgError):
+            return False
+        # No state is changed until all geometry, support and feature checks pass.
+        self.prev, self.H = current.copy(), H.copy()
+        self.reference, self.tracked = reference.astype(np.float32), tracked.copy()
+        return True
 
     def estimate(self, current):
         started = time.perf_counter()

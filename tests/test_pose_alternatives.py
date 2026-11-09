@@ -75,7 +75,7 @@ class AlternativeWorkflowTests(unittest.TestCase):
         with patch('video_annotation.pose.geometric.DenseReference') as dense:
             dense.return_value.estimate.return_value=(np.eye(3),dict(score_after=.9,score_gain=.1,runtime=0.,used=1))
             est=create_estimator(np.zeros((100,100),np.uint8),[18.,18.,64.,64.],Config(),
-                                 method=DEFAULT_METHOD,base_factory=Seed)
+                                 method=DEFAULT_METHOD,base_factory=Seed,options={'use_recent':False})
             row=est.estimate(np.zeros((100,100),np.uint8),[18.,18.,64.,64.],1)
         self.assertEqual(row['valid'],1)
         self.assertEqual(row['candidate_used'],1)

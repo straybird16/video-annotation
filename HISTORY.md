@@ -2,6 +2,14 @@
 
 Newest entries first. See PROVENANCE.md for the original workspace history.
 
+- 2026-11-08 — Added original/accepted-recent geometric pose fitting, cautious
+  raw-frame template refresh, original-sized bounded recovery independent of
+  drifted H, and validated KLT reseeding. Added GUI/CLI controls and per-fit
+  reference/NCC/overlap/recovery provenance; kept opt-out and legacy cache reuse.
+  Reused RANSAC diagnostics and bounded dense normalization to patch ROIs.
+  Codex coordinator with resumed geometric/GUI workers.
+  [Policy and controls](docs/POSE_REFINEMENT.md).
+
 - 2026-11-08 — Added one-neighbor bracketed pose-gap interpolation and KLT
   feature-density/window controls in GUI/CLI. Checked two additional presets
   per fast/geometric method on corrected Ball02 tracks, preserving native fits,

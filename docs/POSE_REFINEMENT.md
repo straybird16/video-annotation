@@ -32,28 +32,47 @@ managed derived pose folder, never the original point predictions/references.
 | `--pose-method` | Behavior |
 |---|---|
 | `similarity` | Original fast correlation, immutable original plus one updated recent canonical template. No original-biased fusion. |
-| `similarity_ic_homography` | **Default:** similarity seed plus a guarded fixed-original IC-LK homography residual. Keeps similarity when the correction fails or gains ≤0.0025 NCC. |
-| `similarity_homography` | Same guarded route with OpenCV ECC homography. |
-| `ecc_affine` | Fixed-original ECC affine, seeded by similarity. Failed candidates remain invalid. |
-| `ecc_homography` | Fixed-original ECC homography, seeded by similarity. Failed candidates remain invalid. |
-| `inverse_compositional` | Fixed-original IC-LK homography, seeded by similarity. Failed candidates remain invalid. |
-| `klt_ransac` | Independent pyramidal KLT, forward/backward filtering and RANSAC homography. No similarity fallback. |
+| `similarity_ic_homography` | **Default:** recent IC-LK homography, periodic original checks and broader correlation recovery. A photometrically validated seed can survive a rejected or unhelpful correction. |
+| `similarity_homography` | Same guarded policy with OpenCV ECC homography. |
+| `ecc_affine` | Original/recent ECC affine; requires a valid solver candidate. |
+| `ecc_homography` | Original/recent ECC homography; requires a valid solver candidate. |
+| `inverse_compositional` | Original/recent IC-LK homography; requires a valid solver candidate. |
+| `klt_ransac` | Pyramidal KLT/RANSAC with original/recent appearance validation; template recovery can reseed lost features. |
 | `anchored` | Previous expensive original-reference-biased fusion, retained as an explicit option. |
 
-The dense alternatives are refiners, not independent recovery methods: they
-require a valid correlation seed and can inherit its failures. Guarded variants
-retain the seed whenever the correction is unavailable; they do not guarantee
-better accuracy or recovery from every rejected seed. Dense correction is a
-post-fit candidate; it does not run the expensive fusion or replace the base
-solver's recent appearance with a separately fused absolute pose.
+All six geometric choices now keep an immutable original and one validated
+recent appearance. Recent fitting uses the last accepted homography translated
+to the supplied point. The original is checked every10 source frames and when
+recent fitting fails; it wins when its NCC is within0.03 of recent on common
+visible pixels. A broader correlation search is rate-limited to once per10
+frames and uses original-sized support at the known point, independent of a
+possibly drifted scale/shear. This is bounded recovery, not a global detector.
+True zoom outside the configured scale-search range can still be unrecoverable.
 
-These methods do not all keep two image templates. Similarity keeps the immutable
-original plus a recent canonical patch, refreshed only after an accepted image
-fit (default update rate1). All dense choices use that two-template solver for
-their seed, but the extra ECC/IC stage fits only the original. Its acceptance is
-separate from the seed's appearance update. KLT keeps canonical feature coordinates
-and the previous frame/tracked features, rather than original/recent appearance
-templates. Legacy `anchored` keeps both images and performs explicit fusion.
+Recent patches are sampled once from raw RGB at the accepted cumulative warp,
+in the original canonical grid. New residuals compose with that warp; pose does
+not reset when the template changes. The optional mask remains canonical
+foreground transported by each candidate, rather than a prior-dependent crop
+that could incorrectly reject a recovery. Comparing references uses common
+visible foreground. The broader correlation helper mirrors the same bank and
+cannot update appearance from a rejected proposal.
+
+Pose acceptance defaults to foreground NCC≥0.70 with≥60% original support
+visible. Refreshing recent remains stricter: NCC≥0.75 and passing the existing
+rotation/inlier reliability gates. Rejected or hidden frames freeze it. These
+are configurable starting thresholds, not calibrated probabilities; the
+correlation seed score is separate and stays0.75 by default.
+
+KLT retains original feature coordinates and previous-frame flow as its normal
+path. If that fails, validated original/recent IC fitting can recover pose;
+only a rotation-reliable recovery reseeds features, inverse-mapped into the
+original coordinates. Flow never bridges a known hidden source frame.
+
+Plain `similarity` and explicit expensive `anchored` keep their prior policies.
+Turn off **Use recent validated template** or pass `--no-recent-template` for
+the preceding original-only geometric behavior. Changed policies have separate
+cache signatures: use a new output directory or **Force recompute** for existing
+geometric outputs. Disabling recent retains compatibility with old caches.
 
 Patch support is the saved source-pixel circle **intersected with its optional
 foreground mask**. Prediction-time supports are preferred, then the saved human
@@ -115,6 +134,23 @@ KLT controls are `--klt-max-points 200`, `--klt-min-distance 4` source pixels,
 and `--klt-window 21` (odd); they are also in GUI advanced settings. Smaller feature
 spacing can retain more correspondences on a small patch; larger windows cost
 more and can include background. These options never enlarge the saved support.
+
+Original/recent controls (GUI advanced settings and CLI):
+
+| Control | Default / meaning |
+|---|---|
+| `--no-recent-template` | Opt out of the new policy; otherwise enabled for geometric methods. |
+| `--geometric-min-score` |0.70, foreground NCC needed to accept a geometric/template pose. |
+| `--template-update-score` |0.75, stricter NCC needed to refresh recent, plus rotation/inlier gates. |
+| `--template-min-overlap` |0.60, visible fraction of original foreground required for a fit/update. |
+| `--original-score-slack` |0.03, prefer original when its NCC is this close to recent on shared visible pixels. |
+| `--original-check-interval` |10 source frames; periodic original checks and maximum frequency of broader search. Failures also trigger local original checks. |
+
+The previous correlation seed score and these NCC scores measure different
+things. Native KLT's inlier ratio remains a separate geometric diagnostic; it
+is not compared with template NCC. Stricter foreground/geometry checks may
+reduce availability despite retaining a recent template. Verify overlays;
+neither passing a threshold nor interpolating a gap proves pose accuracy.
 
 The CLI also exposes sample budget, center weights and OpenCV threads
 (`video-annotate refine --help`). Fast fitting uses up to 2,500 foreground samples.
@@ -203,11 +239,15 @@ methods preserves earlier results and matching runs can be reused.
 `h00..h22` map reference-frame source pixels to current source pixels.
 `homography_valid` marks native measured warps; gap filling never invents a
 homography. `pose_model`, `candidate_used`, `fallback`, candidate NCC/gain/reason,
-solver cost and sparse match/inlier counts expose the chosen path. Dense scores
-are original-reference NCC; KLT scores are inlier ratios, not comparable
-probabilities. Existing rotation-validity gates remain separate from pose
-availability. Low-score but bounded direct fits remain inspectable, following
-the supplied baseline's acceptance policy; they are not verified GT.
+solver cost and sparse match/inlier counts expose the chosen path. In the new
+policy, `score_kind=foreground_ncc` and `reference_ncc` describe original/recent
+photometric agreement; native KLT inlier ratio/error/coverage are separate
+`geometric_*` columns. Legacy opt-out retains its prior score semantics.
+`reference_kind`, reference age/overlap, original/recent NCC, original-check,
+template-refresh, recovery and reseed flags audit each decision. Scores are
+not probabilities. Existing rotation-validity gates remain separate from pose
+availability. The new policy requires explicit NCC/overlap gates; the preceding
+original-only baseline is available with the opt-out. Neither is verified GT.
 
 Rows retain absolute source frames/IDs and nominal source-video timestamps.
 `pose.raw.csv` preserves every measured fit/rejection; `pose.csv` contains the

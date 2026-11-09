@@ -44,6 +44,11 @@ METHOD_FIELDS = (
     ('klt_max_points', 'KLT maximum features (≥8)', int, 200),
     ('klt_min_distance', 'KLT feature spacing (px; ≥1)', float, 4.),
     ('klt_window', 'KLT window (odd px; ≥3)', int, 21),
+    ('geometric_min_score', 'Geometric minimum NCC', float, .70),
+    ('original_score_slack', 'Geometric original NCC slack', float, .03),
+    ('template_min_overlap', 'Geometric template min. overlap', float, .6),
+    ('template_update_score', 'Geometric template update NCC', float, .75),
+    ('original_check_interval', 'Geometric original check (frames)', int, 10),
 )
 
 
@@ -83,7 +88,7 @@ def parse_options(values):
             raise ValueError(f'{label} must be {"an integer" if kind is int else "a number"}') from error
     config.fast = bool(values.get('fast', True))
     config.validate()
-    method_options = {}
+    method_options = {'use_recent':values.get('use_recent', True)}
     for name, label, kind, default in METHOD_FIELDS:
         try:
             method_options[name] = kind(values.get(name, default))
@@ -133,7 +138,8 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
         self.variables.update(point_ids=tk.StringVar(), radius=tk.StringVar(), max_frames=tk.StringVar(),
                               gap_seconds=tk.StringVar(value='.1'), gap_neighbors=tk.StringVar(value='2'),
                               method=tk.StringVar(value=methods.DEFAULT_METHOD),
-                              fast=tk.BooleanVar(value=True), overlay=tk.BooleanVar(value=True), force=tk.BooleanVar(value=False))
+                              fast=tk.BooleanVar(value=True), overlay=tk.BooleanVar(value=True), force=tk.BooleanVar(value=False),
+                              use_recent=tk.BooleanVar(value=True))
         self.variables.update({name:tk.StringVar(value=str(default)) for name, _, _, default in METHOD_FIELDS})
         labels = getattr(methods, 'METHOD_LABELS', {})
         self.method_choices = {labels.get(name, name):name for name in methods.METHODS}
@@ -175,6 +181,10 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
             self.field(advanced, index//2, (index % 2)*2, label, self.variables[name])
         for index, (name, label, _, _) in enumerate(METHOD_FIELDS):
             self.field(advanced, 5+index//2, (index % 2)*2, label, self.variables[name])
+        widget = ttk.Checkbutton(advanced, text='Use recent validated template (geometric methods only)',
+                                 variable=self.variables['use_recent'])
+        widget.grid(row=5+(len(METHOD_FIELDS)+1)//2, column=0, columnspan=4, sticky='w', pady=4)
+        self.controls.append(widget)
         advanced.columnconfigure(1, weight=1); advanced.columnconfigure(3, weight=1)
         options = ttk.Frame(self); options.pack(fill='x', pady=7)
         self.method_options_row = options

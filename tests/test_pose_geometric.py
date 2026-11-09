@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 
 from video_annotation.pose.geometric import (DenseReference, SparseKLT, geometric_gate,
-    homog, local_pose, similarity_matrix, warp_points)
+    homog, local_pose, remap_h, similarity_matrix, warp_points)
 from video_annotation.pose.registration import Config, PoseEstimator
 
 
@@ -163,6 +163,118 @@ class GeometricPoseTests(unittest.TestCase):
             candidate, stats = sparse.estimate(self.initial)
         self.assertIsNone(candidate)
         self.assertEqual(stats['matches'], 0)
+
+    def test_dense_raw_snapshot_is_independent_and_does_not_accumulate_erosion(self):
+        dense = DenseReference(self.est, self.initial)
+        original_ref, original_keep = dense.ref.copy(), dense.keep.copy()
+        H = np.array([[1.005, .007, 1.8], [-.004, 1.003, -.9], [1e-5, -2e-5, 1.]])
+        current = cv2.warpPerspective(self.initial, H, (144, 144))
+        with patch('video_annotation.pose.geometric.cv2.remap', wraps=cv2.remap) as sampler:
+            recent = dense.snapshot(current, H)
+        self.assertIsNotNone(recent)
+        self.assertEqual(sampler.call_count, 1)
+        expected = remap_h(current.astype(np.float32)/255., H @ dense.P, dense.x, dense.y)
+        np.testing.assert_array_equal(recent.ref, expected)
+        np.testing.assert_array_equal(recent.P, dense.P)
+        self.assertIsNone(recent.ic)
+        for field in ('ref','keep','P','Pinv','x','y','_original_ref','_original_keep'):
+            self.assertFalse(np.shares_memory(getattr(recent,field),getattr(dense,field)), field)
+        np.testing.assert_array_equal(dense.ref, original_ref)
+        np.testing.assert_array_equal(dense.keep, original_keep)
+        self.assertFalse(recent._original_ref.flags.writeable)
+        self.assertFalse(recent._original_keep.flags.writeable)
+        partial = self.mask.copy(); partial[:,74:] = 0
+        narrowed = dense.snapshot(self.initial, np.eye(3), mask=partial, min_overlap=.4)
+        self.assertIsNotNone(narrowed)
+        self.assertLess(int(narrowed.keep.sum()), int(dense.keep.sum()))
+        restored = narrowed.snapshot(self.initial, np.eye(3))
+        np.testing.assert_array_equal(restored.keep, dense.keep)
+        np.testing.assert_array_equal(restored.ref, dense.aligned(self.initial, np.eye(3)))
+
+    def test_dense_common_support_score_and_partial_snapshot_limits(self):
+        dense = DenseReference(self.est, self.initial)
+        partial = self.mask.copy(); partial[:,72:] = 0
+        support = dense.visible_support(self.initial, np.eye(3), mask=partial)
+        score = dense.score(self.initial, np.eye(3), mask=partial, keep=support)
+        self.assertGreater(score['score'], .99)
+        self.assertEqual(score['support_pixels'], int(support.sum()))
+        self.assertAlmostEqual(score['overlap'], support.sum()/dense.keep.sum())
+        self.assertIsNone(dense.snapshot(self.initial, np.eye(3), mask=partial, min_overlap=.6))
+        self.assertIsNotNone(dense.snapshot(self.initial, np.eye(3), mask=partial, min_overlap=.4))
+        empty = np.zeros_like(self.mask)
+        self.assertEqual(dense.score(self.initial, np.eye(3), mask=empty),
+                         dict(score=-1.,support_pixels=0,overlap=0.))
+        invalid = np.zeros((3,3))
+        self.assertFalse(dense.visible_support(self.initial, invalid).any())
+        self.assertEqual(dense.score(self.initial, invalid)['score'], -1.)
+        json.dumps(score, allow_nan=False)
+
+    def test_sparse_reseed_after_loss_known_transform_is_atomic(self):
+        sparse = SparseKLT(self.initial, self.mask)
+        sparse.reference = np.empty((0,2),np.float32)
+        sparse.tracked = np.empty((0,2),np.float32)
+        H = np.array([[1., .003, 4.], [-.002, 1., -2.], [1e-5, 0., 1.]])
+        current = cv2.warpPerspective(self.initial, H, (144,144))
+        foreground = cv2.warpPerspective(self.mask, H, (144,144), flags=cv2.INTER_NEAREST)
+        foreground[:,85:] = 0
+        old = (sparse.prev.copy(),sparse.reference.copy(),sparse.tracked.copy(),sparse.H.copy())
+        self.assertFalse(sparse.reseed(np.zeros_like(current), H, mask=foreground))
+        for actual,expected in zip((sparse.prev,sparse.reference,sparse.tracked,sparse.H),old):
+            np.testing.assert_array_equal(actual,expected)
+        self.assertTrue(sparse.reseed(current,H,mask=foreground))
+        np.testing.assert_allclose(warp_points(H,sparse.reference),sparse.tracked,atol=1e-5)
+        indices = np.rint(sparse.reference).astype(int)
+        self.assertTrue((self.mask[indices[:,1],indices[:,0]]!=0).all())
+        indices = np.rint(sparse.tracked).astype(int)
+        self.assertTrue((foreground[indices[:,1],indices[:,0]]!=0).all())
+        delta = np.array([[1.,0.,.8],[0.,1.,.5],[0.,0.,1.]])
+        following = cv2.warpPerspective(self.initial,delta @ H,(144,144))
+        candidate,stats = sparse.estimate(following)
+        self.assertIsNotNone(candidate,stats)
+        np.testing.assert_allclose(warp_points(candidate,[[72.,72.]]),
+                                   warp_points(delta @ H,[[72.,72.]]),atol=.3)
+
+    def test_dense_normalizes_only_mapped_roi_with_identical_global_sampling(self):
+        rng = np.random.default_rng(31)
+        image = rng.integers(0,256,(1440,2560),np.uint8)
+        dense = DenseReference(self.est,self.initial)
+        old_source = image.astype(np.float32)/255.
+        transforms = (
+            np.array([[1.,0.,2100.12347],[0.,1.,900.23453],[0.,0.,1.]]),
+            np.array([[1.,0.,-65.39062],[0.,1.,-68.04687],[0.,0.,1.]]),
+            np.array([[1.02,.07,2200.12347],[-.03,.99,1100.23453],[2e-5,-3e-5,1.]]),
+            np.array([[1.,0.,2480.49219],[0.,1.,1360.79687],[0.,0.,1.]]),
+            np.array([[1.,0.,-500.],[0.,1.,-500.],[0.,0.,1.]]),
+        )
+        remap = cv2.remap
+        for H in transforms:
+            with self.subTest(H=H.tolist()):
+                expected = remap_h(old_source,H @ dense.P,dense.x,dense.y)
+                with patch('video_annotation.pose.geometric.cv2.remap',wraps=remap) as sampler:
+                    actual = dense.aligned(image,H)
+                np.testing.assert_array_equal(actual,expected)
+                if sampler.call_count:
+                    normalized = sampler.call_args.args[0]
+                    self.assertEqual(normalized.dtype,np.float32)
+                    self.assertLess(max(normalized.shape),150)
+                    self.assertLess(normalized.size,image.size/100)
+                else:
+                    self.assertFalse(actual.any())
+    def test_sparse_reseed_clipped_source_border_and_mask_failure(self):
+        sparse = SparseKLT(self.initial,self.mask)
+        H = np.array([[1.,0.,-62.],[0.,1.,-52.],[0.,0.,1.]])
+        current = cv2.warpPerspective(self.initial,H,(144,144))
+        foreground = cv2.warpPerspective(self.mask,H,(144,144),flags=cv2.INTER_NEAREST)
+        self.assertTrue(sparse.reseed(current,H,mask=foreground))
+        self.assertTrue((sparse.tracked>=1).all())
+        self.assertTrue((sparse.tracked<142).all())
+        indices = np.rint(sparse.reference).astype(int)
+        self.assertTrue((self.mask[indices[:,1],indices[:,0]]!=0).all())
+        old = (sparse.prev.copy(),sparse.reference.copy(),sparse.tracked.copy(),sparse.H.copy())
+        self.assertFalse(sparse.reseed(current,H,mask=np.zeros_like(foreground)))
+        self.assertFalse(sparse.reseed(current,np.zeros((3,3))))
+        for actual,expected in zip((sparse.prev,sparse.reference,sparse.tracked,sparse.H),old):
+            np.testing.assert_array_equal(actual,expected)
 
 
 if __name__ == '__main__':

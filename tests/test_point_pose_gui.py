@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from video_annotation.pose.registration import Config
+from video_annotation.pose.methods import method_options
 from video_annotation.rgb_tracking.pose_gui import PoseRefinementTab, parse_options, timing_text, FIELDS
 
 
@@ -39,8 +40,15 @@ class PointPoseGuiTests(unittest.TestCase):
         self.assertEqual((config.recovery_scale_min, config.recovery_scale_max), (.25, 4.))
         self.assertEqual((result['gap_seconds'], result['gap_neighbors']), (.1, 2))
         self.assertEqual(result['method'], 'similarity_ic_homography')
-        self.assertEqual(result['method_options'], {'ecc_iters':45, 'ic_iters':20, 'ic_stride':2, 'min_gain':.0025,
-                                                  'klt_max_points':200, 'klt_min_distance':4., 'klt_window':21})
+        self.assertEqual(result['method_options'], method_options())
+        self.assertIs(result['method_options']['use_recent'], True)
+        self.assertEqual(tuple(result['method_options'][key] for key in ('geometric_min_score','original_score_slack',
+            'template_min_overlap','template_update_score','original_check_interval')), (.70, .03, .6, .75, 10))
+        recent = parse_options(dict(values(), use_recent=False, geometric_min_score='.65', original_score_slack='.04',
+            template_min_overlap='.7', template_update_score='.8', original_check_interval='5'))['method_options']
+        self.assertIs(recent['use_recent'], False)
+        self.assertEqual(tuple(recent[key] for key in ('geometric_min_score','original_score_slack',
+            'template_min_overlap','template_update_score','original_check_interval')), (.65, .04, .7, .8, 5))
         self.assertEqual(parse_options({})['method'], 'similarity_ic_homography')
         custom_klt = parse_options(dict(values(), klt_max_points='80', klt_min_distance='2.5', klt_window='15'))['method_options']
         self.assertEqual(tuple(custom_klt[key] for key in ('klt_max_points','klt_min_distance','klt_window')), (80, 2.5, 15))
@@ -50,7 +58,8 @@ class PointPoseGuiTests(unittest.TestCase):
                        {'gap_seconds':'nan'}, {'gap_seconds':'-.1'}, {'gap_neighbors':'-1'},
                        {'gap_neighbors':'1.5'}, {'method':'missing'},
                        {'ecc_iters':'0'}, {'ic_iters':'bad'}, {'ic_stride':'1.5'}, {'min_gain':'nan'},
-                       {'klt_max_points':'7'}, {'klt_min_distance':'.5'}, {'klt_window':'2'}, {'klt_window':'4'}):
+                       {'klt_max_points':'7'}, {'klt_min_distance':'.5'}, {'klt_window':'2'}, {'klt_window':'4'},
+                       {'use_recent':'false'}, {'original_check_interval':'1.5'}):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 parse_options(dict(values(), **change))
         with self.assertRaises(ValueError):
@@ -108,8 +117,7 @@ class PointPoseGuiTests(unittest.TestCase):
                 self.assertEqual((kwargs['gap_seconds'], kwargs['gap_neighbors']), (.1, 2))
                 self.assertEqual(kwargs['config'].anchor_preference, .8)
                 self.assertEqual(kwargs['method'], 'similarity_ic_homography')
-                self.assertEqual(kwargs['method_options'], {'ecc_iters':45, 'ic_iters':20, 'ic_stride':2, 'min_gain':.0025,
-                                                          'klt_max_points':200, 'klt_min_distance':4., 'klt_window':21})
+                self.assertEqual(kwargs['method_options'], method_options())
                 kwargs['progress']('Frame 2/3')
                 return response
             module.refine_point_tracks = Mock(side_effect=refine)
@@ -143,7 +151,9 @@ class PointPoseGuiTests(unittest.TestCase):
             '--recovery-scale-min', '.5', '--recovery-scale-max', '3', '--recovery-angle-step', '10',
             '--recovery-scale-step', '1.1', '--gap-seconds', '.2', '--gap-neighbors', '1', '--patch-size', '64',
             '--ecc-iters', '27', '--ic-iters', '11', '--ic-stride', '3', '--min-gain', '.01',
-            '--klt-max-points', '80', '--klt-min-distance', '2.5', '--klt-window', '15'])
+            '--klt-max-points', '80', '--klt-min-distance', '2.5', '--klt-window', '15',
+            '--no-recent-template', '--geometric-min-score', '.65', '--original-score-slack', '.04',
+            '--template-min-overlap', '.7', '--template-update-score', '.8', '--original-check-interval', '5'])
         module = ModuleType('video_annotation.pose.workflow')
         module.refine_point_tracks = Mock(return_value={'output':'mock only'})
         with patch.dict('sys.modules', {'video_annotation.pose.workflow':module}), redirect_stdout(io.StringIO()):
@@ -157,8 +167,9 @@ class PointPoseGuiTests(unittest.TestCase):
         self.assertEqual((config.patch_size, config.fast), (64, True))
         self.assertEqual((options['gap_seconds'], options['gap_neighbors']), (.2, 1))
         self.assertEqual(options['method'], 'anchored')
-        self.assertEqual(options['method_options'], {'ecc_iters':27, 'ic_iters':11, 'ic_stride':3, 'min_gain':.01,
-                                                   'klt_max_points':80, 'klt_min_distance':2.5, 'klt_window':15})
+        self.assertEqual(options['method_options'], dict(method_options(), ecc_iters=27, ic_iters=11, ic_stride=3, min_gain=.01,
+            klt_max_points=80, klt_min_distance=2.5, klt_window=15, use_recent=False, geometric_min_score=.65,
+            original_score_slack=.04, template_min_overlap=.7, template_update_score=.8, original_check_interval=5))
 
     def test_method_switch_hides_anchor_fields_and_retains_their_values(self):
         tab = PoseRefinementTab.__new__(PoseRefinementTab)
