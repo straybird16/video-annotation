@@ -273,6 +273,11 @@ class AnchoredPoseEstimator(PoseEstimator):
                                      peak_margin='',innovation=innovation)
         if rotation_ambiguous and not acceptedr:
             validity = dict(rotation_valid=0,rotation_reason='ambiguous_original_rotation')
+        H,temporal=self._temporal_candidate(fused['center'],angle,scale,frame,query)
+        if temporal is not None and not temporal['motion_accepted']:
+            row=self.invalid_result(box,frame,temporal['motion_reason'])
+            row.update(temporal)
+            return row
         unwrapped = self.angle+wrap(angle-self.angle,c.rotation_period)
         self.velocity = (unwrapped-self.angle)/elapsed
         self.scale_velocity = np.log(scale/self.scale)/elapsed
@@ -287,8 +292,10 @@ class AnchoredPoseEstimator(PoseEstimator):
             if not rotation_ambiguous: self.anchor_angle = original['angle']
             if not scale_ambiguous: self.anchor_scale = original['scale']
             if not (rotation_ambiguous or scale_ambiguous): self.anchor_frame = frame
+        if temporal is not None:
+            self.motion.commit(H,frame,query)
         updated = 0
-        if c.update_rate:
+        if c.update_rate and validity['rotation_valid']:
             # One sampling from raw RGB at the fused pose. No recursive warp.
             visible = fused['visible'] & self.fixed_visible
             self.recent[visible] = ((1-c.update_rate)*self.recent[visible]+c.update_rate*fused['aligned'][visible])
@@ -315,4 +322,6 @@ class AnchoredPoseEstimator(PoseEstimator):
             polar_score='',peak_margin='',correction_dx=float(query_fit[0]-query[0]),correction_dy=float(query_fit[1]-query[1]),
             rotation_reference_peak_margin=self.reference_peak_margin,rotation_innovation_degrees=innovation,
             rotation_quality_reference='fixed' if reference is self.fixed else 'recent',**metrics,**quality,**validity)
+        if temporal is not None:
+            row.update(temporal)
         return self._boxes(row,box)

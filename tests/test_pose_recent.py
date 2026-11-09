@@ -156,7 +156,9 @@ class RecentPoseTests(unittest.TestCase):
         self.assertEqual(row['reference_kind'],'klt')
 
     def test_broad_search_recovers_bad_pose_and_mirrors_only_accepted_recent_bank(self):
-        estimator = self.estimator('similarity_ic_homography', original_check_interval=1)
+        # Isolate the legacy broad-search route; the temporal predictor otherwise
+        # correctly ignores the deliberately poisoned, never-accepted H below.
+        estimator = self.estimator('similarity_ic_homography', original_check_interval=1,motion_gate=False)
         image, box, truth = self.frame(1)
         self.assert_source_pose(estimator, estimator.estimate(image, box, 1), truth)
         original_ref, original_keep = estimator.original.ref.copy(), estimator.original.keep.copy()

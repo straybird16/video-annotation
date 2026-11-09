@@ -61,6 +61,11 @@ def parser():
                            help="local geometric model for klt-affine/klt-template (default: adaptive)")
             s.add_argument("--keyframe-interval", type=nonnegative,
                            help="klt-template validated keyframe period; 0 disables (default)")
+            s.add_argument('--motion-gate', action=argparse.BooleanOptionalAction, default=None,
+                           help='enable/disable shared temporal motion acceptance for KLT')
+            s.add_argument('--motion-sigma', type=float, help='temporal innovation limit in uncertainty standard deviations')
+            s.add_argument('--motion-noise-px', type=float, help='motion uncertainty floor in source pixels')
+            s.add_argument('--motion-memory-seconds', type=float, help='accepted motion memory in source-video seconds')
         s.add_argument("--repo", type=Path, default=DEFAULT_REPO if tap_only else None,
                        help="TAPNext++ checkout")
         s.add_argument("--checkpoint", type=Path, help="TAPNext++ checkpoint")
@@ -136,7 +141,7 @@ def parser():
     refine = sub.add_parser("refine", help="refine saved point patches with selectable correlation/geometric methods")
     refine.add_argument("--tracks", type=Path, required=True, help="original or corrected point CSV")
     refine.add_argument("--pose-method", choices=METHODS, default=DEFAULT_METHOD,
-                        help="pose algorithm; default fast similarity with guarded IC-LK homography")
+                        help="pose algorithm; default shared patch-hybrid tracker")
     refine.add_argument("--output-dir", type=Path, help="data-local pose folder; default beside the input tracks")
     refine.add_argument("--point-ids", type=int, nargs="+", help="stable point IDs; defaults to all")
     refine.add_argument("--patch-radius", type=float, help="override saved patch radii; pixels")
@@ -168,8 +173,15 @@ def parser():
     refine.add_argument("--search-radius", type=float, default=64., help="center search hard cap in source pixels")
     refine.add_argument("--search-trigger", type=float, default=.75, help="center search trigger NCC")
     refine.add_argument("--search-top-k", type=positive, default=3, help="center search candidate count")
+    refine.add_argument('--search-shapes', type=positive, default=81,
+                        help='joint shape-bank budget per reference/seed (1–729; 81 default, 729 full projective bank)')
     refine.add_argument("--center-trust", type=float, default=.5, help="center search prediction trust in [0,1]")
     refine.add_argument("--search-interval", type=positive, default=5, help="center search interval in source frames")
+    refine.add_argument('--motion-gate', action=argparse.BooleanOptionalAction, default=True,
+                        help='reject temporally inconsistent pose candidates (default enabled)')
+    refine.add_argument('--motion-sigma', type=float, default=4., help='motion acceptance limit in uncertainty standard deviations')
+    refine.add_argument('--motion-noise-px', type=float, default=1., help='motion uncertainty floor in source pixels')
+    refine.add_argument('--motion-memory-seconds', type=float, default=.1, help='accepted motion memory in source-video seconds')
     refine.add_argument("--min-score", type=float, default=.75)
     refine.add_argument("--full-search", action="store_true", help="disable the cheaper guarded local path")
     refine.add_argument("--reference-interval", type=positive, default=10)
@@ -233,6 +245,8 @@ def tracking_configuration(args):
     overrides = {"win_size": args.lk_window, "fb_threshold": args.fb_threshold,
                  "patch_radius": args.patch_radius, "reanchor_interval": args.reanchor_interval,
                  "motion_model": args.motion_model, "keyframe_interval": args.keyframe_interval}
+    overrides.update({name:getattr(args,name,None) for name in
+                     ('motion_gate','motion_sigma','motion_noise_px','motion_memory_seconds')})
     options.update({key: value for key, value in overrides.items() if value is not None})
     tap_flags = ("repo", "checkpoint", "resolution", "device", "precision", "compile")
     explicit = ["--" + key.replace("_", "-") for key in tap_flags if getattr(args, key) is not None]
@@ -434,7 +448,8 @@ def refine_command(args):
             ('ecc_iters','ic_iters','ic_stride','min_gain','klt_max_points','klt_min_distance','klt_window',
              'use_recent','geometric_min_score','original_score_slack','template_min_overlap',
              'template_update_score','original_check_interval','center_search','search_radius',
-             'search_trigger','search_top_k','center_trust','search_interval')},
+             'search_trigger','search_top_k','search_shapes','center_trust','search_interval',
+             'motion_gate','motion_sigma','motion_noise_px','motion_memory_seconds')},
         progress=lambda value: print(value, flush=True))
     print(json.dumps(result, indent=2))
 

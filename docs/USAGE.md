@@ -138,8 +138,8 @@ or browse a point CSV, then **Run refinement**. This estimates center, clockwise
 rotation and image-based scale using the saved circle/foreground as support.
 The method selector offers fast correlation, guarded ECC/IC-LK homography,
 ECC affine/homography, IC-LK homography, independent KLT/RANSAC, and the optional
-legacy original-biased fusion. The default is **Fast correlation + guarded
-IC-LK homography**. Source radii/masks follow saved annotations; the resampling
+legacy original-biased fusion. The default is **Shared patch tracker** (`patch_hybrid`): the same
+batched KLT/correlation engine as point tracking, with shared temporal acceptance. Source radii/masks follow saved annotations; the resampling
 grid does not change their physical size. **Render overlay** reuses that method's
 saved poses and shared circle/arrow renderer. The tab shows measured costs and
 opens the pose/overlay folders. Labels stay readable at the final preview size,

@@ -9,10 +9,10 @@ import numpy as np
 
 from .registration import PoseEstimator as SimilarityEstimator
 
-METHODS = ('similarity','similarity_homography','similarity_ic_homography','ecc_affine',
+METHODS = ('patch_hybrid','similarity','similarity_homography','similarity_ic_homography','ecc_affine',
            'ecc_homography','inverse_compositional','klt_ransac','anchored')
-DEFAULT_METHOD = 'similarity_ic_homography'
-METHOD_LABELS = dict(similarity='Fast correlation (similarity)',
+DEFAULT_METHOD = 'patch_hybrid'
+METHOD_LABELS = dict(patch_hybrid='Shared patch tracker (KLT + guarded correlation)',similarity='Fast correlation (similarity)',
     similarity_homography='Fast correlation + guarded ECC homography',
     similarity_ic_homography='Fast correlation + guarded IC-LK homography',
     ecc_affine='ECC affine (correlation seeded)', ecc_homography='ECC homography (correlation seeded)',
@@ -24,23 +24,27 @@ METHOD_FIELDS = ('pose_method','pose_model','homography_valid',*H_FIELDS,'candid
     'reference_kind','reference_age_frames','reference_ncc','reference_overlap','original_ncc','recent_ncc',
     'original_checked','recent_template_updated','recent_template_age_frames','template_update_reason',
     'recovery_used','reseeded','geometric_inlier_ratio','geometric_fit_error','geometric_coverage','score_kind',
-    'center_search_used','center_search_radius','center_search_ncc','center_search_dx','center_search_dy','center_search_ms')
+    'center_search_used','center_search_radius','center_search_ncc','center_search_dx','center_search_dy','center_search_ms',
+    'pose_valid','scale_valid','motion_accepted','motion_reason','motion_penalty','scale_innovation','shape_innovation',
+    'fit_margin','tracking_status','recovery_attempts','failure_reason')
 
 RECENT_DEFAULTS = dict(use_recent=True,geometric_min_score=.70,original_score_slack=.03,
     template_min_overlap=.6,template_update_score=.75,original_check_interval=10)
 SEARCH_DEFAULTS = dict(center_search=False,search_radius=64.,search_trigger=.75,search_top_k=3,
-    center_trust=.5,search_interval=5)
-GEOMETRIC_METHODS = tuple(m for m in METHODS if m not in ('similarity','anchored'))
+    center_trust=.5,search_interval=5,search_shapes=81)
+MOTION_DEFAULTS = dict(motion_gate=True,motion_sigma=4.,motion_noise_px=1.,motion_memory_seconds=.1)
+GEOMETRIC_METHODS = tuple(m for m in METHODS if m not in ('patch_hybrid','similarity','anchored'))
 
 
 def method_options(value=None):
     result = dict(ecc_iters=45,ic_iters=20,ic_stride=2,min_gain=.0025,
-                  klt_max_points=200,klt_min_distance=4.,klt_window=21,**RECENT_DEFAULTS,**SEARCH_DEFAULTS)
+                  klt_max_points=200,klt_min_distance=4.,klt_window=21,**RECENT_DEFAULTS,**SEARCH_DEFAULTS,**MOTION_DEFAULTS)
     value = dict(value or {})
-    if set(value)-set(result):raise ValueError('Unknown geometric method options: '+', '.join(sorted(set(value)-set(result))))
+    if set(value)-set(result):raise ValueError('Unknown pose method options: '+', '.join(sorted(set(value)-set(result))))
     result.update(value)
-    for key in ('ecc_iters','ic_iters','ic_stride','klt_max_points','klt_window','original_check_interval','search_top_k','search_interval'):
+    for key in ('ecc_iters','ic_iters','ic_stride','klt_max_points','klt_window','original_check_interval','search_top_k','search_interval','search_shapes'):
         if type(result[key]) is not int or result[key]<1:raise ValueError(key+' must be a positive integer')
+    if result['search_shapes']>729:raise ValueError('search_shapes must be at most 729')
     if result['klt_max_points']<8 or result['klt_window']<3 or result['klt_window']%2!=1:
         raise ValueError('KLT needs at least eight features and an odd window >=3')
     distance=result['klt_min_distance']
@@ -50,7 +54,7 @@ def method_options(value=None):
     if isinstance(result['min_gain'],bool) or not isinstance(result['min_gain'],(int,float)) or not np.isfinite(result['min_gain']) or not 0<=result['min_gain']<2:
         raise ValueError('min_gain must be finite and in [0,2)')
     result['min_gain']=float(result['min_gain'])
-    for key in ('use_recent','center_search'):
+    for key in ('use_recent','center_search','motion_gate'):
         if type(result[key]) is not bool:raise ValueError(key+' must be boolean')
     v=result['search_radius']
     if isinstance(v,bool) or not isinstance(v,(int,float)) or not np.isfinite(v) or not 0<v<=1024:
@@ -62,6 +66,11 @@ def method_options(value=None):
             raise ValueError(key+' must be finite and in [0,1]')
         result[key]=float(v)
     if result['search_trigger']<=0:raise ValueError('search_trigger must be positive')
+    for key in ('motion_sigma','motion_noise_px','motion_memory_seconds'):
+        v=result[key]
+        if isinstance(v,bool) or not isinstance(v,(int,float)) or not np.isfinite(v) or v<=0:
+            raise ValueError(key+' must be finite and positive')
+        result[key]=float(v)
     if result['template_min_overlap']<=0 or result['geometric_min_score']<=0:
         raise ValueError('Geometric score and foreground overlap must be positive')
     if result['template_update_score']<result['geometric_min_score']:
@@ -80,28 +89,38 @@ def attach_matrix(row, matrix, method, model='homography'):
     return row
 
 
-def create_estimator(gray, box, config, *, mask=None, method=DEFAULT_METHOD, options=None, base_factory=None):
+def create_estimator(gray, box, config, *, mask=None, method=DEFAULT_METHOD, options=None, base_factory=None, source_fps=30.,reacquire_seconds=.5):
     if method not in METHODS:raise ValueError('Unknown pose method: '+str(method))
     options=method_options(options)
+    if not np.isfinite(source_fps) or source_fps<=0:raise ValueError('source_fps must be positive')
+    if method=='patch_hybrid':
+        from .hybrid import HybridPoseEstimator
+        return HybridPoseEstimator(gray,box,config,mask=mask,options=options,source_fps=source_fps,reacquire_seconds=reacquire_seconds)
     if not options['use_recent']:
         from dataclasses import replace
         config=replace(config,update_rate=0.)
     if method=='anchored':
         from .anchored import AnchoredPoseEstimator
-        return AnchoredPoseEstimator(gray,box,config,mask=mask)
-    if method=='similarity':return (base_factory or SimilarityEstimator)(gray,box,config,mask=mask)
+        estimator=AnchoredPoseEstimator(gray,box,config,mask=mask)
+        if hasattr(estimator,'set_motion_context'):estimator.set_motion_context(source_fps,options)
+        return estimator
+    if method=='similarity':
+        estimator=(base_factory or SimilarityEstimator)(gray,box,config,mask=mask)
+        if hasattr(estimator,'set_motion_context'):estimator.set_motion_context(source_fps,options)
+        return estimator
     if options['use_recent']:
         from .recent import RecentGeometricEstimator
         return RecentGeometricEstimator(gray,box,config,mask=mask,method=method,options=options,
-                                        base_factory=base_factory or SimilarityEstimator)
+                                        base_factory=base_factory or SimilarityEstimator,source_fps=source_fps)
     return GeometricEstimator(gray,box,config,mask=mask,method=method,options=options,
-                              base_factory=base_factory or SimilarityEstimator)
+                              base_factory=base_factory or SimilarityEstimator,source_fps=source_fps)
 
 
 class GeometricEstimator:
-    def __init__(self, gray, box, config, *, mask, method, options, base_factory):
+    def __init__(self, gray, box, config, *, mask, method, options, base_factory, source_fps=30.):
         from .geometric import DenseReference, SparseKLT
         self.method,self.options,self.config=method,options,config
+        self.source_fps,self.motion=source_fps,None
         self.sparse=self.base=self.dense=None
         self.initial_box=np.asarray(box,float).copy()
         self.center=self.initial_box[:2]+self.initial_box[2:]/2
@@ -118,6 +137,7 @@ class GeometricEstimator:
             except cv2.error as error:raise ValueError('KLT initialization: '+str(error)) from error
         else:
             self.base=base_factory(gray,box,config,mask=mask)
+            if hasattr(self.base,'set_motion_context'):self.base.set_motion_context(source_fps,options)
             self.center=self.base.center.copy();self.reference_center=self.center.copy()
             self.initial_box=self.base.initial_box.copy()
             try:self.dense=DenseReference(self.base,gray,ic_stride=options['ic_stride'])
@@ -133,6 +153,31 @@ class GeometricEstimator:
             self._boxes(row,self.initial_box)
         row.update(candidate_used=0,fallback=0,candidate_reason='reference')
         return attach_matrix(row,np.eye(3),self.method,'similarity')
+
+    def _motion_policy(self):
+        if self.motion is None:
+            from ..common.patch_motion import PatchMotion
+            self.motion=PatchMotion(self.reference_query,float(min(self.initial_box[2:])/2),
+                fps=self.source_fps,enabled=self.options['motion_gate'],sigma=self.options['motion_sigma'],
+                noise_px=self.options['motion_noise_px'],memory_seconds=self.options['motion_memory_seconds'],
+                center_trust=self.options['center_trust'])
+        return self.motion
+
+    def _motion_check(self,H,box,frame):
+        supplied=np.asarray(box[:2])+np.asarray(box[2:])/2
+        return self._motion_policy().check(H,frame,supplied=supplied)
+
+    def _finish(self,row,H,box,frame,model):
+        audit=self._motion_check(H,box,frame)
+        row.update(audit)
+        if not audit['motion_accepted']:
+            self.last_input_frame=frame
+            return {**row,'valid':0,'reason':audit['motion_reason'],'pose_valid':0,'rotation_valid':0,
+                    'scale_valid':0,'homography_valid':0,'template_updated':0,'pose_method':self.method,
+                    'rotation_reason':audit['motion_reason']}
+        self._motion_policy().commit(H,frame,supplied=np.asarray(box[:2])+np.asarray(box[2:])/2)
+        row.update(pose_valid=1,scale_valid=1)
+        return attach_matrix(row,H,self.method,model)
 
     def invalid_result(self, box, frame, reason):
         if self.base is not None:row=self.base.invalid_result(box,frame,reason)
@@ -179,7 +224,7 @@ class GeometricEstimator:
                 row.update(candidate_used=0,fallback=1,candidate_reason=stats.get('reason','low_fixed_score'),
                     candidate_gain=stats.get('score_gain',''),candidate_score=score,
                     geometric_ms=1000*stats.get('runtime',0.))
-                return attach_matrix(row,seed,self.method,'similarity')
+                return self._finish(row,seed,box,frame,'similarity')
         if H is None:
             row.update(rotation_valid=0,rotation_reason='klt_failed',pose_method=self.method,homography_valid=0)
             return row
@@ -189,13 +234,13 @@ class GeometricEstimator:
         except (ValueError,np.linalg.LinAlgError):
             if self.guarded:
                 row.update(candidate_used=0,fallback=1,candidate_reason='invalid_local_jacobian')
-                return attach_matrix(row,seed,self.method,'similarity')
+                return self._finish(row,seed,box,frame,'similarity')
             return {**row,'valid':0,'reason':'invalid_local_jacobian','rotation_valid':0,'homography_valid':0,'pose_method':self.method}
         if (not np.isfinite(np.r_[center,angle,scale]).all() or scale<=0 or
                 np.linalg.norm(query_center-(np.asarray(box[:2])+np.asarray(box[2:])/2))>self.config.center_limit*max(box[2:])/2+2):
             if self.guarded:
                 row.update(candidate_used=0,fallback=1,candidate_reason='invalid_projective_pose')
-                return attach_matrix(row,seed,self.method,'similarity')
+                return self._finish(row,seed,box,frame,'similarity')
             return {**row,'valid':0,'reason':'invalid_projective_pose','rotation_valid':0,'homography_valid':0,'pose_method':self.method}
         angle=float(angle+360*round((float(row.get('rotation_unwrapped_degrees') or self.angle)-angle)/360))
         row.update(valid=1,reason='ok',x=float(center[0]),y=float(center[1]),scale=float(scale),
@@ -213,6 +258,9 @@ class GeometricEstimator:
                       stats.get('fit_error',float('inf'))/max(self.initial_box[2:])<=self.config.rotation_max_fit_error)
             row.update(score=float(ratio),registration_score=float(ratio),rotation_valid=int(reliable),
                        rotation_reason='ransac_local_jacobian' if reliable else 'weak_ransac_geometry')
+        audit=self._motion_check(H,box,frame)
+        if not audit['motion_accepted']:
+            return self._finish(row,H,box,frame,'homography')
         self.angle=angle;self.last_input_frame=frame
         self._boxes(row,box,H)
-        return attach_matrix(row,H,self.method,'affine' if self.method=='ecc_affine' else 'homography')
+        return self._finish(row,H,box,frame,'affine' if self.method=='ecc_affine' else 'homography')

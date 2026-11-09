@@ -60,7 +60,7 @@ class AlternativeWorkflowTests(unittest.TestCase):
                         config={'patch_size':64,'angles':128,'radii':32,'min_score':.3},
                         method_options={'ecc_iters':12,'ic_iters':10})['reused'])
             self.assertEqual(len(set(outputs)),len(METHODS))
-            self.assertEqual(DEFAULT_METHOD,'similarity_ic_homography')
+            self.assertEqual(DEFAULT_METHOD,'patch_hybrid')
 
 
     def test_geometric_gate_uses_query_center_not_off_center_mask_bbox(self):
@@ -75,7 +75,7 @@ class AlternativeWorkflowTests(unittest.TestCase):
         with patch('video_annotation.pose.geometric.DenseReference') as dense:
             dense.return_value.estimate.return_value=(np.eye(3),dict(score_after=.9,score_gain=.1,runtime=0.,used=1))
             est=create_estimator(np.zeros((100,100),np.uint8),[18.,18.,64.,64.],Config(),
-                                 method=DEFAULT_METHOD,base_factory=Seed,options={'use_recent':False})
+                                 method='similarity_ic_homography',base_factory=Seed,options={'use_recent':False})
             row=est.estimate(np.zeros((100,100),np.uint8),[18.,18.,64.,64.],1)
         self.assertEqual(row['valid'],1)
         self.assertEqual(row['candidate_used'],1)

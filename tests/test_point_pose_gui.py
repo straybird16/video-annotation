@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from video_annotation.pose.registration import Config
-from video_annotation.pose.methods import method_options
+from video_annotation.pose.methods import DEFAULT_METHOD, method_options
 from video_annotation.rgb_tracking.pose_gui import PoseRefinementTab, parse_options, timing_text, FIELDS
 
 
@@ -39,7 +39,7 @@ class PointPoseGuiTests(unittest.TestCase):
         self.assertEqual((config.anchor_preference, config.anchor_score_delta), (.8, .05))
         self.assertEqual((config.recovery_scale_min, config.recovery_scale_max), (.25, 4.))
         self.assertEqual((result['gap_seconds'], result['gap_neighbors']), (.1, 2))
-        self.assertEqual(result['method'], 'similarity_ic_homography')
+        self.assertEqual(result['method'], DEFAULT_METHOD)
         self.assertEqual(result['method_options'], method_options())
         self.assertIs(result['method_options']['use_recent'], True)
         self.assertIs(result['method_options']['center_search'], False)
@@ -57,7 +57,7 @@ class PointPoseGuiTests(unittest.TestCase):
         self.assertIs(recent['use_recent'], False)
         self.assertEqual(tuple(recent[key] for key in ('geometric_min_score','original_score_slack',
             'template_min_overlap','template_update_score','original_check_interval')), (.65, .04, .7, .8, 5))
-        self.assertEqual(parse_options({})['method'], 'similarity_ic_homography')
+        self.assertEqual(parse_options({})['method'], DEFAULT_METHOD)
         custom_klt = parse_options(dict(values(), klt_max_points='80', klt_min_distance='2.5', klt_window='15'))['method_options']
         self.assertEqual(tuple(custom_klt[key] for key in ('klt_max_points','klt_min_distance','klt_window')), (80, 2.5, 15))
         self.assertEqual(parse_options(dict(values(), gap_neighbors='1'))['gap_neighbors'], 1)
@@ -125,7 +125,7 @@ class PointPoseGuiTests(unittest.TestCase):
                 self.assertTrue(kwargs['overlay'])
                 self.assertEqual((kwargs['gap_seconds'], kwargs['gap_neighbors']), (.1, 2))
                 self.assertEqual(kwargs['config'].anchor_preference, .8)
-                self.assertEqual(kwargs['method'], 'similarity_ic_homography')
+                self.assertEqual(kwargs['method'], DEFAULT_METHOD)
                 self.assertEqual(kwargs['method_options'], method_options())
                 kwargs['progress']('Frame 2/3')
                 return response
@@ -154,7 +154,7 @@ class PointPoseGuiTests(unittest.TestCase):
 
     def test_cli_forwards_anchor_recovery_and_gap_options_with_legacy_settings(self):
         from video_annotation.rgb_tracking.__main__ import parser, refine_command
-        self.assertEqual(parser().parse_args(['refine', '--tracks', 'points.csv']).pose_method, 'similarity_ic_homography')
+        self.assertEqual(parser().parse_args(['refine', '--tracks', 'points.csv']).pose_method, DEFAULT_METHOD)
         self.assertFalse(parser().parse_args(['refine','--tracks','points.csv']).center_search)
         self.assertTrue(parser().parse_args(['refine','--tracks','points.csv','--center-search']).center_search)
         args = parser().parse_args(['refine', '--tracks', 'points.csv', '--pose-method', 'anchored', '--anchor-preference', '.7',
@@ -201,6 +201,54 @@ class PointPoseGuiTests(unittest.TestCase):
         tab.anchor_form.pack_forget.assert_called_once()
         self.assertEqual(tab.variables['anchor_preference'].get(), '.9')
         tab.method_selector.configure.assert_called_with(state='readonly')
+
+    def test_patch_hybrid_motion_controls_presets_and_cli_forwarding(self):
+        from video_annotation.rgb_tracking.pose_gui import pose_settings_snapshot, normalize_pose_settings
+        from video_annotation.rgb_tracking.__main__ import parser, refine_command, tracking_configuration
+        from video_annotation.rgb_tracking.overlay_settings import normalize_overlay_settings
+        from video_annotation.rgb_tracking.labeler import settings_fields
+        from video_annotation.rgb_tracking.session import parameter_help
+        from video_annotation.pose.methods import METHODS
+        self.assertIn('patch_hybrid',METHODS)
+        setting=dict(values(),method='patch_hybrid',motion_gate=False,motion_sigma='3.5',
+                     motion_noise_px='1.25',motion_memory_seconds='.2',search_shapes='729')
+        options=parse_options(setting)['method_options']
+        self.assertIs(options['motion_gate'],False)
+        self.assertEqual(options['search_shapes'],729)
+        self.assertEqual(tuple(options[key] for key in ('motion_sigma','motion_noise_px','motion_memory_seconds')),
+                         (3.5,1.25,.2))
+        document=pose_settings_snapshot(setting,normalize_overlay_settings(
+            dict(kind='rgb_overlay_settings',schema_version=1)))
+        self.assertEqual(normalize_pose_settings(document),document)
+        self.assertIs(document['refinement']['motion_gate'],False)
+        for key,value in (('motion_gate','false'),('motion_sigma',True),('motion_sigma','0'),
+                          ('motion_noise_px','nan'),('motion_memory_seconds','0'),
+                          ('search_shapes','0'),('search_shapes','730')):
+            with self.subTest(key=key,value=value),self.assertRaises(ValueError):
+                parse_options(dict(setting,**{key:value}))
+        args=parser().parse_args(['refine','--tracks','points.csv','--pose-method','patch_hybrid',
+            '--no-motion-gate','--motion-sigma','3.5','--motion-noise-px','1.25','--motion-memory-seconds','.2',
+            '--search-shapes','729'])
+        module=ModuleType('video_annotation.pose.workflow')
+        module.refine_point_tracks=Mock(return_value={'output':'mock only'})
+        with patch.dict('sys.modules',{'video_annotation.pose.workflow':module}),redirect_stdout(io.StringIO()):
+            refine_command(args)
+        forwarded=module.refine_point_tracks.call_args.kwargs
+        self.assertEqual(forwarded['method'],'patch_hybrid')
+        for key in ('motion_gate','motion_sigma','motion_noise_px','motion_memory_seconds','search_shapes'):
+            self.assertEqual(forwarded['method_options'][key],options[key])
+        args=parser().parse_args(['process','--source-dir','data/videos','--tracker','klt-template',
+            '--no-motion-gate','--motion-sigma','3.5','--motion-noise-px','1.25','--motion-memory-seconds','.2'])
+        tracker,_=tracking_configuration(args)
+        self.assertIs(tracker['motion_gate'],False)
+        self.assertEqual(tracker['motion_sigma'],3.5)
+        fields=settings_fields(SimpleNamespace(backend='klt-template',backend_options={}))
+        self.assertIs(fields['motion_gate']['type'],bool)
+        self.assertIs(fields['use_recent_template']['type'],bool)
+        for key in ('motion_gate','motion_sigma','motion_noise_px','motion_memory_seconds','center_trust',
+                    'use_recent_template','correlation_top_k','correlation_max_shapes','template_update_score'):
+            self.assertIn(key,fields)
+            self.assertGreater(len(parameter_help(key)),30)
 
 
 if __name__ == '__main__':

@@ -2,6 +2,13 @@
 
 Newest entries first. See PROVENANCE.md for the original workspace history.
 
+- 2026-11-09 — Unified point tracking and refinement with a shared patch engine,
+  batched gray/LK streams, cached foreground matching and accepted-only source-time
+  motion checks. Added symmetry-jump rejection, gradual external-track drift priors,
+  bounded joint shape/center recovery and optional projective banks. CPU backend
+  crossover measured; native KLT crops preserve source pyramid alignment. Codex
+  coordinator with matched matcher/pose/controls workers. [Methods and controls](docs/POSE_REFINEMENT.md).
+
 - 2026-11-09 — Added correlation-guarded KLT with batched flow, moving support,
   bounded source-time recovery and original-scale recovery independent of drift.
   Track CSVs include initial pose, component flags and full source-coordinate H.

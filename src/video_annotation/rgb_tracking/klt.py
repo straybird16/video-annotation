@@ -90,6 +90,15 @@ class KLTConfig:
     correlation_angle_step: float = 6.
     correlation_max_candidates: int = 24
     correlation_refine_iterations: int = 8
+    correlation_top_k: int = 3
+    correlation_max_shapes: int = 81
+    template_update_score: float = .75
+    use_recent_template: bool = True
+    center_trust: float = .5
+    motion_gate: bool = True
+    motion_sigma: float = 4.
+    motion_noise_px: float = 1.
+    motion_memory_seconds: float = .1
 
     def __post_init__(self):
         if self.template_mode not in ("correlation", "legacy_ecc"):
@@ -99,7 +108,7 @@ class KLTConfig:
         integers = ("win_size", "max_level", "patch_radius", "max_features", "min_inliers",
                     "feature_refresh_interval", "reanchor_interval", "registration_iterations", "threads",
                     "min_model_features", "min_projective_features", "keyframe_interval", "max_keyframes",
-                    "correlation_max_candidates", "correlation_refine_iterations")
+                    "correlation_max_candidates", "correlation_refine_iterations", "correlation_top_k", "correlation_max_shapes")
         for name in integers:
             value = getattr(self, name)
             minimum = 0 if name in ("max_level", "keyframe_interval") else 1
@@ -109,8 +118,11 @@ class KLTConfig:
             raise ValueError("win_size must be odd and at least 5")
         if self.patch_radius < 4 or self.max_features < self.min_inliers or self.min_inliers < 3:
             raise ValueError("need patch_radius >= 4, max_features >= min_inliers >= 3")
+        for name in ("use_recent_template", "motion_gate"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be boolean")
         for item in fields(self):
-            if item.name in ("motion_model", "adaptive_max_model", "template_mode"):
+            if item.name in ("motion_model", "adaptive_max_model", "template_mode", "use_recent_template", "motion_gate"):
                 continue
             value = getattr(self, item.name)
             if isinstance(value, bool) or not isinstance(value, Real) or not np.isfinite(value):
@@ -149,6 +161,10 @@ class KLTConfig:
                 or not 1 <= self.correlation_max_candidates <= 64
                 or not 1 <= self.correlation_refine_iterations <= 30):
             raise ValueError("invalid bounded correlation search settings")
+        if (not 0 <= self.center_trust <= 1 or not 0 < self.template_update_score <= 1
+                or min(self.motion_sigma, self.motion_noise_px, self.motion_memory_seconds) <= 0
+                or not 1 <= self.correlation_top_k <= 8 or not 1 <= self.correlation_max_shapes <= 729):
+            raise ValueError("invalid shared motion/reference/recovery settings")
         if self.registration_iterations > 100:
             raise ValueError("registration_iterations must be <= 100")
 
@@ -228,6 +244,7 @@ class KLTTracker:
         self.precision = "float32"
         cv2.setNumThreads(self.config.threads)
         self._grids = {}
+        self._direct_references = {}
         self._patch_grid = self._grid(self.config.patch_radius)
         self._pending_regions = None
         self.reset()
@@ -253,6 +270,9 @@ class KLTTracker:
         self.last_diagnostics = []
         self._hybrid = None
         self.first_failures = {}
+        self._flow_frame = -1
+        self._center_hints = self._warp_hints = self._active_mask = None
+        self._direct_references = {}
         self.patch_configs, self.support_masks, self.explicit_masks = [], [], []
         self.patch_regions_used = None
 
@@ -300,7 +320,7 @@ class KLTTracker:
         return np.sum(self._grid(radius)**2, axis=-1) <= radius**2
 
     def provenance(self):
-        return {"algorithm": self.name, "engine_revision": 2, "template_mode": self.config.template_mode, "implementation": "OpenCV pyramidal LK for circles; inverse-compositional foreground alignment for explicit masks",
+        return {"algorithm": self.name, "engine_revision": 3, "template_mode": self.config.template_mode, "implementation": "OpenCV pyramidal LK for circles; inverse-compositional foreground alignment for explicit masks",
                 "opencv": cv2.__version__, "config": asdict(self.config),
                 "patch_regions": self.patch_regions_used,
                 "support_policy": "per-query source-pixel circle intersected with optional reference foreground mask; transported by accepted warp",
@@ -308,8 +328,8 @@ class KLTTracker:
                 "border_policy": "immutable real reference pixels; reference/current visibility intersection for appearance; in-frame center and min_visible_fraction; plain edge uses supported-corner translation and LK windows shrink with visible circle area",
                 "reference_policy": ("immutable original plus latest accepted raw RGB on fixed reference support; rejected fits never refresh; optional original-validated bank" if self.algorithm == "klt-template" and self.config.template_mode == "correlation" else "immutable original plus optional bounded original-validated native-pixel keyframes; no unchecked template promotion"),
                 "validity_policy": "positive local tracking gates do not certify an original anchor or a drift bound; inspect registration_status separately",
-                "registration_policy": "rejected anchors retain locally valid LK; never update the original reference",
-                "registration_convergence": ("masked NCC guard; bounded coarse/fine pose/center search with at most one final IC-LK fit per searched reference" if self.algorithm == "klt-template" and self.config.template_mode == "correlation" else "local ECC needs an already close prior; innovation limits are rejection gates, not a guaranteed capture range"),
+                "registration_policy": "original/recent proposals share source-time acceptance; center-only ambiguity never updates pose or templates; immutable original",
+                "registration_convergence": ("masked NCC and temporal guard; progressive joint shape/center banks, automatic CPU map/remap scoring and bounded top-K IC-LK fits" if self.algorithm == "klt-template" and self.config.template_mode == "correlation" else "local ECC needs an already close prior; innovation limits are rejection gates, not a guaranteed capture range"),
                 "registration_budget": ("bounded coarse/fine candidate bank only on weak evidence or original drift checks; one final direct fit per searched reference" if self.algorithm == "klt-template" and self.config.template_mode == "correlation" else "original first; adaptive can try one higher original model, then at most one validated-keyframe fallback (at most three ECC hypotheses per due query)"),
                 "warp_convention": "full native original-to-current homography; pose from polar decomposition of its Jacobian at the original query",
                 "loss_policy": ("correlation recovery within source-time grace; finite last-known coordinates while invalid" if self.algorithm == "klt-template" and self.config.template_mode == "correlation" else "permanent until explicit reset; finite last-known coordinates with nonpositive quality"),
@@ -388,99 +408,22 @@ class KLTTracker:
         mask. Current pixels are sampled through every candidate warp, so its
         support moves with the patch instead of clipping it at its old position.
         """
-        r = config.patch_radius
-        interior = cv2.erode(support.astype(np.uint8), np.ones((3, 3), np.uint8),
-                             borderType=cv2.BORDER_CONSTANT, borderValue=0) != 0
-        count = int(interior.sum())
-        info = dict(alignment_method="masked_direct", support_pixel_count=count,
-                    photometric_rms=None, photometric_inlier_ratio=None,
-                    reason="masked_insufficient_support")
-        if count < 24:
-            return None, info
-        offsets = self._grid(r)[interior].astype(np.float64)
-        xy = offsets + center
-        values = template[interior].astype(np.float64)
-        contrast = float(values.std())
-        if contrast < config.min_patch_std:
-            return None, {**info, "reason": "masked_low_texture"}
-        target = (values-values.mean())/contrast
-        gy, gx = np.gradient(template.astype(np.float64))
-        gx, gy = gx[interior]/contrast, gy[interior]/contrast
-        dx, dy = offsets.T
-        if model == "translation":
-            jacobian = np.column_stack([gx*r, gy*r])
-        elif model == "similarity":
-            jacobian = np.column_stack([gx*r, gy*r, -gx*dy+gy*dx, gx*dx+gy*dy])
-        else:
-            jacobian = np.column_stack([gx*dx, gx*dy, gx*r, gy*dx, gy*dy, gy*r])
-            if model == "homography":
-                radial = gx*dx+gy*dy
-                jacobian = np.column_stack([jacobian, -radial*dx/r, -radial*dy/r])
-        eigen = np.linalg.eigvalsh(jacobian.T @ jacobian)
-        if eigen[0] <= max(1e-6, eigen[-1]*1e-6):
-            return None, {**info, "reason": "masked_unobservable_warp"}
-        matrix = np.asarray(prior, np.float64).copy()
-        domain = np.array([[r, 0., center[0]], [0., r, center[1]], [0., 0., 1.]])
-        inverse_domain = np.linalg.inv(domain)
-        h, w = gray.shape
-        for _ in range(config.registration_iterations):
-            mapped = project_points(matrix, xy)
-            visible = ((mapped[:, 0] >= 0) & (mapped[:, 0] <= w-1) &
-                       (mapped[:, 1] >= 0) & (mapped[:, 1] <= h-1))
-            if visible.mean() < config.min_visible_fraction or visible.sum() < 24:
-                return None, {**info, "reason": "masked_insufficient_visible_support"}
-            sampled = cv2.remap(gray, mapped[:, 0].astype(np.float32).reshape(-1, 1),
-                mapped[:, 1].astype(np.float32).reshape(-1, 1), cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_CONSTANT).ravel().astype(np.float64)/255.
-            current = sampled[visible]
-            if current.std() < config.min_patch_std:
-                return None, {**info, "reason": "masked_low_texture"}
-            residual = (current-current.mean())/current.std()-target[visible]
-            j = jacobian[visible]
-            # A bounded Huber influence protects the fit from small real
-            # occlusions without treating excluded pixels as observations.
-            weights = np.minimum(1., .75/np.maximum(np.abs(residual), 1e-8))
-            normal = j.T @ (weights[:, None]*j)
-            try:
-                step = np.linalg.solve(normal, j.T @ (weights*residual))
-            except np.linalg.LinAlgError:
-                return None, {**info, "reason": "masked_unobservable_warp"}
-            if not np.isfinite(step).all():
-                return None, {**info, "reason": "masked_nonfinite_update"}
-            delta = np.eye(3)
-            if model == "translation":
-                delta[:2, 2] = step
-            elif model == "similarity":
-                tx, ty, angle, scale = step
-                delta[:2] = [[1+scale, -angle, tx], [angle, 1+scale, ty]]
-            else:
-                delta[:2] += step[:6].reshape(2, 3)
-                if model == "homography":
-                    delta[2, :2] = step[6:]
-            try:
-                updated = normalize_warp(matrix @ domain @ np.linalg.inv(delta) @ inverse_domain, center)
-            except (ValueError, np.linalg.LinAlgError):
-                return None, {**info, "reason": "masked_invalid_warp"}
-            jump = np.max(np.linalg.norm(project_points(updated, xy)-mapped, axis=1))
-            if not np.isfinite(jump) or jump > config.max_displacement:
-                return None, {**info, "reason": "masked_excessive_update"}
-            matrix = updated
-            if jump < max(.015, config.registration_epsilon):
-                break
-        mapped = project_points(matrix, xy)
-        visible = ((mapped[:, 0] >= 0) & (mapped[:, 0] <= w-1) &
-                   (mapped[:, 1] >= 0) & (mapped[:, 1] <= h-1))
-        sampled = cv2.remap(gray, mapped[:, 0].astype(np.float32).reshape(-1, 1),
-            mapped[:, 1].astype(np.float32).reshape(-1, 1), cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT).ravel().astype(np.float64)/255.
-        current = sampled[visible]
-        if len(current) < 24 or current.std() < config.min_patch_std:
-            return None, {**info, "reason": "masked_low_texture"}
-        residual = (current-current.mean())/current.std()-target[visible]
-        return matrix, {**info, "reason": "passed_masked_direct",
-                        "support_pixel_count": int(visible.sum()),
-                        "photometric_rms": float(np.sqrt(np.mean(residual**2))),
-                        "photometric_inlier_ratio": float((np.abs(residual) <= .75).mean())}
+        from ..common.patch_matching import PatchReference
+        # Cache immutable reference preparation; keep bounded references per query.
+        key = (id(template), id(support), config.patch_radius, tuple(center))
+        entry = self._direct_references.get(key)
+        reference = None if entry is None else entry[2]
+        if reference is None:
+            reference = PatchReference(template, support, center, config.patch_radius)
+            if len(self._direct_references) >= max(8, 4*self.query_count):
+                self._direct_references.clear()
+            # Retain source arrays so id-based cache keys cannot alias a newly
+            # allocated different template after the caller releases its input.
+            self._direct_references[key] = (template,support,reference)
+        return reference.fit(gray, prior, model=model,
+            iterations=config.registration_iterations,
+            min_overlap=config.min_visible_fraction, min_std=config.min_patch_std,
+            max_displacement=config.max_displacement, epsilon=config.registration_epsilon)
 
     def _original_overlap(self, gray, identity, transform):
         xy = project_points(transform, self._grid(self.patch_configs[identity].patch_radius) + self.initial_points[identity])
@@ -1035,6 +978,44 @@ class KLTTracker:
                             (1 + (row["fb_error"] or 0.) / c.fb_threshold))
         return scores, rows
 
+    def initialize_gray(self, gray, points_xy):
+        """Initialize from a prepared uint8 source image, shared with pose fitting."""
+        if self.previous is not None:
+            raise ValueError('Reset before initializing a new patch stream')
+        if gray.ndim != 2 or gray.dtype != np.uint8:
+            raise ValueError('Expected uint8 grayscale source frame')
+        self.source_size = gray.shape[::-1]
+        rows = self._initialize(gray, points_xy, 0)
+        if self.algorithm == 'klt-template' and self.config.template_mode == 'correlation':
+            from .klt_patch import initialize
+            initialize(self, gray, rows)
+        scores = np.where(self.alive, 1., -1.).astype(np.float32)
+        self.previous, self._flow_frame, self.frames_seen = gray, 0, 1
+        self.last_diagnostics = rows
+        return scores, rows
+
+    def advance_gray(self, gray, *, frame, center_hints=None, warp_hints=None, active_mask=None):
+        """Propose/validate once using optional external trajectory/H priors.
+
+        Hint coordinates are native source pixels. Missing source frames cannot
+        be treated as consecutive optical flow; recovery still uses real images.
+        """
+        if self.previous is None or frame < self.frames_seen:
+            raise ValueError('Initialize first and supply increasing source frame IDs')
+        if gray.ndim != 2 or gray.dtype != np.uint8 or gray.shape[::-1] != self.source_size:
+            raise ValueError('Expected unchanged uint8 source image dimensions')
+        self.frames_seen = int(frame)
+        self._center_hints = None if center_hints is None else np.asarray(center_hints, float).reshape(self.query_count, 2)
+        self._warp_hints = None if warp_hints is None else np.asarray(warp_hints, float).reshape(self.query_count, 3, 3)
+        self._active_mask = None if active_mask is None else np.asarray(active_mask,bool).reshape(self.query_count)
+        try:
+            scores, rows = self._advance(gray, 0)
+        finally:
+            self._center_hints = self._warp_hints = self._active_mask = None
+        self.previous, self._flow_frame, self.frames_seen = gray, int(frame), int(frame)+1
+        self.last_diagnostics = rows
+        return scores, rows
+
     def infer(self, frames_bgr, points_xy=None):
         if not frames_bgr:
             raise ValueError("empty frame chunk")
@@ -1055,15 +1036,11 @@ class KLTTracker:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             prepared = time.perf_counter()
             if self.previous is None:
-                rows = self._initialize(gray, points_xy, offset)
-                if self.algorithm == "klt-template" and self.config.template_mode == "correlation":
-                    from .klt_patch import initialize
-                    initialize(self, gray, rows)
-                scores = np.where(self.alive, 1., -1.).astype(np.float32)
+                scores, rows = self.initialize_gray(gray, points_xy)
             else:
-                scores, rows = self._advance(gray, offset)
-            self.previous = gray
-            self.frames_seen += 1
+                scores, rows = self.advance_gray(gray, frame=self.frames_seen)
+            for row in rows:
+                row['frame_offset'] = offset
             positions.append(self.points.copy())
             quality.append(scores)
             diagnostics.extend(rows)

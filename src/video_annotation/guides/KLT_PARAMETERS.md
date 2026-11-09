@@ -15,6 +15,17 @@ These are estimates: a passing score does not certify correct correspondence.
 Image correlation does not require a minimum number of corners to validate a
 recovery, but needs textured and sufficiently unambiguous support.
 
+The shared patch-hybrid path applies temporal motion acceptance before committing
+a pose, recent appearance or motion history. Motion controls use source-video
+time; they are separate from loss/reacquisition and final gap interpolation.
+The pose method selector also exposes `patch_hybrid`, using the shared patch
+tracker instead of a second independent refinement engine.
+Joint map recovery starts with 9 similarity shapes, then expands to the default
+81 affine shapes; 729 permits the optional full projective bank. This budget is
+per reference/seed. Only bounded top-K peaks receive fine fitting. In pose
+settings use **Joint shape bank budget** or CLI `--search-shapes 729`; KLT settings
+store the same budget as `correlation_max_shapes`.
+
 The shared `reacquire_seconds` runtime setting defaults to 0.5 source-video
 seconds (CLI `--reacquire-seconds`); zero ends a track immediately. It limits native
 recoveries such as TAPNext++ provides; correlation-mode template KLT also tries
@@ -62,6 +73,15 @@ that an iterative optimizer or a finite candidate grid finds the true motion.
 | Parameter | Default | Meaning |
 |---|---|---|
 | `motion_model` | `adaptive` | Start simple and upgrade with evidence; fixed similarity, affine or homography are also selectable. |
+| `motion_gate` | `true` | Reject temporally inconsistent motion before committing pose or template updates. |
+| `motion_sigma` | `4` | Motion innovation limit in uncertainty standard deviations. |
+| `motion_noise_px` | `1` | Source-pixel uncertainty floor for motion acceptance. |
+| `motion_memory_seconds` | `0.1` | Recent accepted motion memory in source-video seconds. |
+| `center_trust` | `0.5` | Soft center prior when ranking candidates; does not blend accepted coordinates afterward. |
+| `use_recent_template` | `true` | Use accepted recent appearance alongside the immutable original. |
+| `template_update_score` | `0.75` | Minimum foreground score before a valid accepted fit may refresh recent appearance from raw RGB. |
+| `correlation_top_k` | `3` | Distinct correlation peaks retained for final candidate validation. |
+| `correlation_max_shapes` | `81` | Shape-bank budget; up to 729 permits the full optional projective bank. Separate from legacy `correlation_max_candidates`. |
 | `adaptive_max_model` | `homography` | Most flexible model adaptive fitting may use. Affine is more conservative than homography. |
 | `win_size` | `21` | Odd sparse-LK window width in source pixels (at least 5); unused by direct masked alignment. |
 | `max_level` | `3` | Maximum optical-flow pyramid level; sparse LK windows can use image context outside support. |
@@ -109,7 +129,7 @@ that an iterative optimizer or a finite candidate grid finds the true motion.
 | `correlation_search_step` | `3.0` | Coarse center-grid spacing in source pixels. |
 | `correlation_pose_step` | `0.06` | Coarse log-scale/shear/perspective neighborhood step within the motion model and geometry bounds. |
 | `correlation_angle_step` | `6.0` | Coarse rotation step in degrees. |
-| `correlation_max_candidates` | `24` | Maximum coarse shape hypotheses per recovery; center-grid scoring is performed for each. |
+| `correlation_max_candidates` | `24` | Maximum ranked joint candidates considered for distinct-basin fine fitting; every selected shape/center is still coarse-scored. |
 | `correlation_refine_iterations` | `8` | Maximum fine alignment iterations for at most the best candidate. |
 | `reanchor_interval` | `10` | Frames between original-reference checks; in `legacy_ecc` this runs periodic iterative registration. Lower costs more compute. |
 | `registration_min_ncc` | `0.85` | Minimum reference-to-current normalized correlation to accept a template registration. |

@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 from .geometric import DenseReference, homog, warp_points
+from ..common.patch_motion import PatchMotion
 
 
 def adaptive_radius(score, trigger, maximum):
@@ -16,39 +17,7 @@ def adaptive_radius(score, trigger, maximum):
     return float(maximum*np.clip(2*(trigger/max(float(score), .05)-1), 0, 1))
 
 
-def masked_ncc(image, template, support, valid=None, min_overlap=.6):
-    """All translation NCCs without including masked background in statistics."""
-    image=np.asarray(image,np.float32);template=np.asarray(template,np.float32)
-    weight=np.asarray(support,np.float32)
-    area=float(weight.sum())
-    if area<16 or min(np.subtract(image.shape,template.shape))<0:return None
-    if valid is None:
-        centered=(template-float((template*weight).sum())/area)*weight
-        energy=float((centered*centered).sum())
-        if energy<1e-8:return None
-        numerator=cv2.matchTemplate(image,centered,cv2.TM_CCORR)
-        total=cv2.matchTemplate(image,weight,cv2.TM_CCORR)
-        total2=cv2.matchTemplate(image*image,weight,cv2.TM_CCORR)
-        variance=np.maximum(total2-total*total/area,0)
-        denominator=np.sqrt(variance*energy)
-        enough=True
-    else:
-        # Window-dependent common foreground: outside-source pixels are
-        # unobserved, never black data. The extra maps are needed only at edges.
-        valid=np.asarray(valid,np.float32);image=image*valid
-        count=cv2.matchTemplate(valid,weight,cv2.TM_CCORR)
-        n=np.maximum(count,1.)
-        ts=cv2.matchTemplate(valid,template*weight,cv2.TM_CCORR)
-        ts2=cv2.matchTemplate(valid,template*template*weight,cv2.TM_CCORR)
-        total=cv2.matchTemplate(image,weight,cv2.TM_CCORR)
-        total2=cv2.matchTemplate(image*image,weight,cv2.TM_CCORR)
-        cross=cv2.matchTemplate(image,template*weight,cv2.TM_CCORR)
-        numerator=cross-ts*total/n
-        denominator=np.sqrt(np.maximum(ts2-ts*ts/n,0)*np.maximum(total2-total*total/n,0))
-        enough=count>=max(16.,min_overlap*area)
-    result=np.full_like(numerator,-1.)
-    np.divide(numerator,denominator,out=result,where=(denominator>1e-6)&enough)
-    return np.clip(result,-1,1)
+from ..common.patch_matching import masked_ncc
 
 
 class CenterSearch:
@@ -75,6 +44,13 @@ class CenterSearch:
         self.recent=self.original
         self.H=np.eye(3);self.last_center=self.query.copy();self.velocity=np.zeros(2)
         self.last_frame=0;self.last_search=-options['search_interval']
+        fps=getattr(estimator,'source_fps',30.)
+        if getattr(estimator,'motion_context',None) is not None:
+            fps=estimator.motion_context[0]
+        radius=max(4.,float(getattr(self.original,'radius',min(estimator.initial_box[2:])/2)))
+        self.motion=PatchMotion(query,radius,fps=fps,enabled=options.get('motion_gate',True),
+            sigma=options.get('motion_sigma',4.),noise_px=options.get('motion_noise_px',1.),
+            memory_seconds=options.get('motion_memory_seconds',.1),center_trust=options['center_trust'])
 
     def references(self, estimator):
         original=getattr(estimator,'original',None) or self.original
@@ -146,24 +122,27 @@ class CenterSearch:
     def propose(self, estimator, gray, box, frame):
         started=time.perf_counter();box=np.asarray(box,float).copy()
         supplied=box[:2]+box[2:]/2;references=self.references(estimator)
+        self._supplied_center=supplied.copy()
         maximum=self.options['search_radius'];trust=self.options['center_trust']
+        predicted=warp_points(self.motion.predict(frame,supplied),[self.query])[0]
         def ranked(center,score):
-            return score-.1*trust*(np.linalg.norm(center-supplied)/maximum)**2
+            return score-.1*trust*(np.linalg.norm(center-predicted)/maximum)**2
         best=supplied.copy();score=self.measure(references,gray,best);rank=ranked(best,score)
         # A corrected constant-velocity prediction is cheap and survives sudden
         # supplied-track errors without searching every offset in a 2D grid.
         dt=frame-self.last_frame
-        predicted=self.last_center+self.velocity*min(dt,3)
-        if 2<np.linalg.norm(predicted-supplied)<=maximum:
+        if np.linalg.norm(predicted-supplied)>1e-6:
             q=self.measure(references,gray,predicted);r=ranked(predicted,q)
             if r>rank+.015:best,score,rank=predicted,q,r
         radius=adaptive_radius(score,self.options['search_trigger'],maximum)
+        if frame-self.last_frame>1:
+            radius=max(radius,min(maximum,self.motion.noise_px*(frame-self.last_frame)))
         searched=False
         if radius>=2 and frame-self.last_search>=self.options['search_interval']:
             self.last_search=frame;searched=True
             # No repeated geometric solver calls or recursive patch updates.
             for ref in references:
-                for center in self._peaks(ref,gray,supplied,radius):
+                for center in self._peaks(ref,gray,predicted,radius):
                     q=self.measure(references,gray,center);r=ranked(center,q)
                     if r>rank+.015:best,score,rank=center,q,r
         correction=best-supplied
@@ -177,6 +156,10 @@ class CenterSearch:
         if not accepted:return
         center=warp_points(H,[self.query])[0]
         self.velocity=(center-self.last_center)/max(1,frame-self.last_frame)
+        # Learn the correction to supplied motion, not the whole object's velocity.
+        supplied=getattr(self,'_supplied_center',center)
+        if frame>self.motion.frame:
+            self.motion.commit(H,frame,supplied)
         self.H=H.copy();self.last_center=center;self.last_frame=frame
         # Native recent policy owns its accepted bank. Legacy methods get one
         # independent raw-frame snapshot, never a warped-template update.

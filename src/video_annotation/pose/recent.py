@@ -17,14 +17,15 @@ from .quality import sparse_quality, rotation_validity
 
 
 class RecentGeometricEstimator(GeometricEstimator):
-    def __init__(self, gray, box, config, *, mask, method, options, base_factory):
-        super().__init__(gray,box,config,mask=mask,method=method,options=options,base_factory=base_factory)
+    def __init__(self, gray, box, config, *, mask, method, options, base_factory, source_fps=30.):
+        super().__init__(gray,box,config,mask=mask,method=method,options=options,base_factory=base_factory,source_fps=source_fps)
         self.is_klt=method=='klt_ransac'
         self.seed_model=self.base
         self.initial_mask=None if mask is None else (np.asarray(mask)!=0).astype(np.uint8)
         if self.is_klt:
             try:
                 self.seed_model=base_factory(gray,box,config,mask=mask)
+                if hasattr(self.seed_model,'set_motion_context'):self.seed_model.set_motion_context(source_fps,options)
                 self.dense=DenseReference(self.seed_model,gray,ic_stride=options['ic_stride'])
             except ValueError:
                 # Sparse tracking can initialize near a source edge even when
@@ -81,6 +82,9 @@ class RecentGeometricEstimator(GeometricEstimator):
         except (ValueError,np.linalg.LinAlgError):return False
 
     def _seed(self,box):
+        if self.options['motion_gate']:
+            return self._motion_policy().predict(self.last_input_frame,
+                supplied=np.asarray(box[:2])+np.asarray(box[2:])/2)
         seed=self.H.copy()
         query=warp_points(seed,[self.reference_query])[0]
         translation=np.eye(3);translation[:2,2]=np.asarray(box[:2])+np.asarray(box[2:])/2-query
@@ -88,10 +92,14 @@ class RecentGeometricEstimator(GeometricEstimator):
 
     def _measure(self,reference,gray,H,box,*,keep=None):
         if reference is None or not self._valid_geometry(H,box):return None
+        motion=self._motion_check(H,box,self.last_input_frame)
+        if not motion['motion_accepted']:
+            self.last_motion_rejection=motion
+            return None
         scored=reference.score(gray,H,keep=keep)
         if (scored['score']<self.options['geometric_min_score'] or
                 scored['overlap']<self.options['template_min_overlap']):return None
-        return dict(H=H,reference=reference,**scored)
+        return dict(H=H,reference=reference,motion=motion,**scored)
 
     def _fit(self,reference,gray,seed,box,kind,frame):
         if reference is None:return None
@@ -180,6 +188,7 @@ class RecentGeometricEstimator(GeometricEstimator):
             row.update(reference_kind='klt' if self.is_klt else 'unavailable',template_update_reason='no_dense_reference')
             return row
         started=time.perf_counter();self.last_input_frame=frame
+        self.last_motion_rejection=None
         seed=self._seed(box)
         candidate=self._sparse_candidate(gray,box,frame) if self.is_klt else None
         if candidate is None:candidate=self._fit(self.recent,gray,seed,box,'recent',frame)
@@ -203,10 +212,12 @@ class RecentGeometricEstimator(GeometricEstimator):
             template_update_reason='no_accepted_fit',recovery_used=0,reseeded=0)
         if selected is None:
             self.loss_active=True
-            return dict(valid=0,reason='no_reliable_template_fit',rotation_valid=0,
+            rejection=self.last_motion_rejection or {}
+            return dict(valid=0,reason=rejection.get('motion_reason','no_reliable_template_fit'),pose_valid=0,scale_valid=0,rotation_valid=0,
                 rotation_reason='no_reliable_template_fit',template_updated=0,fit_mode='none',
-                pose_method=self.method,homography_valid=0,geometric_ms=1000*(time.perf_counter()-started),**audit)
+                pose_method=self.method,homography_valid=0,geometric_ms=1000*(time.perf_counter()-started),**audit,**rejection)
         H,reference=selected['H'],selected['reference']
+        motion=selected['motion']
         center,angle,scale=local_pose(H,self.reference_center)
         _,query_angle,query_scale=local_pose(H,self.reference_query)
         angle=float(angle+360*round((self.angle-angle)/360))
@@ -253,6 +264,7 @@ class RecentGeometricEstimator(GeometricEstimator):
                 audit.update(recent_template_updated=1,recent_template_age_frames=0,template_update_reason='accepted_raw_rgb')
         stats=selected['stats']
         row=dict(valid=1,reason='ok',x=float(center[0]),y=float(center[1]),scale=float(scale),
+            pose_valid=1,scale_valid=1,
             similarity_scale=float(scale),registration_scale=float(scale),scale_target=float(scale),
             rotation_degrees=float((angle+180)%360-180),rotation_unwrapped_degrees=angle,
             score=float(selected['score']),registration_score=float(selected['score']),
@@ -267,6 +279,8 @@ class RecentGeometricEstimator(GeometricEstimator):
             rotation_quality_reference=selected['kind'],
             source=selected['kind'],fit_mode='template_recovery' if recovery else 'recent_geometric',
             **quality,**rotation,**audit)
+        row.update(motion)
+        self._motion_policy().commit(H,frame,supplied=np.asarray(box[:2])+np.asarray(box[2:])/2)
         self.H=H.copy();self.accepted_frame=frame;self.angle=angle;self.query_angle=query_angle
         self.loss_active=False
         self._boxes(row,box,H)

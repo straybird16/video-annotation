@@ -5,6 +5,8 @@ photometric alignment. Search changes target sampling, never the reference mask.
 """
 
 from dataclasses import dataclass, replace
+from functools import lru_cache
+from ..common.patch_motion import PatchMotion
 import cv2
 import numpy as np
 from .klt_warps import (
@@ -21,6 +23,7 @@ class Reference:
     pixels: np.ndarray
     mask: np.ndarray
     frame: int
+    prepared: object = None
 
 
 @dataclass
@@ -31,10 +34,15 @@ class State:
     last_frame: int = 0
     missing_since: object = None
     attempts: int = 0
+    motion: object = None
+    original: object = None
+    center_only: bool = False
+    anchor_scale: float = 1.0
 
 
 def initialize(tracker, gray, rows):
     tracker._hybrid = []
+    tracker._sampled_patches = [{} for _ in rows]
     tracker._score_grids = [dict() for _ in rows]
     for i, row in enumerate(rows):
         c = tracker.patch_configs[i]
@@ -65,6 +73,18 @@ def initialize(tracker, gray, rows):
                 np.eye(3),
             )
         )
+        state = tracker._hybrid[-1]
+        state.original = Reference(tracker.templates[i], tracker.support_masks[i], 0)
+        state.motion = PatchMotion(
+            tracker.initial_points[i],
+            c.patch_radius,
+            fps=tracker.stream_fps,
+            enabled=c.motion_gate,
+            sigma=c.motion_sigma,
+            noise_px=c.motion_noise_px,
+            memory_seconds=c.motion_memory_seconds,
+            center_trust=c.center_trust,
+        )
         row.update(
             pose_valid=bool(row["valid"]),
             rotation_valid=bool(
@@ -87,78 +107,55 @@ def initialize(tracker, gray, rows):
             row.update(rotation_degrees=0.0, scale=1.0, motion_model="similarity")
 
 
-def _score(tracker, gray, i, matrices, reference, *, coarse=False, common=False):
-    """Batch actual masked samples for many candidate H; no padded-edge evidence."""
-    c = tracker.patch_configs[i]
-    mask = reference.mask
-    key = (coarse, mask.tobytes())
-    cache = tracker._score_grids[i]
+def _prepared(tracker, i, reference):
+    from ..common.patch_matching import PatchReference
+
+    if reference.prepared is None:
+        reference.prepared = PatchReference(
+            reference.pixels,
+            reference.mask,
+            tracker.initial_points[i],
+            tracker.patch_configs[i].patch_radius,
+            frame=reference.frame,
+        )
+    return reference.prepared
+
+
+def _sampled_patch(tracker, gray, i, matrix):
+    cache = tracker._sampled_patches[i]
+    matrix = np.asarray(matrix, float)
+    denominator = matrix[2] @ np.r_[tracker.initial_points[i], 1.0]
+    key = (
+        np.round(matrix / denominator, 12).tobytes()
+        if abs(denominator) > 1e-9
+        else matrix.tobytes()
+    )
     if key not in cache:
-        yy, xx = np.nonzero(mask)
-        if coarse and len(xx) > 256:
-            take = np.linspace(0, len(xx) - 1, 256).astype(int)
-            yy, xx = yy[take], xx[take]
-        xy = np.column_stack([xx - c.patch_radius, yy - c.patch_radius]).astype(
-            np.float64
-        )
-        xy += tracker.initial_points[i]
-        if len(cache) > 4:
+        if len(cache) >= 8:
             cache.clear()
-        cache[key] = yy, xx, np.column_stack([xy, np.ones(len(xy))])
-    yy, xx, xy_h = cache[key]
-    if len(xx) < 12:
-        return np.full(len(matrices), -1.0), np.zeros(len(matrices))
-    h = np.asarray(matrices, np.float64).reshape(-1, 3, 3)
-    mapped = np.matmul(xy_h, h.transpose(0, 2, 1))
-    den = mapped[..., 2]
-    valid_den = np.abs(den) > 1e-9
-    xy = np.divide(
-        mapped[..., :2],
-        den[..., None],
-        out=np.full_like(mapped[..., :2], -1e6),
-        where=valid_den[..., None],
-    )
-    visible = (
-        valid_den
-        & (xy[..., 0] >= 0)
-        & (xy[..., 0] <= gray.shape[1] - 1)
-        & (xy[..., 1] >= 0)
-        & (xy[..., 1] <= gray.shape[0] - 1)
-    )
-    if common:
-        visible &= visible.all(axis=0, keepdims=True)
-    x = np.ascontiguousarray(np.nan_to_num(xy[..., 0], nan=-1e6), np.float32)
-    y = np.ascontiguousarray(np.nan_to_num(xy[..., 1], nan=-1e6), np.float32)
-    samples = (
-        cv2.remap(gray, x, y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT).astype(
-            np.float32
+        cache[key] = _prepared(tracker, i, tracker._hybrid[i].original).aligned_patch(
+            gray, matrix
         )
-        / 255.0
+    return cache[key]
+
+
+def _score(tracker, gray, i, matrices, reference, *, coarse=False, common=False):
+    c = tracker.patch_configs[i]
+    prepared = _prepared(tracker, i, reference)
+    if len(matrices) == 1 and not coarse:
+        pixels, visible = _sampled_patch(tracker, gray, i, matrices[0])
+        score, overlap = prepared.score_aligned(
+            pixels, visible, min_overlap=c.min_visible_fraction, min_std=c.min_patch_std
+        )
+        return np.asarray([score]), np.asarray([overlap])
+    return prepared.score(
+        gray,
+        matrices,
+        coarse=coarse,
+        common=common,
+        min_overlap=c.min_visible_fraction,
+        min_std=c.min_patch_std,
     )
-    ref = reference.pixels[yy, xx][None, :]
-    n = visible.sum(axis=1)
-    safe_n = np.maximum(1, n)
-    a = (
-        samples - (samples * visible).sum(axis=1, keepdims=True) / safe_n[:, None]
-    ) * visible
-    b = (ref - (ref * visible).sum(axis=1, keepdims=True) / safe_n[:, None]) * visible
-    energy = np.sqrt((a * a).sum(axis=1) * (b * b).sum(axis=1))
-    scores = np.divide(
-        (a * b).sum(axis=1),
-        energy,
-        out=np.full(len(h), -1.0, np.float32),
-        where=energy > 1e-8,
-    )
-    overlap = n / len(xx)
-    texture = np.sqrt((a * a).sum(axis=1) / safe_n)
-    ref_texture = np.sqrt((b * b).sum(axis=1) / safe_n)
-    scores[
-        (overlap < c.min_visible_fraction)
-        | (n < 12)
-        | (texture < c.min_patch_std)
-        | (ref_texture < c.min_patch_std)
-    ] = -1.0
-    return scores, overlap
 
 
 def _centered_shape(matrix, center, target):
@@ -180,9 +177,13 @@ def _window(tracker, gray, i):
 def _batch_flow(tracker, gray, active):
     """One forward/backward call per compatible window; no old target-mask clip."""
     groups = {}
+    if tracker.frames_seen - tracker._flow_frame != 1:
+        return {}
     for i in active:
         if (
             tracker.explicit_masks[i]
+            or tracker._hybrid[i].center_only
+            or tracker._hybrid[i].last_frame != tracker.frames_seen - 1
             or tracker._hybrid[i].missing_since is not None
             or not len(tracker.features[i])
         ):
@@ -197,6 +198,25 @@ def _batch_flow(tracker, gray, active):
         seed = np.concatenate(
             [project_points(tracker._hybrid[i].delta, tracker.features[i]) for i in ids]
         ).astype(np.float32)
+        # Share one source-aligned crop/pyramid per window group. Local pose
+        # refinement often has only a few neighboring points; full-HD pyramids
+        # per group waste most work. Include predicted/search neighborhoods and
+        # full LK footprints, with origins aligned to the pyramid sampling grid.
+        level = tracker.config.max_level
+        alignment = 2**level
+        margin = (window // 2 + 3) * alignment + tracker.config.max_displacement
+        extent = np.concatenate((p, seed))
+        low = np.maximum(
+            0, np.floor((extent.min(axis=0) - margin) / alignment) * alignment
+        ).astype(int)
+        high = np.minimum(
+            np.array(gray.shape[::-1]),
+            np.ceil((extent.max(axis=0) + margin + 1) / alignment) * alignment,
+        ).astype(int)
+        x0, y0 = low
+        x1, y1 = high
+        previous, current = tracker.previous[y0:y1, x0:x1], gray[y0:y1, x0:x1]
+        native_origin = low.astype(np.float32)
         options = dict(
             winSize=(window, window),
             maxLevel=tracker.config.max_level,
@@ -205,18 +225,26 @@ def _batch_flow(tracker, gray, active):
             flags=cv2.OPTFLOW_USE_INITIAL_FLOW,
         )
         q, status, error = cv2.calcOpticalFlowPyrLK(
-            tracker.previous, gray, p[:, None, :], seed[:, None, :].copy(), **options
+            previous,
+            current,
+            (p - native_origin)[:, None, :],
+            (seed - native_origin)[:, None, :].copy(),
+            **options,
         )
         if q is None:
             continue
-        q = q.reshape(-1, 2)
+        q = q.reshape(-1, 2) + native_origin
         finite = np.isfinite(q).all(axis=1)
         q[~finite] = p[~finite]
         back, status_back, _ = cv2.calcOpticalFlowPyrLK(
-            gray, tracker.previous, q[:, None, :], p[:, None, :].copy(), **options
+            current,
+            previous,
+            (q - native_origin)[:, None, :],
+            (p - native_origin)[:, None, :].copy(),
+            **options,
         )
         fb = (
-            np.linalg.norm(back.reshape(-1, 2) - p, axis=1)
+            np.linalg.norm(back.reshape(-1, 2) + native_origin - p, axis=1)
             if back is not None
             else np.full(len(p), np.inf)
         )
@@ -300,165 +328,247 @@ def _features(tracker, gray, i, transform):
     return pts.reshape(-1, 2) + low.astype(np.float32)
 
 
-def _shape_bank(tracker, i, base, target, *, original=False):
-    c = tracker.patch_configs[i]
-    p = tracker.initial_points[i]
-    r = c.patch_radius
-    # Work in normalized query coordinates. Projective perturbations are small
-    # across this patch, not dependent on the image's global origin.
-    domain = np.array([[r, 0, p[0]], [0, r, p[1]], [0, 0, 1.0]], float)
-    inv = np.array([[1 / r, 0, -p[0] / r], [0, 1 / r, -p[1] / r], [0, 0, 1.0]], float)
-    bank = [_centered_shape(base, p, target)]
+@lru_cache(maxsize=32)
+def _shape_changes(dof, pose_step, angle_step, budget):
+    """Joint normalized grids, vectorized once per configuration/stage."""
+    grid = np.indices((3,) * dof).reshape(dof, -1).T.astype(float) - 1
+    order = np.argsort(np.sum(grid * grid, axis=1), kind="stable")
+    grid = grid[order[:budget]]
+    theta, ell = np.deg2rad(angle_step) * grid[:, 0], pose_step * grid[:, 1]
+    a = pose_step * grid[:, 2] if dof >= 4 else np.zeros(len(grid))
+    b = pose_step * grid[:, 3] if dof >= 4 else np.zeros(len(grid))
+    amplitude = np.hypot(a, b)
+    ratio = np.divide(
+        np.sinh(amplitude), amplitude, out=np.ones_like(a), where=amplitude > 1e-9
+    )
+    strain = np.zeros((len(grid), 2, 2))
+    strain[:, 0, 0] = np.cosh(amplitude) + ratio * a
+    strain[:, 1, 1] = np.cosh(amplitude) - ratio * a
+    strain[:, 0, 1] = strain[:, 1, 0] = ratio * b
+    rotation = np.empty_like(strain)
+    rotation[:, 0, 0] = rotation[:, 1, 1] = np.cos(theta)
+    rotation[:, 1, 0] = np.sin(theta)
+    rotation[:, 0, 1] = -np.sin(theta)
+    changes = np.repeat(np.eye(3)[None], len(grid), axis=0)
+    changes[:, :2, :2] = np.exp(ell)[:, None, None] * (rotation @ strain)
+    if dof == 6:
+        changes[:, 2, :2] = pose_step * 0.5 * grid[:, 4:]
+    changes.setflags(write=False)
+    return changes
+
+
+def _shape_bank(tracker, i, base, target, *, original=False, dof=2):
+    c, state = tracker.patch_configs[i], tracker._hybrid[i]
+    p, r = tracker.initial_points[i], c.patch_radius
+    domain, inverse = state.motion.domain, state.motion.inverse_domain
+    seeds = np.array([_centered_shape(base, p, target)])
     if original:
-        bank.append(_centered_shape(tracker._hybrid[i].anchor, p, target))
-        # Preserve predicted orientation while independently resetting scale/shear.
-        geometry = warp_geometry(base, p, r)
-        a = np.deg2rad(geometry["rotation_degrees"])
-        reset = np.eye(3)
-        reset[:2, :2] = [[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]]
-        bank.append(_centered_shape(domain @ reset @ inv, p, target))
-    seeds = list(bank)
-    step = c.correlation_pose_step
-    angle = np.deg2rad(c.correlation_angle_step)
-    perturb = []
-    for a in [-angle, angle]:
-        h = np.eye(3)
-        h[:2, :2] = [[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]]
-        perturb.append(h)
-    for s in [-step, step]:
-        h = np.eye(3)
-        h[0, 0] = h[1, 1] = np.exp(s)
-        perturb.append(h)
-    if c.motion_model in ("adaptive", "affine", "homography"):
-        for s in [-step, step]:
-            for y, x in [(0, 1), (1, 0)]:
-                h = np.eye(3)
-                h[y, x] = s
-                perturb.append(h)
+        # Preserve independent original scale and prior accepted anchor; a bad
+        # cumulative H never determines all recovery shapes or the source mask.
+        reset = state.motion.params.copy()
+        reset[1:] = 0.0
+        seeds = np.concatenate(
+            (
+                seeds,
+                [
+                    state.motion.compose(target, reset),
+                    _centered_shape(state.anchor, p, target),
+                ],
+            )
+        )
+    if len(seeds) > 1:
+        probes = np.array([[1, 0, 1], [0, 1, 1], [-1, 0, 1], [0, -1, 1]], float)
+        local = (
+            np.linalg.inv(np.array([[r, 0, target[0]], [0, r, target[1]], [0, 0, 1.0]]))
+            @ seeds
+            @ domain
+        )
+        mapped = probes @ local.transpose(0, 2, 1)
+        mapped = mapped[..., :2] / mapped[..., 2, None]
+        distance = (
+            np.linalg.norm(mapped[:, None] - mapped[None], axis=-1).max(axis=-1) * r
+        )
+        keep = [0]
+        for seed_index in range(1, len(seeds)):
+            if (distance[seed_index, keep] > 0.25 * c.correlation_search_step).all():
+                keep.append(seed_index)
+        seeds = seeds[keep]
+    elapsed = max(0.0, (tracker.frames_seen - state.last_frame) / tracker.stream_fps)
+    expansion = min(
+        3.0, 1.0 + elapsed / max(c.motion_memory_seconds, 1 / tracker.stream_fps)
+    )
+    changes = _shape_changes(
+        dof,
+        c.correlation_pose_step * expansion,
+        c.correlation_angle_step,
+        c.correlation_max_shapes,
+    )
+    matrices = (seeds[:, None] @ domain @ changes[None] @ inverse).reshape(-1, 3, 3)
+    # Generated in normalized query coordinates: each shape has this exact center.
+    centers = matrices[:, :2] @ np.r_[p, 1.0]
+    centers /= (matrices[:, 2] @ np.r_[p, 1.0])[:, None]
+    matrices[:, :2] += (target - centers)[:, :, None] * matrices[:, None, 2]
+    return matrices
+
+
+def _search(tracker, gray, i, base, reference, *, original=False):
+    c, state = tracker.patch_configs[i], tracker._hybrid[i]
+    p = tracker.initial_points[i]
+    hint = None if tracker._center_hints is None else tracker._center_hints[i]
+    if hint is not None and not np.isfinite(hint).all():
+        hint = None
+    if not state.motion.check(base, tracker.frames_seen, hint)["motion_accepted"]:
+        base = state.motion.predict(tracker.frames_seen, hint)
+    target = project_points(base, p)
+    gap = max(1, tracker.frames_seen - state.last_frame)
+    score = float(_score(tracker, gray, i, [base], reference)[0][0])
+    uncertainty = max(0.0, (gap - 1) / tracker.stream_fps / c.motion_memory_seconds)
+    weakness = np.clip(
+        (c.correlation_trigger - score) / max(0.05, c.correlation_trigger), 0.0, 1.0
+    )
+    initial_radius = min(
+        c.correlation_search_radius,
+        max(2 * c.correlation_search_step, c.patch_radius * 0.25),
+    )
+    radius = min(
+        c.max_displacement,
+        c.correlation_search_radius,
+        initial_radius
+        + (c.correlation_search_radius - initial_radius)
+        * min(1.0, 2 * weakness + uncertainty),
+    )
+    step = max(c.correlation_search_step, radius / 12.0)
+    stage = [2]
+    if (
+        c.motion_model in ("adaptive", "affine", "homography")
+        and c.correlation_max_shapes > 9
+    ):
+        stage.append(4)
     if (
         c.motion_model == "homography"
         or c.motion_model == "adaptive"
         and c.adaptive_max_model == "homography"
-    ):
-        for s in [-step / 2, step / 2]:
-            for x in [0, 1]:
-                h = np.eye(3)
-                h[2, x] = s
-                perturb.append(h)
-    for seed in seeds:
-        for change in perturb:
-            if len(bank) >= c.correlation_max_candidates:
+    ) and c.correlation_max_shapes > 81:
+        stage.append(6)
+    best, best_score, best_info = None, -1.0, {}
+    total = 0
+    # Native correlation maps evaluate all centers together, one warp per shape.
+    for dof in stage:
+        shapes = _shape_bank(tracker, i, base, target, original=original, dof=dof)
+        axis = np.unique(np.r_[np.arange(-radius, radius + step * 0.1, step), 0.0])
+        gx, gy = np.meshgrid(axis, axis)
+        shifts = np.column_stack((gx.ravel(), gy.ravel()))
+        shifts = shifts[np.sum(shifts * shifts, axis=1) <= radius * radius + 1e-9]
+        if len(shifts) <= 24:
+            # Complete Cartesian shape/center bank, with no Python center loop.
+            proposed = np.repeat(shapes, len(shifts), axis=0)
+            translation = np.tile(shifts, (len(shapes), 1))
+            proposed[:, :2] += translation[:, :, None] * proposed[:, None, 2]
+            locations = len(proposed)
+        else:
+            proposed, _, locations = _prepared(
+                tracker, i, reference
+            ).correlation_candidates(
+                gray,
+                shapes,
+                radius=radius,
+                step=step,
+                top_k=c.correlation_top_k,
+                min_overlap=c.min_visible_fraction,
+            )
+        total += locations
+        if not len(proposed):
+            continue
+        dense, overlap = _score(tracker, gray, i, proposed, reference, coarse=True)
+        motion = state.motion.assess(proposed, tracker.frames_seen, hint)
+        rank = dense - motion["motion_penalty"] - 0.01 * (1 - overlap)
+        rank[~motion["motion_accepted"]] = -np.inf
+        order = np.argsort(rank, kind="stable")[::-1][: c.correlation_max_candidates]
+        # Keep geometrically distinct basins; this loop is capped at top_k fits,
+        # never pixels, center-grid locations or every candidate solver call.
+        chosen = []
+        probes = np.array([p, p + [c.patch_radius, 0], p + [0, c.patch_radius]])
+        mapped = np.c_[probes, np.ones(len(probes))] @ proposed.transpose(0, 2, 1)
+        mapped = mapped[..., :2] / mapped[..., 2, None]
+        excluded = ~np.isfinite(rank)
+        for _ in range(c.correlation_top_k):
+            available = order[~excluded[order]]
+            if not len(available):
                 break
-            bank.append(_centered_shape(seed @ domain @ change @ inv, p, target))
-    return bank[: c.correlation_max_candidates]
-
-
-def _search(tracker, gray, i, base, reference, *, original=False):
-    c = tracker.patch_configs[i]
-    state = tracker._hybrid[i]
-    p = tracker.initial_points[i]
-    target = project_points(base, p)
-    gap = tracker.frames_seen - state.last_frame
-    radius = min(c.max_displacement, c.correlation_search_radius * np.sqrt(max(1, gap)))
-    step = max(c.correlation_search_step, radius / 5)
-    offsets = np.arange(-radius, radius + step * 0.1, step)
-    offsets = np.unique(np.r_[offsets, 0.0])
-    xx, yy = np.meshgrid(offsets, offsets)
-    delta = np.column_stack([xx.ravel(), yy.ravel()])
-    shapes = _shape_bank(tracker, i, base, target, original=original)
-    matrices = np.repeat(np.array(shapes), len(delta), axis=0)
-    shifts = np.tile(delta, (len(shapes), 1))
-    matrices[:, :2, :] += shifts[:, :, None] * matrices[:, None, 2, :]
-    scores, overlap = _score(tracker, gray, i, matrices, reference, coarse=True)
-    penalties = np.zeros(len(shapes))
-    if c.motion_model == "adaptive":
-        changes = np.asarray(shapes) @ np.linalg.inv(shapes[0])
-        projective = np.max(np.abs(changes[:, 2, :2]), axis=1) > 1e-10
-        gram = changes[:, :2, :2].transpose(0, 2, 1) @ changes[:, :2, :2]
-        anisotropic = (
-            np.abs(gram[:, 0, 0] - gram[:, 1, 1]) + 2 * np.abs(gram[:, 0, 1])
-        ) > 1e-6
-        penalties = (
-            np.where(projective, 2.0, anisotropic.astype(float))
-            * c.adaptive_registration_min_gain
+            index = int(available[0])
+            chosen.append(index)
+            same = np.linalg.norm(mapped - mapped[index], axis=2).max(axis=1) < max(
+                1.5, c.patch_radius * 0.15
+            )
+            excluded |= same
+        if not chosen:
+            continue
+        finalists = list(proposed[chosen])
+        fit_model = "similarity" if dof == 2 else "affine" if dof == 4 else "homography"
+        prepared = _prepared(tracker, i, reference)
+        for candidate in proposed[chosen]:
+            fitted, _ = prepared.fit(
+                gray,
+                candidate,
+                model=fit_model,
+                iterations=c.correlation_refine_iterations,
+                min_overlap=c.min_visible_fraction,
+                min_std=c.min_patch_std,
+                max_displacement=c.max_displacement,
+                epsilon=c.registration_epsilon,
+            )
+            if fitted is not None:
+                finalists.append(fitted)
+        finalists = np.asarray(finalists)
+        full, _ = _score(tracker, gray, i, finalists, reference, common=True)
+        motion = state.motion.assess(finalists, tracker.frames_seen, hint)
+        ranked = full - motion["motion_penalty"]
+        ranked[~motion["motion_accepted"]] = -np.inf
+        for candidate_index, candidate_H in enumerate(finalists):
+            valid_H, _, _ = _geometry(
+                tracker, i, candidate_H, tracker.transforms[i], reanchor=original
+            )
+            if valid_H is None:
+                ranked[candidate_index] = -np.inf
+        index = int(np.argmax(ranked))
+        if not np.isfinite(ranked[index]):
+            continue
+        winner = finalists[index]
+        # Compare competing geometric basins, not neighboring subpixel samples.
+        winner_probes = project_points(winner, probes)
+        other = np.linalg.norm(mapped - winner_probes, axis=2).max(axis=1) > max(
+            2.0, c.patch_radius * 0.2
         )
-    penalties = np.repeat(penalties, len(delta))
-    # Motion is a soft tie-breaker, never an evidence substitute.
-    ranked = (
-        scores
-        - penalties
-        - 0.01 * (np.linalg.norm(shifts, axis=1) / max(1, radius)) ** 2
-        - 0.01 * (1 - overlap)
-    )
-    best = int(np.argmax(ranked))
-    if scores[best] <= -1:
-        return None, {"fit_margin": None, "search_candidates": len(matrices)}
-    # Correlation is sharply peaked on small textured patches: a coarse cell
-    # need not pass the final threshold before its neighborhood is refined.
-    order = np.argsort(ranked)[-3:][::-1]
-    fine_axis = np.linspace(-step, step, 9)
-    fx, fy = np.meshgrid(fine_axis, fine_axis)
-    fine_delta = np.column_stack([fx.ravel(), fy.ravel()])
-    fine = np.repeat(matrices[order], len(fine_delta), axis=0)
-    shifts_fine = np.tile(fine_delta, (len(order), 1))
-    fine[:, :2, :] += shifts_fine[:, :, None] * fine[:, None, 2, :]
-    fine_scores, _ = _score(tracker, gray, i, fine, reference, coarse=True)
-    fine_penalty = np.repeat(penalties[order], len(fine_delta))
-    fine_order = np.argsort(fine_scores - fine_penalty)[-4:][::-1]
-    full, _ = _score(tracker, gray, i, fine[fine_order], reference, common=True)
-    chosen = int(np.argmax(full - fine_penalty[fine_order]))
-    winner = fine[fine_order[chosen]]
-    score = float(full[chosen])
-    best_center = project_points(winner, p)
-    centers = np.einsum("nij,j->ni", matrices, np.r_[p, 1.0])
-    centers = centers[:, :2] / centers[:, 2, None]
-    other = np.linalg.norm(centers - best_center, axis=1) > max(
-        3.0, c.patch_radius * 0.25
-    )
-    r = c.patch_radius
-    probes = p + np.array([[-r, -r], [-r, r], [r, -r], [r, r]], float)
-    mapped = np.matmul(
-        np.column_stack([probes, np.ones(4)]), matrices.transpose(0, 2, 1)
-    )
-    mapped = mapped[..., :2] / mapped[..., 2, None]
-    winner_probes = project_points(winner, probes)
-    other |= np.linalg.norm(mapped - winner_probes, axis=2).max(axis=1) > max(
-        3.0, r * 0.25
-    )
-    if other.any():
-        rival = int(np.flatnonzero(other)[np.argmax(scores[other])])
-        compared, _ = _score(
-            tracker, gray, i, [winner, matrices[rival]], reference, common=True
+        other &= state.motion.assess(proposed, tracker.frames_seen, hint)[
+            "motion_accepted"
+        ]
+        rival = (
+            proposed[np.argmax(np.where(other, dense, -np.inf))]
+            if other.any()
+            else None
         )
-        margin = float(compared[0] - compared[1])
-    else:
-        margin = score + 1.0
-    if margin < c.correlation_margin:
-        return None, {"fit_margin": margin, "search_candidates": len(matrices)}
-    if score < c.min_patch_ncc:
-        return None, {
-            "fit_margin": margin,
-            "search_candidates": len(matrices) + len(fine),
-        }
-    candidate = winner
-    # One optional direct fit for the winning basin; no ECC for every hypothesis.
-    model = "similarity" if c.motion_model == "adaptive" else c.motion_model
-    refine_config = replace(c, registration_iterations=c.correlation_refine_iterations)
-    fitted, _ = tracker._masked_align(
-        gray, reference.pixels, reference.mask, p, candidate, refine_config, model
-    )
-    if fitted is not None:
-        compared, _ = _score(
-            tracker, gray, i, [candidate, fitted], reference, common=True
-        )
-        if compared[1] >= compared[0]:
-            candidate = fitted
-            score = float(compared[1])
-    return candidate, {
-        "fit_margin": margin,
-        "fit_score": score,
-        "search_candidates": len(matrices),
-    }
+        margin = 2.0
+        if rival is not None:
+            comparison, _ = _score(
+                tracker, gray, i, [winner, rival], reference, common=True
+            )
+            prior = state.motion.assess([winner, rival], tracker.frames_seen, hint)[
+                "motion_penalty"
+            ]
+            margin = float((comparison - prior)[0] - (comparison - prior)[1])
+        if full[index] >= c.min_patch_ncc and margin >= c.correlation_margin:
+            if full[index] > best_score:
+                best, best_score = winner, float(full[index])
+                best_info = dict(
+                    fit_score=best_score,
+                    fit_margin=margin,
+                    recovery_dof=dof,
+                    recovery_shape_count=len(shapes),
+                    recovery_bank_truncated=bool(3**dof > c.correlation_max_shapes),
+                )
+            if full[index] >= c.correlation_trigger:
+                break
+    return best, {**best_info, "search_candidates": total}
 
 
 def _geometry(tracker, i, candidate, last, *, reanchor=False):
@@ -517,7 +627,12 @@ def advance(tracker, gray, offset):
     from .klt import fit_similarity
 
     tracker._current_gray = gray
-    active = np.flatnonzero(tracker.alive)
+    tracker._sampled_patches = [{} for _ in range(tracker.query_count)]
+    active = np.flatnonzero(
+        tracker.alive
+        if tracker._active_mask is None
+        else tracker.alive & tracker._active_mask
+    )
     flows = _batch_flow(tracker, gray, active)
     rows = [
         tracker._diagnostic(
@@ -531,7 +646,11 @@ def advance(tracker, gray, offset):
         for i in range(tracker.query_count)
     ]
     scores = np.full(tracker.query_count, -1.0, np.float32)
+    previous_index = None
     for i in active:
+        if previous_index is not None:
+            tracker._sampled_patches[previous_index].clear()
+        previous_index = i
         c = tracker.patch_configs[i]
         p = tracker.initial_points[i]
         state = tracker._hybrid[i]
@@ -557,25 +676,10 @@ def advance(tracker, gray, offset):
                 tracking_status="terminated",
             )
             continue
-        predicted = state.delta @ last
-        if gap > 1:
-            center = project_points(last, p)
-            target = center + (project_points(predicted, p) - center) * min(gap, 10)
-            try:
-                angle = np.deg2rad(
-                    warp_geometry(state.delta, center, c.patch_radius)[
-                        "rotation_degrees"
-                    ]
-                    * gap
-                )
-                rotation = np.eye(3)
-                rotation[:2, :2] = [
-                    [np.cos(angle), -np.sin(angle)],
-                    [np.sin(angle), np.cos(angle)],
-                ]
-                predicted = _centered_shape(rotation @ last, p, target)
-            except ValueError:
-                predicted = _centered_shape(last, p, target)
+        hint = None if tracker._center_hints is None else tracker._center_hints[i]
+        if hint is not None and not np.isfinite(hint).all():
+            hint = None
+        predicted = state.motion.predict(tracker.frames_seen, hint)
         proposal = None
         metrics = {}
         pp = qq = np.empty((0, 2), np.float32)
@@ -583,8 +687,15 @@ def advance(tracker, gray, offset):
         local_valid = False
         if tracker.explicit_masks[i]:
             model = "similarity" if c.motion_model == "adaptive" else c.motion_model
-            proposal, metrics = tracker._masked_align(
-                gray, state.recent.pixels, state.recent.mask, p, predicted, c, model
+            proposal, metrics = _prepared(tracker, i, state.recent).fit(
+                gray,
+                predicted,
+                model=model,
+                iterations=c.correlation_refine_iterations,
+                min_overlap=c.min_visible_fraction,
+                min_std=c.min_patch_std,
+                max_displacement=c.max_displacement,
+                epsilon=c.registration_epsilon,
             )
             row.update(
                 {k: v for k, v in metrics.items() if k != "reason"},
@@ -629,10 +740,27 @@ def advance(tracker, gray, offset):
                 }
             )
         candidate = proposal if proposal is not None else predicted
+        if (
+            tracker._warp_hints is not None
+            and np.isfinite(tracker._warp_hints[i]).all()
+        ):
+            offered = tracker._warp_hints[i]
+            comparison, _ = _score(
+                tracker, gray, i, [candidate, offered], state.recent, common=True
+            )
+            motion = state.motion.assess(
+                [candidate, offered], tracker.frames_seen, hint
+            )
+            ranks = comparison - motion["motion_penalty"]
+            ranks[~motion["motion_accepted"]] = -np.inf
+            if ranks[1] > ranks[0] and comparison[1] >= c.min_patch_ncc:
+                candidate = offered.copy()
+                local_valid = True
+                row["model_selection"] = "validated_external_warp_proposal"
         recent, _ = _score(tracker, gray, i, [candidate], state.recent)
         recent_score = float(recent[0])
         due = tracker.frames_seen % c.reanchor_interval == 0
-        original = Reference(tracker.templates[i], tracker.support_masks[i], 0)
+        original = state.original
         original_score = (
             float(_score(tracker, gray, i, [candidate], original)[0][0])
             if due or not local_valid
@@ -659,7 +787,12 @@ def advance(tracker, gray, offset):
                     inliers = keep
                     row.update(extra)
                     local_valid = True
-        recovery = not local_valid or recent_score < c.correlation_trigger
+        temporal = state.motion.check(candidate, tracker.frames_seen, hint)
+        recovery = (
+            not local_valid
+            or recent_score < c.correlation_trigger
+            or not temporal["motion_accepted"]
+        )
         failure_reason = (
             metrics.get("reason", "no_local_proposal")
             if not local_valid
@@ -674,6 +807,7 @@ def advance(tracker, gray, offset):
             state.attempts += 1
             fitted, search_info = _search(tracker, gray, i, candidate, state.recent)
             margin = search_info.get("fit_margin")
+            row.update({k: v for k, v in search_info.items() if k != "fit_score"})
             if fitted is not None:
                 candidate = fitted
                 recent_score = float(
@@ -689,10 +823,25 @@ def advance(tracker, gray, offset):
                     model_selection="correlation:bounded_recovery",
                 )
         # Original support recovery is independent of failed accumulated scale.
-        if due or not local_valid:
+        if (
+            due
+            or not local_valid
+            or not state.motion.check(candidate, tracker.frames_seen, hint)[
+                "motion_accepted"
+            ]
+        ):
             original_score = float(
                 _score(tracker, gray, i, [candidate], original)[0][0]
             )
+            if (
+                original_score >= c.registration_min_ncc
+                and (not local_valid or recent_score < c.min_patch_ncc)
+                and state.motion.check(candidate, tracker.frames_seen, hint)[
+                    "motion_accepted"
+                ]
+            ):
+                local_valid = True
+                used_original = True
             if original_score < c.registration_min_ncc:
                 fitted, search_info = _search(
                     tracker, gray, i, candidate, original, original=True
@@ -713,6 +862,37 @@ def advance(tracker, gray, offset):
                         used_original = True
                         margin = search_info.get("fit_margin")
             origin_confirmed = local_valid and original_score >= c.registration_min_ncc
+        temporal = state.motion.check(candidate, tracker.frames_seen, hint)
+        row.update(temporal)
+        if local_valid and not temporal["motion_accepted"]:
+            # Preserve a strong center measurement without recording an invented
+            # orientation/H or contaminating accepted pose/template state.
+            center = project_points(candidate, p)
+            if (
+                recent_score >= c.correlation_trigger
+                and tracker._inside(center)
+                and np.linalg.norm(center - state.motion.center) <= c.max_displacement
+            ):
+                tracker.points[i] = center
+                state.motion.commit_center(center, tracker.frames_seen, hint)
+                state.center_only = True
+                row.update(
+                    valid=True,
+                    reason="center_only_ambiguous_pose",
+                    tracking_status="center_only",
+                    pose_valid=False,
+                    rotation_valid=False,
+                    scale_valid=False,
+                    fit_score=recent_score,
+                    recent_template_updated=False,
+                    rotation_degrees=None,
+                    scale=None,
+                )
+                row.update({f"warp_h{y}{x}": None for y in range(3) for x in range(3)})
+                scores[i] = max(0.001, recent_score)
+                continue
+            local_valid = False
+            failure_reason = temporal["motion_reason"]
         candidate, geometry, geometry_reason = (
             _geometry(tracker, i, candidate, last, reanchor=used_original)
             if local_valid
@@ -749,7 +929,7 @@ def advance(tracker, gray, offset):
                 tracker.alive[i] = False
                 row["tracking_status"] = "terminated"
             continue
-        anchor_scale = warp_geometry(state.anchor, p, c.patch_radius)["scale"]
+        anchor_scale = state.anchor_scale
         scale_reliable = (
             origin_confirmed
             or 1 / c.registration_max_scale
@@ -757,6 +937,8 @@ def advance(tracker, gray, offset):
             <= c.registration_max_scale
         )
         recovered = state.missing_since is not None
+        state.motion.commit(candidate, tracker.frames_seen, hint)
+        state.center_only = False
         state.delta = candidate @ np.linalg.inv(last)
         tracker.transforms[i] = candidate
         tracker.points[i] = project_points(candidate, p)
@@ -767,14 +949,20 @@ def advance(tracker, gray, offset):
         )
         if origin_confirmed:
             state.anchor = candidate.copy()
-        # Extract from accepted raw pixels onto the immutable original grid.
-        mask = tracker.support_masks[i] & tracker._visible(
-            gray, p, c.patch_radius, candidate
+            state.anchor_scale = geometry["scale"]
+        used_reference_frame = state.recent.frame
+        # High-quality, observable accepted RGB alone may refresh the recent bank.
+        refresh = (
+            c.use_recent_template
+            and accepted_score >= c.template_update_score
+            and tracker.observability[i] >= c.registration_min_observability
         )
-        pixels, _ = tracker._patch(
-            gray, p, candidate, radius=c.patch_radius, support=mask
-        )
-        state.recent = Reference(pixels, mask.copy(), tracker.frames_seen)
+        if refresh:
+            pixels, visible = _sampled_patch(tracker, gray, i, candidate)
+            mask = tracker.support_masks[i] & visible
+            state.recent = Reference(
+                pixels.astype(np.float32), mask.copy(), tracker.frames_seen
+            )
         state.last_frame = tracker.frames_seen
         state.missing_since = None
         if not tracker.explicit_masks[i]:
@@ -814,7 +1002,8 @@ def advance(tracker, gray, offset):
             failure_reason=None,
             original_confirmed=origin_confirmed,
             reference_id="original" if origin_confirmed else "recent",
-            reference_frame=0 if origin_confirmed else state.last_frame - gap,
+            reference_frame=0 if origin_confirmed else used_reference_frame,
+            recent_template_updated=bool(refresh),
             registration_status=(
                 "accepted_original"
                 if origin_confirmed
@@ -833,4 +1022,6 @@ def advance(tracker, gray, offset):
         if origin_confirmed:
             tracker._promote_keyframe(gray, i, candidate, row)
         scores[i] = max(0.001, min(1.0, max(0.0, accepted_score)))
+    if previous_index is not None:
+        tracker._sampled_patches[previous_index].clear()
     return scores, rows

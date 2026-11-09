@@ -3,8 +3,8 @@
 In the GUI, open **Refine pose**, click **Use current tracks** or browse an
 original/corrected `points.csv`, and **Run refinement**. Save pending corrections
 first. Leave point IDs/radius/frame limit blank to use all saved points and
-supports. Select the **Method**; the default is fast correlation plus guarded
-IC-LK homography. Refinement and rendering run in a cancellable background job.
+supports. Select the **Method**; the default is **Shared patch tracker**
+(`patch_hybrid`), using the same KLT/correlation engine as point tracking. Refinement and rendering run in a cancellable background job.
 
 **Render overlay** reuses matching poses and draws each fitted patch circle plus
 a clockwise rotation indicator when `rotation_valid=1`. The zero-angle direction
@@ -34,7 +34,7 @@ CLI equivalent from the workspace root:
 ```bash
 video-annotate refine \
   --tracks data/pseudo-ground-truths/point_tracks/SEQUENCE/klt-template/adaptive/corrected/points.csv \
-  --pose-method similarity_ic_homography --overlay
+  --pose-method patch_hybrid --overlay
 ```
 
 Add `--point-ids 0 3`, `--max-frames 60` for a short check, or
@@ -47,14 +47,47 @@ managed derived pose folder, never the original point predictions/references.
 
 | `--pose-method` | Behavior |
 |---|---|
+| `patch_hybrid` | **Default:** batched KLT/RANSAC or masked direct proposals, foreground correlation, temporal acceptance and bounded joint center/shape recovery. |
 | `similarity` | Original fast correlation, immutable original plus one updated recent canonical template. No original-biased fusion. |
-| `similarity_ic_homography` | **Default:** recent IC-LK homography, periodic original checks and broader correlation recovery. A photometrically validated seed can survive a rejected or unhelpful correction. |
+| `similarity_ic_homography` | recent IC-LK homography, periodic original checks and broader correlation recovery. A photometrically validated seed can survive a rejected or unhelpful correction. |
 | `similarity_homography` | Same guarded policy with OpenCV ECC homography. |
 | `ecc_affine` | Original/recent ECC affine; requires a valid solver candidate. |
 | `ecc_homography` | Original/recent ECC homography; requires a valid solver candidate. |
 | `inverse_compositional` | Original/recent IC-LK homography; requires a valid solver candidate. |
 | `klt_ransac` | Pyramidal KLT/RANSAC with original/recent appearance validation; template recovery can reseed lost features. |
 | `anchored` | Previous expensive original-reference-biased fusion, retained as an explicit option. |
+
+The shared engine keeps immutable original and accepted-recent appearances.
+Points initialized together share one grayscale/LK stream; hidden points skip
+updates. Supplied centers guide a gradually changing correction, rather than
+forcing each frame back to an inaccurate track. Native tracker H is an optional
+validated proposal; corrected tracks never reuse stale pose. Saved circles/masks
+supply native-pixel support, and source FPS/reacquisition policy are preserved.
+
+**Motion consistency** exposes the gate, uncertainty multiplier (4), pixel noise
+floor (1 source pixel) and memory (0.1 source seconds). Accepted motion alone learns
+velocity/noise; a rejected rotation/scale/shape jump cannot refresh appearance.
+A strong center can survive ambiguous pose with blank rotation/scale/H. These are
+plausibility checks, not calibrated probabilities or proof of material rotation.
+Perfect symmetry after a gap can remain unobservable.
+
+Recovery begins near the accepted temporal prediction, expands with uncertainty
+and image disagreement, and coarse-scores joint shape/center banks. **Search shape
+budget** is per reference/independent seed: 9 similarity shapes, then up to 81
+affine shapes by default; 729 enables the full optional projective bank. Coarse
+scoring uses batched remapping for small grids and native correlation maps for
+larger ones. Only bounded top-K distinct candidates receive direct fine fits.
+`--center-search --search-radius 64 --center-trust 0.5` permits wider recovery;
+normal shared-engine recovery stays within 12 source pixels by default. Radius
+is a hard cap. **Use recent validated template** / `--no-recent-template` toggles
+recent appearance; high-quality accepted raw RGB alone refreshes it.
+
+Resampling-grid/log-polar/fusion controls belong to the older methods below;
+the shared engine uses annotated native-pixel support and KLT/search controls.
+All methods retain separate outputs. Similarity/ECC/IC alternatives remain
+available and also use temporal acceptance when launched through this workflow.
+
+### Other selectable methods
 
 All six geometric choices now keep an immutable original and one validated
 recent appearance. Recent fitting uses the last accepted homography translated

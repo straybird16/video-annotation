@@ -144,6 +144,8 @@ def sample(image, points):
 
 class PoseEstimator:
     def __init__(self, gray, box=None, config=None, *, mask=None):
+        self.motion = None
+        self.motion_context = None
         self.config = config or Config()
         self.config.validate()
         self._validate_image(gray)
@@ -217,6 +219,26 @@ class PoseEstimator:
         self.reference_peak_margin = self.polar.correlate(
             self.fixed_spectrum, self.fixed_spectrum, 1., scale_limit=1.,
             period=c.rotation_period)['margin']
+
+    def set_motion_context(self, fps, options):
+        self.motion_context = (float(fps),dict(options))
+        self.motion = None
+
+    def _temporal_candidate(self, center, angle, scale, frame, supplied):
+        if self.motion_context is None:
+            return None,None
+        from ..common.patch_motion import PatchMotion
+        if self.motion is None:
+            fps,options=self.motion_context
+            query=self.initial_box[:2]+self.initial_box[2:]/2
+            self.motion=PatchMotion(query,self.grid_radius,fps=fps,
+                enabled=options['motion_gate'],sigma=options['motion_sigma'],
+                noise_px=options['motion_noise_px'],memory_seconds=options['motion_memory_seconds'],
+                center_trust=options['center_trust'])
+        query=self.initial_box[:2]+self.initial_box[2:]/2
+        H=np.eye(3);H[:2,:2]=scale*rotation(angle)
+        H[:2,2]=np.asarray(center)-H[:2,:2]@query
+        return H,self.motion.check(H,frame,supplied)
 
     @staticmethod
     def _validate_image(gray):
@@ -595,6 +617,17 @@ class PoseEstimator:
             if (angle_gap > 10 or scale_gap > .1) and abs(candidates[0]['score']-candidates[1]['score']) < .05:
                 result['reason'] = 'template_disagreement'
                 return self._boxes(result, box)
+        H,temporal=self._temporal_candidate(best['center'],best['angle'],best['scale'],frame,tracker_center)
+        if temporal is not None:
+            result.update(temporal)
+            if not temporal['motion_accepted']:
+                result.update(reason=temporal['motion_reason'],rotation_reason=temporal['motion_reason'],template_updated=0)
+                return self._boxes(result,box)
+        validity=rotation_validity(quality,c,reference_margin=self.reference_peak_margin,
+                                  peak_margin=best['peak_margin'],innovation=innovation)
+        if validity['rotation_reason']=='temporal_innovation' or 'temporal_innovation' in validity['rotation_reason'].split('|'):
+            result.update(validity,reason='temporal_innovation',template_updated=0)
+            return self._boxes(result,box)
         if result['fit_mode'] == 'full':
             # If the fixed anchor has lost all agreement, local image evidence
             # alone can follow another angular basin. Keep global recent FFTs.
@@ -610,15 +643,16 @@ class PoseEstimator:
         self.motion_updates += 1
         self.angle, self.scale, self.center, self.last_frame = angle, best['scale'], best['center'], frame
         self.tracker_center = tracker_center.copy()
+        if temporal is not None:
+            self.motion.commit(H,frame,tracker_center)
         result.update(valid=1, reason='accepted', x=float(self.center[0]), y=float(self.center[1]), scale=self.scale,
                       rotation_degrees=float(wrap(angle)), rotation_unwrapped_degrees=angle,
                       correction_dx=float(self.center[0]-tracker_center[0]),
                       correction_dy=float(self.center[1]-tracker_center[1]))
-        result.update(rotation_validity(quality, c, reference_margin=self.reference_peak_margin,
-                                       peak_margin=best['peak_margin'], innovation=innovation))
+        result.update(validity)
         # Acceptance already passed the fit-quality and disagreement gates.
         # An old fixed template must not veto a valid recent-template refresh.
-        if c.update_rate:
+        if c.update_rate and validity['rotation_valid']:
             self._update_recent(best)
             self.recent_frame = frame
             result['template_updated'] = 1

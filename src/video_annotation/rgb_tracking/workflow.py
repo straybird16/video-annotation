@@ -32,8 +32,11 @@ QUALITY_COLUMNS = ("frame", "point_id", "valid", "fb_error", "lk_error", "featur
                    "original_confirmed", "keyframe_count", "keyframe_action", "reason",
                    "alignment_method", "support_pixel_count", "photometric_rms", "photometric_inlier_ratio",
                    "pose_valid", "rotation_valid", "scale_valid", "fit_score", "recent_score", "original_score",
-                   "fit_margin", "tracking_status", "recovery_attempts", "failure_reason")
-QUALITY_SCHEMA_VERSION = 4
+                   "fit_margin", "tracking_status", "recovery_attempts", "failure_reason",
+                   "motion_accepted", "motion_reason", "rotation_innovation_degrees", "scale_innovation",
+                   "shape_innovation", "motion_penalty", "recent_template_updated", "recovery_dof",
+                   "recovery_shape_count", "recovery_bank_truncated", "search_candidates")
+QUALITY_SCHEMA_VERSION = 5
 
 
 def file_digest(path):
@@ -396,6 +399,7 @@ class Processor:
                             package / "lifecycle.py",
                             package.parent / "common/registration.py"]
             dependencies.extend(sorted(package.glob("klt_*.py")))
+            dependencies.extend(sorted((package.parent/'common').glob('patch_*.py')))
             digest = hashlib.sha256()
             for path in dependencies:
                 digest.update(path.read_bytes())

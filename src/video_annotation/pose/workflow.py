@@ -176,13 +176,18 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
     xy = np.asarray([[row[i][0] for i in selected] for _,row in groups[:count]],float)
     visible = np.asarray([[row[i][1] for i in selected] for _,row in groups[:count]],bool)
     visible &= np.all((xy>=0)&(xy<[source['width'],source['height']]),axis=-1)
+    source_grace=metadata.get('track_policy',{}).get('reacquire_seconds',.5)
     visible,policy = apply_lifecycle(frames,selected,xy,visible,source['fps'],
-        metadata.get('track_policy',{}).get('reacquire_seconds',.5),metadata.get('manual_edits',{}).get('anchors'))
+        source_grace,metadata.get('manual_edits',{}).get('anchors'))
     requested_count = count
     ends = [end for end in policy['point_end_frames'].values() if end is not None]
     count = max(ends)-start+1 if ends else 0
     frames,xy,visible = frames[:count],xy[:count],visible[:count]
     supports = patch_supports(tracks,metadata,video,source,selected,radius)
+    proposals={}
+    if method=='patch_hybrid':
+        from .hybrid import track_warp_proposals
+        proposals=track_warp_proposals(tracks,metadata,selected)
     cfg = _config(config)
     output_dir = contained_path(output_dir or tracks.parent/('refined-'+method),'data')
     if output_dir in (tracks.parent,video.parent) or tracks.is_relative_to(output_dir) or video.is_relative_to(output_dir):
@@ -209,7 +214,8 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
     if method=='klt_ransac':
         for key,default in dict(klt_max_points=200,klt_min_distance=4.,klt_window=21).items():
             if method_options[key]!=default:signature_options[key]=method_options[key]
-    signature = hashlib.sha256(json.dumps(dict(version=5,method=method,method_options=signature_options,gap_seconds=gap_seconds,gap_neighbors=gap_neighbors,tracks=file_digest(tracks),
+    if method=='patch_hybrid':signature_options=dict(method_options)
+    signature = hashlib.sha256(json.dumps(dict(version=6,source_fps=source['fps'],method=method,method_options=signature_options,gap_seconds=gap_seconds,gap_neighbors=gap_neighbors,tracks=file_digest(tracks),
         metadata=file_digest(tracks.with_suffix('.json')),source=[video.stat().st_size,video.stat().st_mtime_ns],
         point_ids=selected,config=asdict(cfg),frames=count,
         supports={str(i):dict(radius=s['radius'],query=None if s['query'] is None else s['query'].tolist(),
@@ -267,7 +273,7 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                 writers[i] = csv.DictWriter(stack.enter_context((folder/'pose.raw.csv').open('w',newline='')),
                                             fieldnames=FIELDS,extrasaction='ignore')
                 writers[i].writeheader()
-                states[i] = dict(estimator=None,reference_frame=None,angle=0.,scale=1.,offset=np.zeros(2),reference_query=None,reference_center=None,H=None,initial_mask=None,model='similarity',search=None)
+                states[i] = dict(estimator=None,reference_frame=None,angle=0.,scale=1.,offset=np.zeros(2),reference_query=None,reference_center=None,H=None,initial_mask=None,model='similarity',search=None,proposal_inverse=None)
             w,h = source['width'],source['height']
             ratio = min(1.,max_width/w)
             dw,dh = max(1,round(w*ratio)),max(1,round(h*ratio))
@@ -280,6 +286,8 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                 times['render_seconds'] += time.perf_counter()-clock
             stream = iter(video_frames(video,start,count,source=source))
             valid_total = point_frames = 0
+            hybrid_groups=[]
+            selected_index={identity:index for index,identity in enumerate(selected)}
             for index,frame_id in enumerate(frames):
                 check_cancel(cancel)
                 clock = time.perf_counter()
@@ -288,6 +296,49 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                     raise ValueError('Source video ended before the declared point interval')
                 gray = cv2.cvtColor(image,cv2.COLOR_BGR2GRAY)
                 times['decode_seconds'] += time.perf_counter()-clock
+                hybrid_failures={}
+                if method=='patch_hybrid':
+                    # Points sharing a reference frame share one gray/LK stream.
+                    # Hidden and ended slots never refresh appearance or motion.
+                    clock=time.perf_counter()
+                    for group,identities in hybrid_groups:
+                        centers=[];active=[];hints=[];has_hint=False
+                        for identity in identities:
+                            state=states[identity]
+                            point=selected_index[identity]
+                            centers.append(xy[index,point])
+                            active.append(bool(visible[index,point] and state['estimator'] is not None and
+                                state['estimator'].batch is group and
+                                policy['point_end_frames'][str(identity)] is not None and
+                                frame_id<=policy['point_end_frames'][str(identity)]))
+                            H=proposals.get((int(frame_id),identity))
+                            inverse=state['proposal_inverse']
+                            hint=H@inverse if H is not None and inverse is not None else np.full((3,3),np.nan)
+                            hints.append(hint);has_hint|=bool(np.isfinite(hint).all())
+                        group.prepare(gray,int(frame_id),centers,active,np.asarray(hints) if has_hint else None)
+                    times['refinement_seconds']+=time.perf_counter()-clock
+                    new=[identity for identity in selected if states[identity]['estimator'] is None and
+                         visible[index,selected_index[identity]] and policy['point_end_frames'][str(identity)] is not None and
+                         frame_id<=policy['point_end_frames'][str(identity)]]
+                    if new:
+                        from .hybrid import HybridPoseBatch
+                        clock=time.perf_counter();boxes=[];masks=[]
+                        for identity in new:
+                            support=supports[identity];center=xy[index,selected_index[identity]];r=support['radius']
+                            boxes.append([center[0]-r,center[1]-r,2*r,2*r])
+                            masks.append(transported_mask(support,center,0.,1.,(w,h)) if support['mask'] is not None else None)
+                        group=HybridPoseBatch(gray,boxes,cfg,masks=masks,options=method_options,
+                            source_fps=source['fps'],source_frame=int(frame_id),reacquire_seconds=source_grace)
+                        hybrid_groups.append((group,new))
+                        for identity,estimator in zip(new,group.estimators):
+                            if not estimator.initial_result()['valid']:
+                                hybrid_failures[identity]='initialization_failed: '+estimator.initial_result()['reason']
+                                continue
+                            center=xy[index,selected_index[identity]];origin=proposals.get((int(frame_id),identity))
+                            states[identity].update(estimator=estimator,reference_frame=int(frame_id),
+                                reference_query=np.asarray(center).copy(),reference_center=estimator.center.copy(),
+                                offset=np.zeros(2),proposal_inverse=np.linalg.inv(origin) if origin is not None else None)
+                        times['setup_seconds']+=time.perf_counter()-clock
                 rows = {}
                 for point,i in enumerate(selected):
                     end = policy['point_end_frames'][str(i)]
@@ -295,25 +346,28 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                         continue
                     state,support = states[i],supports[i]
                     center = xy[index,point]
-                    r = support['radius']*state['scale']
+                    r = support['radius']*(1. if method=='patch_hybrid' else state['scale'])
                     box = [center[0]-r,center[1]-r,2*r,2*r]
                     row = _invalid('point_invisible')
                     clock = time.perf_counter()
-                    initializing = state['estimator'] is None
+                    initializing = state['estimator'] is None or (method=='patch_hybrid' and state['reference_frame']==frame_id)
                     if visible[index,point]:
                         point_frames += 1
                         mask = (transported_mask(support,center,state['angle'],state['scale'],(w,h))
-                                if support['mask'] is not None else None)
-                        if state['initial_mask'] is not None and state['H'] is not None and state['model']!='similarity':
+                                if support['mask'] is not None and method!='patch_hybrid' else None)
+                        if method!='patch_hybrid' and state['initial_mask'] is not None and state['H'] is not None and state['model']!='similarity':
                             from .geometric import warp_points
                             previous=warp_points(state['H'],[state['reference_query']])[0]
                             move=np.eye(3);move[:2,2]=np.asarray(center)-previous
                             mask=cv2.warpPerspective(state['initial_mask'],move@state['H'],(w,h),flags=cv2.INTER_NEAREST)
                         times['adaptation_seconds'] += time.perf_counter()-clock
                         clock = time.perf_counter()
-                        if state['estimator'] is None:
+                        if method=='patch_hybrid' and initializing:
+                            row=(state['estimator'].initial_result() if state['estimator'] is not None else
+                                 _invalid(hybrid_failures.get(i,'initialization_failed')))
+                        elif state['estimator'] is None:
                             try:
-                                estimator = create_estimator(gray,box,cfg,mask=mask,method=method,options=method_options,base_factory=PoseEstimator)
+                                estimator = create_estimator(gray,box,cfg,mask=mask,method=method,options=method_options,base_factory=PoseEstimator,source_fps=source['fps'],reacquire_seconds=source_grace)
                             except ValueError as error:
                                 row = _invalid('initialization_failed: '+str(error))
                             else:
@@ -322,7 +376,10 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                                              reference_center=estimator.center.copy(),
                                              initial_mask=None if mask is None else np.asarray(mask,np.uint8).copy())
                                 estimator.reference_query=np.asarray(center).copy()
-                                if method_options['center_search']:
+                                origin=proposals.get((int(frame_id),i))
+                                if origin is not None:
+                                    state['proposal_inverse']=np.linalg.inv(origin)
+                                if method_options['center_search'] and method!='patch_hybrid':
                                     state['search']=CenterSearch(estimator,gray,center,method_options)
                                 row = estimator.initial_result()
                         else:
@@ -334,9 +391,14 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                                     move=np.float32([[1,0,proposed[0]-box[0]],[0,1,proposed[1]-box[1]]])
                                     mask=cv2.warpAffine(mask,move,(w,h),flags=cv2.INTER_NEAREST)
                                 box=proposed
-                            row = state['estimator'].estimate(gray,box,local_frame,mask=mask)
+                            if method=='patch_hybrid':
+                                proposed=proposals.get((int(frame_id),i))
+                                hint=(proposed@state['proposal_inverse'] if proposed is not None and state['proposal_inverse'] is not None else None)
+                                row=state['estimator'].estimate(gray,box,local_frame,warp_hint=hint)
+                            else:
+                                row = state['estimator'].estimate(gray,box,local_frame,mask=mask)
                             row.update(audit)
-                        if int(row['valid']):
+                        if int(row['valid']) and row.get('pose_valid',1) not in (False,0):
                             fitted = np.array([row['x'],row['y']],float)
                             scale = float(row['similarity_scale'])
                             angle = float(row['rotation_degrees'])
@@ -364,6 +426,9 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                                 circle_radius=support['radius']*scale,geometry_source='point_patch_circle')
                             row['circle_scale'] = scale
                             state.update(angle=angle,scale=scale)
+                        elif int(row['valid']):
+                            row.update(correction_dx=float(row['x']-center[0]),correction_dy=float(row['y']-center[1]),
+                                       geometry_source='center_only')
                     elif state['estimator'] is not None:
                         row = state['estimator'].invalid_result(box,int(frame_id-state['reference_frame']),'point_invisible')
                     duration = time.perf_counter()-clock
@@ -440,6 +505,8 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                         gap_processing=gap_reports[i],
                         validity_semantics='fit_valid/rotation_fit_valid preserve native measurements; valid/rotation_valid are independently usable after explicitly flagged gap interpolation; filled fit-quality fields are blank',
                         point_end_frame=policy['point_end_frames'][str(i)])
+                    if method=='patch_hybrid' and states[i]['estimator'] is not None:
+                        point_metadata['shared_patch_tracker']=states[i]['estimator'].tracker.provenance()
                     require_no_output_references(point_metadata)
                     write_json(folder/'pose.json',point_metadata)
                     for filename in ('pose.csv','pose.raw.csv','pose.json'):

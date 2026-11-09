@@ -1,4 +1,4 @@
-"""Responsive point-circle pose refinement using the shared correlation workflow."""
+"""Responsive point-circle pose refinement using shared patch/geometric tools."""
 from copy import deepcopy
 from pathlib import Path
 import queue
@@ -53,8 +53,12 @@ METHOD_FIELDS = (
     ('search_radius', 'Center search hard cap (source px)', float, 64.),
     ('search_trigger', 'Center search trigger NCC', float, .75),
     ('search_top_k', 'Center search candidate count', int, 3),
+    ('search_shapes', 'Joint shape bank budget (1–729)', int, 81),
     ('center_trust', 'Center search prediction trust', float, .5),
     ('search_interval', 'Center search interval (frames)', int, 5),
+    ('motion_sigma', 'Motion acceptance sigma', float, 4.),
+    ('motion_noise_px', 'Motion noise floor (source px)', float, 1.),
+    ('motion_memory_seconds', 'Motion prediction memory (source seconds)', float, .1),
 )
 
 
@@ -94,10 +98,14 @@ def parse_options(values):
             raise ValueError(f'{label} must be {"an integer" if kind is int else "a number"}') from error
     config.fast = bool(values.get('fast', True))
     config.validate()
-    method_options = {'use_recent':values.get('use_recent', True), 'center_search':values.get('center_search', False)}
+    method_options = {'use_recent':values.get('use_recent', True), 'center_search':values.get('center_search', False),
+                      'motion_gate':values.get('motion_gate', True)}
     for name, label, kind, default in METHOD_FIELDS:
         try:
-            method_options[name] = kind(values.get(name, default))
+            value = values.get(name, default)
+            if isinstance(value, bool):
+                raise ValueError('numeric setting cannot be boolean')
+            method_options[name] = kind(value)
         except (ValueError, TypeError) as error:
             raise ValueError(f'{label} must be {"an integer" if kind is int else "a number"}') from error
     method_options = validate_method_options(method_options)
@@ -105,7 +113,7 @@ def parse_options(values):
                 gap_seconds=gap_seconds, gap_neighbors=gap_neighbors, method=method, method_options=method_options)
 
 
-_PRESET_BOOLEANS = ('fast', 'overlay', 'use_recent', 'center_search')
+_PRESET_BOOLEANS = ('fast', 'overlay', 'use_recent', 'center_search', 'motion_gate')
 _PRESET_FIELDS = {name for name, _, _ in FIELDS} | {name for name, _, _, _ in METHOD_FIELDS} | {
     'point_ids', 'radius', 'max_frames', 'gap_seconds', 'gap_neighbors', 'method', *_PRESET_BOOLEANS}
 
@@ -125,7 +133,7 @@ def normalize_pose_settings(value):
     settings = {name: getattr(config, name) for name, _, _ in FIELDS}
     settings.update({name: default for name, _, _, default in METHOD_FIELDS})
     settings.update(point_ids='', radius='', max_frames='', gap_seconds=.1, gap_neighbors=2,
-                    method=DEFAULT_METHOD, fast=True, overlay=True, use_recent=True, center_search=False)
+                    method=DEFAULT_METHOD, fast=True, overlay=True, use_recent=True, center_search=False, motion_gate=True)
     settings.update(supplied)
     for name in _PRESET_BOOLEANS:
         if type(settings[name]) is not bool:
@@ -192,7 +200,8 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
                               gap_seconds=tk.StringVar(value='.1'), gap_neighbors=tk.StringVar(value='2'),
                               method=tk.StringVar(value=methods.DEFAULT_METHOD),
                               fast=tk.BooleanVar(value=True), overlay=tk.BooleanVar(value=True), force=tk.BooleanVar(value=False),
-                              use_recent=tk.BooleanVar(value=True), center_search=tk.BooleanVar(value=False))
+                              use_recent=tk.BooleanVar(value=True), center_search=tk.BooleanVar(value=False),
+                              motion_gate=tk.BooleanVar(value=True))
         self.variables.update({name:tk.StringVar(value=str(default)) for name, _, _, default in METHOD_FIELDS})
         labels = getattr(methods, 'METHOD_LABELS', {})
         self.method_choices = {labels.get(name, name):name for name in methods.METHODS}
@@ -240,7 +249,7 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
             self.field(local, index//2, (index % 2)*2, label, self.variables[name])
         local.columnconfigure(1, weight=1); local.columnconfigure(3, weight=1)
         geometry = group('Geometric fitting and template references')
-        geometric_fields = [field for field in METHOD_FIELDS if not field[0].startswith('search_') and field[0] != 'center_trust']
+        geometric_fields = [field for field in METHOD_FIELDS if not field[0].startswith(('search_', 'motion_')) and field[0] != 'center_trust']
         for index, (name, label, _, _) in enumerate(geometric_fields):
             self.field(geometry, index//2, (index % 2)*2, label, self.variables[name])
         widget = ttk.Checkbutton(geometry, text='Use updated/recent templates', variable=self.variables['use_recent'])
@@ -250,11 +259,21 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
         search = group('Nearby center recovery')
         search_fields = [field for field in METHOD_FIELDS if field[0].startswith('search_') or field[0] == 'center_trust']
         for index, (name, label, _, _) in enumerate(search_fields):
-            self.field(search, index//2, (index % 2)*2, label, self.variables[name])
+            self.field(search, index//2, (index % 2)*2, label, self.variables[name], name=name)
         widget = ttk.Checkbutton(search, text='Search for a refined center', variable=self.variables['center_search'])
         widget.grid(row=(len(search_fields)+1)//2, column=0, columnspan=4, sticky='w', pady=4)
         self.controls.append(widget)
         search.columnconfigure(1, weight=1); search.columnconfigure(3, weight=1)
+        motion = group('Temporal motion acceptance')
+        motion_fields = [field for field in METHOD_FIELDS if field[0].startswith('motion_')]
+        for index, (name, label, _, _) in enumerate(motion_fields):
+            self.field(motion, index//2, (index % 2)*2, label, self.variables[name], name=name)
+        widget = ttk.Checkbutton(motion, text='Reject temporally inconsistent motion', variable=self.variables['motion_gate'])
+        widget.grid(row=(len(motion_fields)+1)//2, column=0, columnspan=4, sticky='w', pady=4)
+        self.controls.append(widget)
+        if hasattr(self.owner, 'parameter_tooltip'):
+            self.owner.parameter_tooltip(widget, 'motion_gate')
+        motion.columnconfigure(1, weight=1); motion.columnconfigure(3, weight=1)
         self.anchor_form = CollapsibleFrame(self, text='Original-anchor fusion (legacy)', expanded=False)
         for index, (name, label, _) in enumerate(ANCHOR_FIELDS):
             self.field(self.anchor_form.body, index//2, (index % 2)*2, label, self.variables[name])
@@ -287,8 +306,11 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
         self.controls.append(widget)
         return widget
 
-    def field(self, parent, row, column, label, variable):
-        ttk.Label(parent, text=label).grid(row=row, column=column, sticky='w', padx=(0, 8), pady=5)
+    def field(self, parent, row, column, label, variable, *, name=None):
+        caption = ttk.Label(parent, text=label)
+        caption.grid(row=row, column=column, sticky='w', padx=(0, 8), pady=5)
+        if name is not None and hasattr(self.owner, 'parameter_tooltip'):
+            self.owner.parameter_tooltip(caption, name)
         widget = ttk.Entry(parent, textvariable=variable, width=13)
         widget.grid(row=row, column=column+1, sticky='ew', padx=(0, 20), pady=5)
         self.controls.append(widget)
