@@ -6,6 +6,7 @@ import threading
 
 from .annotations import DisplayTransform, PointController, reference_path
 from .workflow import Cancelled
+from .overlay_settings import parse_render_settings
 
 
 def mask_preview(image_bgr, points, patches, color=None, alpha=.3):
@@ -92,22 +93,6 @@ def parse_settings(fields, values):
     return parsed
 
 
-def parse_render_settings(values):
-    """Parse view fields separately from the tracking frame limit."""
-    from .render_options import normalize_render_options
-    fps = float(values["overlay_fps"]) if str(values["overlay_fps"]).strip() else None
-    width = int(values["max_width"])
-    if fps is not None and (not math.isfinite(fps) or fps <= 0):
-        raise ValueError("Overlay FPS must be positive, or blank for source FPS")
-    if width < 1:
-        raise ValueError("Maximum width must be positive")
-    maximum = int(values["max_frames"]) if str(values["max_frames"]).strip() else None
-    options = normalize_render_options({"crf": int(values["crf"]), "preset": values["preset"],
-                                       "max_frames": maximum, "trails": values["trails"],
-                                       "trail_length": int(values["trail_length"])})
-    return fps, width, options
-
-
 class PointLabeler:
     def __init__(self, controller: PointController, processor=None, *, track=False,
                  overlay=False, overlay_fps=None, max_width=1280, root=None,
@@ -136,7 +121,7 @@ class PointLabeler:
         self.root.title("RGB annotation · points, patches and SAM masks")
         self.root.geometry("1360x950")
         self.root.protocol("WM_DELETE_WINDOW", self.close)
-        from .ui import configure_style
+        from .ui import configure_style, ScrollableFrame, CollapsibleFrame
         self.point_style = configure_style(self.root)
         from .patch_editor import PatchSession
         self.patch_session = PatchSession()
@@ -161,13 +146,14 @@ class PointLabeler:
         self.controls = []
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill="both", expand=True)
-        annotation_parent = self.annotation_frame = ttk.Frame(self.notebook)
-        self.review_frame = ttk.Frame(self.notebook)
-        self.pose_frame = ttk.Frame(self.notebook)
-        self.sam_frame = ttk.Frame(self.notebook)
-        self.mask_review_frame = ttk.Frame(self.notebook)
-        self.render_frame = ttk.Frame(self.notebook)
-        self.notebook.add(annotation_parent, text="Annotate points")
+        self.annotation_frame = ScrollableFrame(self.notebook)
+        annotation_parent = self.annotation_frame.body
+        self.review_frame = ScrollableFrame(self.notebook)
+        self.pose_frame = ScrollableFrame(self.notebook)
+        self.sam_frame = ScrollableFrame(self.notebook)
+        self.mask_review_frame = ScrollableFrame(self.notebook)
+        self.render_frame = ScrollableFrame(self.notebook)
+        self.notebook.add(self.annotation_frame, text="Annotate points")
         self.notebook.add(self.review_frame, text="Review tracks")
         self.notebook.add(self.pose_frame, text="Refine pose")
         self.notebook.add(self.sam_frame, text="SAM objects")
@@ -175,7 +161,7 @@ class PointLabeler:
         self.notebook.add(self.render_frame, text="Render settings")
         self.review = None
         self.mask_labeler = self.mask_review = self.pose_view = None
-        self._active_tab, self._changing_tab = str(annotation_parent), False
+        self._active_tab, self._changing_tab = str(self.annotation_frame), False
         self.notebook.bind("<<NotebookTabChanged>>", self.tab_changed)
         header = ttk.Frame(annotation_parent, padding=8)
         header.pack(fill="x")
@@ -192,7 +178,8 @@ class PointLabeler:
         self._button(toolbar, "Load saved", self.load_saved)
         self._button(toolbar, "Undo", self.undo)
         self._button(toolbar, "Clear", self.clear)
-        body = ttk.Frame(annotation_parent)
+        body = ttk.Frame(annotation_parent, height=420)
+        body.pack_propagate(False)
         self.canvas = tk.Canvas(body, background="#202020", highlightthickness=0)
         self.canvas.pack(side="left", fill="both", expand=True)
         side = ttk.Frame(body, padding=5)
@@ -220,7 +207,9 @@ class PointLabeler:
         self.setup_viewport(toolbar)
         footer = ttk.Frame(annotation_parent)
         footer.pack(side="bottom", fill="x")
-        tracker_bar = ttk.Frame(footer, padding=5)
+        tracker_group = CollapsibleFrame(footer, text="Tracker and motion")
+        tracker_group.pack(fill="x", padx=5, pady=3)
+        tracker_bar = ttk.Frame(tracker_group.body, padding=5)
         tracker_bar.pack(fill="x")
         from .backends import BACKENDS
         ttk.Label(tracker_bar, text="Tracker:").pack(side="left", padx=(0, 4))
@@ -243,8 +232,10 @@ class PointLabeler:
         self.controls.append(self.keyframe_entry)
         self.motion_apply = self._button(tracker_bar, "Apply", self.select_motion)
         self.settings_button = self._button(tracker_bar, "Settings…", self.open_settings)
-        ttk.Label(footer, textvariable=self.motion_status, padding=(5, 0), wraplength=1200).pack(fill="x")
-        view = ttk.Frame(footer, padding=5)
+        ttk.Label(tracker_group.body, textvariable=self.motion_status, padding=(5, 0), wraplength=1200).pack(fill="x")
+        appearance = CollapsibleFrame(footer, text="Patch mask appearance", expanded=False)
+        appearance.pack(fill="x", padx=5, pady=3)
+        view = ttk.Frame(appearance.body, padding=5)
         view.pack(fill="x")
         visible = ttk.Checkbutton(view, text="Show masks", variable=self.mask_visible_var, command=self.redraw)
         visible.pack(side="left");self.controls.append(visible)
@@ -255,7 +246,9 @@ class PointLabeler:
         opacity = ttk.Scale(view, from_=0, to=1, variable=self.mask_alpha_var, length=200,
                             command=lambda value: self.redraw())
         opacity.pack(side="left");self.controls.append(opacity)
-        options = ttk.Frame(footer, padding=5)
+        run_group = CollapsibleFrame(footer, text="Run options, batch and session settings", expanded=False)
+        run_group.pack(fill="x", padx=5, pady=3)
+        options = ttk.Frame(run_group.body, padding=5)
         options.pack(fill="x")
         for text, var, changed in (("Track after Save & next", self.track_var, "track"),
                                    ("Also save MP4 overlay (enables tracking)", self.overlay_var, "overlay")):
@@ -271,7 +264,7 @@ class PointLabeler:
         self._button(actions, "Skip / next", lambda: self.navigate(1))
         self.cancel_button = ttk.Button(actions, text="Cancel processing", command=self.cancel.set, state="disabled")
         self.cancel_button.pack(side="left", padx=3)
-        batch = ttk.Frame(footer, padding=5)
+        batch = ttk.Frame(run_group.body, padding=5)
         batch.pack(fill="x")
         for label, mode in (("Track all", "track"), ("Render all", "render"), ("Track + render all", "both")):
             self._button(batch, label, lambda chosen=mode: self.start_batch(chosen))
@@ -286,18 +279,21 @@ class PointLabeler:
 
     def build_render_tab(self):
         from .render_options import RENDER_PRESETS
+        from .ui import CollapsibleFrame
         ttk, tk = self.ttk, self.tk
-        parent = self.render_frame
+        parent = getattr(self.render_frame, 'body', self.render_frame)
         ttk.Label(parent, text="Overlay video settings", style="Point.Title.TLabel", padding=12).pack(anchor="w")
         ttk.Label(parent, text="These options apply to annotation overlays, batch rendering and corrected-track previews. "
                   "They never change tracking results or source frame IDs.", wraplength=1050, padding=(12, 0)).pack(anchor="w")
         self.render_variables = {}
-        timing = ttk.LabelFrame(parent, text="Output size and timing", padding=12)
-        timing.pack(fill="x", padx=12, pady=10)
-        compression = ttk.LabelFrame(parent, text="H.264 compression", padding=12)
-        compression.pack(fill="x", padx=12, pady=10)
-        trails = ttk.LabelFrame(parent, text="Point trails", padding=12)
-        trails.pack(fill="x", padx=12, pady=10)
+        def section(text, expanded=True):
+            group = CollapsibleFrame(parent, text=text, expanded=expanded)
+            group.pack(fill="x", padx=12, pady=6)
+            return group.body
+        timing = section("Output size and timing")
+        compression = section("H.264 compression", False)
+        trails = section("Point trails", False)
+        pose = section("Pose circles, rotation and labels")
         def entry(frame, row, name, label):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 20), pady=5)
             variable = tk.StringVar()
@@ -325,7 +321,21 @@ class PointLabeler:
         show.grid(row=0, column=0, columnspan=2, sticky="w", pady=5)
         self.controls.append(show)
         entry(trails, 1, "trail_length", "Trail length (frames, default 30)")
-        self._button(parent, "Apply render settings", self.apply_render_settings, side="top")
+        entry(pose, 0, "pose_line_width", "Circle / rotation line width (pixels, default 1)")
+        entry(pose, 1, "pose_alpha", "Circle / rotation opacity (0 < value ≤ 1, default 0.7)")
+        entry(pose, 2, "pose_font_scale", "Pose label font scale (default 0.4)")
+        for row, name, label in ((3, "pose_halo", "Dark outline around pose lines and labels"),
+                                  (4, "pose_labels", "Show pose labels")):
+            variable = tk.BooleanVar()
+            self.render_variables[name] = variable
+            widget = ttk.Checkbutton(pose, text=label, variable=variable)
+            widget.grid(row=row, column=0, columnspan=2, sticky="w", pady=4)
+            self.controls.append(widget)
+        actions = ttk.Frame(parent, padding=8)
+        actions.pack(fill="x")
+        self._button(actions, "Apply render settings", self.apply_render_settings)
+        self._button(actions, "Save overlay settings…", self.save_overlay_settings)
+        self._button(actions, "Load overlay settings…", self.load_overlay_settings)
         self.render_status = tk.StringVar()
         ttk.Label(parent, textvariable=self.render_status, wraplength=1050, padding=12).pack(anchor="w")
         self.sync_render_settings()
@@ -336,23 +346,51 @@ class PointLabeler:
         values = {**self.render_options, "overlay_fps": self.overlay_fps, "max_width": self.max_width}
         for name, variable in self.render_variables.items():
             value = values[name]
-            variable.set(value if name == "trails" else "" if value is None else str(value))
+            variable.set(value if name in ("trails", "pose_halo", "pose_labels") else "" if value is None else str(value))
         maximum = self.render_options["max_frames"]
         self.render_status.set(f"Applied: FPS {self.overlay_fps or 'source'}, width {self.max_width}, "
                                f"render limit {maximum if maximum is not None else 'all'}, "
                                f"CRF {self.render_options['crf']}, {self.render_options['preset']}. "
                                "Change fields and press Apply before rendering.")
 
-    def apply_render_settings(self):
+    def capture_render_settings(self):
+        """Validate the fields currently shown, including changes not yet applied."""
+        values = ({name:variable.get() for name, variable in self.render_variables.items()}
+                  if hasattr(self, 'render_variables') else
+                  dict(self.render_options, overlay_fps=self.overlay_fps, max_width=self.max_width))
+        fps, width, options = parse_render_settings(values)
+        return dict(kind='rgb_overlay_settings', schema_version=1,
+                    overlay_fps=fps, max_width=width, render_options=options)
+
+    def apply_render_settings(self, value=None):
         if self.controller.busy:
             raise ValueError("wait for processing to finish before changing render settings")
+        from .overlay_settings import normalize_overlay_settings
         # Review workers snapshot these settings when starting; do not alter them.
-        fps, width, options = parse_render_settings({name: variable.get() for name, variable in self.render_variables.items()})
-        self.overlay_fps, self.max_width, self.render_options = fps, width, options
+        value = self.capture_render_settings() if value is None else normalize_overlay_settings(value)
+        self.overlay_fps, self.max_width, self.render_options = value['overlay_fps'], value['max_width'], value['render_options']
         sam = getattr(self, "mask_labeler", None)
         if sam is not None:
-            sam.overlay_fps, sam.max_width = fps, width
+            sam.overlay_fps, sam.max_width = self.overlay_fps, self.max_width
         self.sync_render_settings()
+
+    def save_overlay_settings(self):
+        from .overlay_settings import save_overlay_settings
+        value = self.capture_render_settings()
+        path = self.files.asksaveasfilename(parent=self.root, title='Save overlay settings',
+            defaultextension='.json', initialfile='overlay-settings.json', filetypes=[('JSON settings', '*.json')])
+        if path:
+            save_overlay_settings(path, value)
+            self.render_status.set(f'Saved overlay settings to {path}.')
+
+    def load_overlay_settings(self):
+        from .overlay_settings import load_overlay_settings
+        if self.controller.busy:
+            raise ValueError('wait for processing to finish before changing render settings')
+        path = self.files.askopenfilename(parent=self.root, title='Load overlay settings', filetypes=[('JSON settings', '*.json')])
+        if path:
+            self.apply_render_settings(load_overlay_settings(path))
+            self.render_status.set(f'Loaded overlay settings from {path}.')
 
     def tab_changed(self, event=None):
         if self._changing_tab:
@@ -382,7 +420,7 @@ class PointLabeler:
         if selected == str(self.review_frame) and self.review is None:
             try:
                 from .review_gui import TrackReview
-                review = TrackReview(self.review_frame, self)
+                review = TrackReview(getattr(self.review_frame, 'body', self.review_frame), self)
                 review.pack(fill="both", expand=True)
                 self.review = review
             except Exception as error:
@@ -395,7 +433,7 @@ class PointLabeler:
         try:
             if selected == str(getattr(self, "pose_frame", None)) and self.pose_view is None:
                 from .pose_gui import PoseRefinementTab
-                self.pose_view = PoseRefinementTab(self.pose_frame, self)
+                self.pose_view = PoseRefinementTab(getattr(self.pose_frame, 'body', self.pose_frame), self)
                 self.pose_view.pack(fill="both", expand=True)
             elif selected == str(getattr(self, "sam_frame", None)) and self.mask_labeler is None:
                 from video_annotation.mask_tracking.annotations import MaskController
@@ -408,11 +446,11 @@ class PointLabeler:
                 controller = MaskController(c.videos, c.default_frame, source_root=source_root)
                 if c.index:
                     controller.load(c.index)
-                self.mask_labeler = MaskLabeler(controller, processor, root=self.sam_frame, embedded=True,
+                self.mask_labeler = MaskLabeler(controller, processor, root=getattr(self.sam_frame, 'body', self.sam_frame), embedded=True,
                     overlay_fps=self.overlay_fps, max_width=self.max_width)
             elif selected == str(getattr(self, "mask_review_frame", None)) and self.mask_review is None:
                 from video_annotation.mask_tracking.review_gui import MaskTrackReview
-                self.mask_review = MaskTrackReview(self.mask_review_frame, owner=self,
+                self.mask_review = MaskTrackReview(getattr(self.mask_review_frame, 'body', self.mask_review_frame), owner=self,
                     status_callback=self.status.set, patch_session=self.patch_session)
                 self.mask_review.pack(fill="both", expand=True)
         except Exception as error:
@@ -656,13 +694,14 @@ class PointLabeler:
             raise ValueError("wait for processing to finish before saving settings")
         self.select_motion(announce=False)
         from .session import settings_snapshot, save_settings
-        value = settings_snapshot(self.processor, overlay_fps=self.overlay_fps, max_width=self.max_width,
+        rendering = self.capture_render_settings()
+        value = settings_snapshot(self.processor, overlay_fps=rendering['overlay_fps'], max_width=rendering['max_width'],
                                   source_dir=getattr(self.controller, "source_dir", None),
                                   recursive=getattr(self.controller, "recursive", True),
                                   frame=getattr(self.controller, "default_frame", 0),
                                   mask_color=self.mask_color_var.get(), mask_alpha=self.mask_alpha_var.get(),
                                   mask_visible=self.mask_visible_var.get(),
-                                  render_options=getattr(self, "render_options", None))
+                                  render_options=rendering['render_options'])
         path = self.files.asksaveasfilename(parent=self.root, title="Save point tracking settings",
                                            defaultextension=".json", filetypes=(("JSON", "*.json"),))
         if path:

@@ -2,6 +2,7 @@
 from copy import deepcopy
 from pathlib import Path
 import queue
+import json
 import re
 import subprocess
 import sys
@@ -104,6 +105,53 @@ def parse_options(values):
                 gap_seconds=gap_seconds, gap_neighbors=gap_neighbors, method=method, method_options=method_options)
 
 
+_PRESET_BOOLEANS = ('fast', 'overlay', 'use_recent', 'center_search')
+_PRESET_FIELDS = {name for name, _, _ in FIELDS} | {name for name, _, _, _ in METHOD_FIELDS} | {
+    'point_ids', 'radius', 'max_frames', 'gap_seconds', 'gap_neighbors', 'method', *_PRESET_BOOLEANS}
+
+
+def normalize_pose_settings(value):
+    """Validate a portable preset completely before applying GUI state."""
+    from video_annotation.pose.registration import Config
+    from video_annotation.pose.methods import DEFAULT_METHOD
+    from .overlay_settings import normalize_overlay_settings
+    if (not isinstance(value, dict) or value.get('kind') != 'rgb_pose_refinement_settings'
+            or type(value.get('schema_version')) is not int or value.get('schema_version') != 1 or set(value)-{'kind', 'schema_version', 'refinement', 'render'}):
+        raise ValueError('Expected refinement settings JSON (rgb_pose_refinement_settings, schema 1)')
+    supplied = value.get('refinement')
+    if not isinstance(supplied, dict) or set(supplied)-_PRESET_FIELDS:
+        raise ValueError('Unknown refinement setting or invalid refinement object')
+    config = Config()
+    settings = {name: getattr(config, name) for name, _, _ in FIELDS}
+    settings.update({name: default for name, _, _, default in METHOD_FIELDS})
+    settings.update(point_ids='', radius='', max_frames='', gap_seconds=.1, gap_neighbors=2,
+                    method=DEFAULT_METHOD, fast=True, overlay=True, use_recent=True, center_search=False)
+    settings.update(supplied)
+    for name in _PRESET_BOOLEANS:
+        if type(settings[name]) is not bool:
+            raise ValueError(name+' must be boolean')
+    # Validate even hidden legacy fields so a preset never restores bad text.
+    parse_options({**settings, 'method':'anchored'})
+    parsed = parse_options(settings)
+    for name, label, kind in FIELDS:
+        if isinstance(settings[name], bool):
+            raise ValueError(label+' must be numeric')
+        settings[name] = kind(settings[name])
+    settings.update(parsed['method_options'])
+    settings.update(point_ids='' if parsed['point_ids'] is None else ', '.join(map(str, parsed['point_ids'])),
+                    radius='' if parsed['radius'] is None else parsed['radius'],
+                    max_frames='' if parsed['max_frames'] is None else parsed['max_frames'],
+                    gap_seconds=parsed['gap_seconds'], gap_neighbors=parsed['gap_neighbors'])
+    return dict(kind='rgb_pose_refinement_settings', schema_version=1,
+                refinement=settings, render=normalize_overlay_settings(value.get('render')))
+
+
+def pose_settings_snapshot(values, rendering):
+    """Export parameters only; source paths and force-recompute are transient."""
+    return normalize_pose_settings(dict(kind='rgb_pose_refinement_settings', schema_version=1,
+        refinement={name: setting for name, setting in values.items() if name in _PRESET_FIELDS}, render=rendering))
+
+
 def timing_text(result):
     """Display measured workflow timings without guessing missing measurements."""
     timing = result.get('timing', {})
@@ -150,26 +198,36 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
         self.method_choices = {labels.get(name, name):name for name in methods.METHODS}
         self.method_label = tk.StringVar(value=labels.get(methods.DEFAULT_METHOD, methods.DEFAULT_METHOD))
 
+        from .ui import CollapsibleFrame
         ttk.Label(self, text='Point / patch pose refinement', style='Point.Title.TLabel').pack(anchor='w', pady=(0, 6))
-        ttk.Label(self, text='Refine saved point patches with correlation or geometric registration. Saved per-point radii and masks define support; only a radius override changes it.',
-                  wraplength=1100).pack(anchor='w')
-        source = ttk.Frame(self); source.pack(fill='x', pady=9)
+        inputs = ttk.LabelFrame(self, text='Input and method', padding=10)
+        inputs.pack(fill='x', pady=6)
+        source = ttk.Frame(inputs); source.pack(fill='x', pady=4)
         ttk.Label(source, text='Point CSV:').pack(side='left')
         entry = ttk.Entry(source, textvariable=self.tracks_var)
         entry.pack(side='left', fill='x', expand=True, padx=6); self.controls.append(entry)
         self.button(source, 'Use current tracks', self.use_current_tracks)
         self.button(source, 'Browse…', self.browse)
-
-        method_row = ttk.Frame(self); method_row.pack(fill='x', pady=5)
+        method_row = ttk.Frame(inputs); method_row.pack(fill='x', pady=5)
         ttk.Label(method_row, text='Pose method:').pack(side='left')
         self.method_selector = ttk.Combobox(method_row, textvariable=self.method_label,
             values=tuple(self.method_choices), state='readonly', width=48)
         self.method_selector.pack(side='left', padx=7)
         self.method_selector.bind('<<ComboboxSelected>>', lambda event: self.action(self.select_method))
         self.controls.append(self.method_selector)
-
-        form = ttk.LabelFrame(self, text='Refinement settings', padding=10)
-        form.pack(fill='x', pady=6)
+        presets = ttk.Frame(self); presets.pack(fill='x', pady=6)
+        self.button(presets, 'Save settings…', self.save_settings)
+        self.button(presets, 'Load settings…', self.load_settings)
+        self.button(presets, 'Overlay settings', self.show_overlay_settings)
+        ttk.Label(self, text='Presets include refinement and overlay settings. Saved circles/masks define patch support.',
+                  wraplength=1000).pack(anchor='w', pady=3)
+        self.groups = []
+        def group(title, expanded=False):
+            section = CollapsibleFrame(self, text=title, expanded=expanded)
+            section.pack(fill='x', pady=5)
+            self.groups.append(section)
+            return section.body
+        form = group('Points and gap filling', True)
         basics = [('point_ids', 'Point IDs (blank = all)'), ('radius', 'Patch radius override (px; blank = saved)'),
                   ('max_frames', 'Maximum source frames (blank = all)'),
                   ('gap_seconds', 'Fill gaps up to (source seconds; 0 = off)'),
@@ -177,55 +235,55 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
         for index, (name, label) in enumerate(basics):
             self.field(form, index//2, (index % 2)*2, label, self.variables[name])
         form.columnconfigure(1, weight=1); form.columnconfigure(3, weight=1)
-        self.anchor_form = ttk.LabelFrame(self, text='Original-anchor fusion (anchored method only)', padding=10)
-        for index, (name, label, _) in enumerate(ANCHOR_FIELDS):
-            self.field(self.anchor_form, index//2, (index % 2)*2, label, self.variables[name])
-        self.anchor_form.columnconfigure(1, weight=1); self.anchor_form.columnconfigure(3, weight=1)
-        advanced = ttk.LabelFrame(self, text='Local fitting and smoothness', padding=10)
+        local = group('Correlation fitting and smoothness')
         for index, (name, label, _) in enumerate(LOCAL_FIELDS):
-            self.field(advanced, index//2, (index % 2)*2, label, self.variables[name])
-        for index, (name, label, _, _) in enumerate(METHOD_FIELDS):
-            self.field(advanced, 5+index//2, (index % 2)*2, label, self.variables[name])
-        widget = ttk.Checkbutton(advanced, text='Use updated/recent templates',
-                                 variable=self.variables['use_recent'])
-        widget.grid(row=5+(len(METHOD_FIELDS)+1)//2, column=0, columnspan=4, sticky='w', pady=4)
+            self.field(local, index//2, (index % 2)*2, label, self.variables[name])
+        local.columnconfigure(1, weight=1); local.columnconfigure(3, weight=1)
+        geometry = group('Geometric fitting and template references')
+        geometric_fields = [field for field in METHOD_FIELDS if not field[0].startswith('search_') and field[0] != 'center_trust']
+        for index, (name, label, _, _) in enumerate(geometric_fields):
+            self.field(geometry, index//2, (index % 2)*2, label, self.variables[name])
+        widget = ttk.Checkbutton(geometry, text='Use updated/recent templates', variable=self.variables['use_recent'])
+        widget.grid(row=(len(geometric_fields)+1)//2, column=0, columnspan=4, sticky='w', pady=4)
         self.controls.append(widget)
-        widget = ttk.Checkbutton(advanced, text='Search for a refined center', variable=self.variables['center_search'])
-        widget.grid(row=6+(len(METHOD_FIELDS)+1)//2, column=0, columnspan=4, sticky='w', pady=4)
+        geometry.columnconfigure(1, weight=1); geometry.columnconfigure(3, weight=1)
+        search = group('Nearby center recovery')
+        search_fields = [field for field in METHOD_FIELDS if field[0].startswith('search_') or field[0] == 'center_trust']
+        for index, (name, label, _, _) in enumerate(search_fields):
+            self.field(search, index//2, (index % 2)*2, label, self.variables[name])
+        widget = ttk.Checkbutton(search, text='Search for a refined center', variable=self.variables['center_search'])
+        widget.grid(row=(len(search_fields)+1)//2, column=0, columnspan=4, sticky='w', pady=4)
         self.controls.append(widget)
-        advanced.columnconfigure(1, weight=1); advanced.columnconfigure(3, weight=1)
-        options = ttk.Frame(self); options.pack(fill='x', pady=7)
+        search.columnconfigure(1, weight=1); search.columnconfigure(3, weight=1)
+        self.anchor_form = CollapsibleFrame(self, text='Original-anchor fusion (legacy)', expanded=False)
+        for index, (name, label, _) in enumerate(ANCHOR_FIELDS):
+            self.field(self.anchor_form.body, index//2, (index % 2)*2, label, self.variables[name])
+        self.anchor_form.body.columnconfigure(1, weight=1); self.anchor_form.body.columnconfigure(3, weight=1)
+        options = ttk.LabelFrame(self, text='Run options', padding=8); options.pack(fill='x', pady=6)
         self.method_options_row = options
         for name, label in [('fast', 'Fast correlation fitting'), ('overlay', 'Render overlay after refinement'),
                             ('force', 'Force recompute')]:
             widget = ttk.Checkbutton(options, text=label, variable=self.variables[name])
             widget.pack(side='left', padx=(0, 14)); self.controls.append(widget)
-        advanced_visible = tk.BooleanVar(value=False)
-        def toggle_advanced():
-            if advanced_visible.get():
-                advanced.pack(fill='x', pady=6, before=options)
-            else:
-                advanced.pack_forget()
-        widget = ttk.Checkbutton(options, text='Advanced settings', variable=advanced_visible, command=toggle_advanced)
-        widget.pack(side='left'); self.controls.append(widget)
-        ttk.Label(self, text='Default: fast similarity correlation with guarded IC-LK homography. Resampling grid size is independent of annotated support radius. Overlays use final filled poses and Render settings.',
-                  wraplength=1100).pack(anchor='w', pady=5)
         actions = ttk.Frame(self); actions.pack(fill='x', pady=7)
-        self.button(actions, 'Run refinement', self.run)
-        self.button(actions, 'Render overlay', lambda: self.run(overlay=True))
+        self.button(actions, 'Run refinement', self.run, row=0, column=0)
+        self.button(actions, 'Render overlay', lambda: self.run(overlay=True), row=0, column=1)
         self.cancel_button = ttk.Button(actions, text='Cancel', command=self.cancel_processing, state='disabled')
-        self.cancel_button.pack(side='left', padx=4)
-        self.button(actions, 'Open refined-track folder', lambda: self.open_folder('tracks'))
-        self.button(actions, 'Open overlay folder', lambda: self.open_folder('overlay'))
-        ttk.Label(self, textvariable=self.timings, wraplength=1100, padding=(0, 10)).pack(anchor='w')
-        ttk.Label(self, textvariable=self.status, wraplength=1100).pack(anchor='w', pady=8)
+        self.cancel_button.grid(row=0, column=2, padx=4, pady=3, sticky='w')
+        self.button(actions, 'Open refined-track folder', lambda: self.open_folder('tracks'), row=1, column=0)
+        self.button(actions, 'Open overlay folder', lambda: self.open_folder('overlay'), row=1, column=1)
+        ttk.Label(self, textvariable=self.timings, wraplength=1000, padding=(0, 10)).pack(anchor='w')
+        ttk.Label(self, textvariable=self.status, wraplength=1000).pack(anchor='w', pady=8)
         self.sync_method_controls()
         self._poll_after = self.after(75, self.poll)
         self.bind('<Destroy>', lambda event: self.close() if event.widget is self else None, add='+')
 
-    def button(self, parent, text, command):
+    def button(self, parent, text, command, *, row=None, column=0):
         widget = ttk.Button(parent, text=text, command=lambda: self.action(command))
-        widget.pack(side='left', padx=3, pady=2)
+        if row is None:
+            widget.pack(side='left', padx=3, pady=2)
+        else:
+            widget.grid(row=row, column=column, padx=3, pady=3, sticky='w')
         self.controls.append(widget)
         return widget
 
@@ -297,6 +355,47 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
             initialdir=ROOT/'data/pseudo-ground-truths/point_tracks', filetypes=[('Point tracks', '*.csv')])
         if path:
             self.tracks_var.set(path)
+
+    def show_overlay_settings(self):
+        self.require_idle()
+        self.owner.notebook.select(self.owner.render_frame)
+
+    def save_settings(self, path=None):
+        self.require_idle()
+        value = pose_settings_snapshot({name: variable.get() for name, variable in self.variables.items()},
+                                       self.owner.capture_render_settings())
+        path = path or filedialog.asksaveasfilename(parent=self, title='Save refinement and overlay settings',
+            defaultextension='.json', filetypes=[('JSON settings', '*.json')])
+        if not path:
+            return
+        path = Path(path).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name+'.partial')
+        try:
+            temporary.write_text(json.dumps(value, indent=2, allow_nan=False)+'\n')
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        self.status.set(f'Saved refinement and overlay settings: {path}')
+        return path
+
+    def load_settings(self, path=None):
+        self.require_idle()
+        path = path or filedialog.askopenfilename(parent=self, title='Load refinement and overlay settings',
+                                                  filetypes=[('JSON settings', '*.json')])
+        if not path:
+            return
+        # Validate the complete document before changing any visible value.
+        value = normalize_pose_settings(json.loads(Path(path).expanduser().read_text()))
+        self.owner.apply_render_settings(value['render'])
+        for name, setting in value['refinement'].items():
+            self.variables[name].set(setting)
+        self.variables['force'].set(False)
+        from video_annotation.pose.methods import METHOD_LABELS
+        self.method_label.set(METHOD_LABELS[self.variables['method'].get()])
+        self.sync_method_controls()
+        self.status.set(f'Loaded refinement and overlay settings: {path}')
+        return value
 
     def run(self, *, overlay=None):
         self.require_idle()

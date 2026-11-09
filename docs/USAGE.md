@@ -122,7 +122,11 @@ IC-LK homography**. Source radii/masks follow saved annotations; the resampling
 grid does not change their physical size. **Render overlay** reuses that method's
 saved poses and shared circle/arrow renderer. The tab shows measured costs and
 opens the pose/overlay folders. Labels stay readable at the final preview size,
-with opaque dark backing and edge clamping. **Advanced settings** includes
+without background panels. **Render settings** offers pose line width, opacity,
+outline, labels and font scale (defaults1px/70%/no outline). Parameter groups
+fold, all tabs scroll, and video wheel zoom stays local. **Save/Load settings**
+in Refine pose includes both refinement and overlay settings; Render settings
+can also save/load an overlay-only preset. **Nearby center recovery** includes
 bounded center search (opt-in): search radius in source pixels,
 trigger NCC, candidate count, prediction trust and search interval. The CLI
 equivalents are `--search-radius`, `--search-trigger`, `--search-top-k`,

@@ -67,8 +67,8 @@ def _overlay_path(tracks, video, method):
     return ROOT/'outputs/videos/point_pose'/relative/('refined-'+method+'.mp4')
 
 
-def _draw(frame, rows, source_frame, *, source_size=None):
-    return draw_pose_overlay(frame,rows,source_frame,source_size=source_size)
+def _draw(frame, rows, source_frame, *, source_size=None, render_options=None):
+    return draw_pose_overlay(frame,rows,source_frame,source_size=source_size,render_options=render_options)
 
 
 def _invalid(reason):
@@ -110,7 +110,7 @@ def _render_saved_poses(paths, video, source, start, count, target, fps, max_wid
                 clock=time.perf_counter()
                 if (dw,dh)!=(source['width'],source['height']):
                     image=cv2.resize(image,(dw,dh),interpolation=cv2.INTER_AREA)
-                _draw(image,rows,frame,source_size=(source['width'],source['height']))
+                _draw(image,rows,frame,source_size=(source['width'],source['height']),render_options=options)
                 image=cv2.copyMakeBorder(image,0,size[1]-dh,0,size[0]-dw,cv2.BORDER_CONSTANT)
                 writer.write(image)
                 times['render_seconds']+=time.perf_counter()-clock
@@ -224,7 +224,7 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
     if output_dir.exists() and not old:
         raise ValueError('Existing point refinement directory has no manifest; choose a fresh directory')
     times['adaptation_seconds'] = time.perf_counter()-begin
-    overlay_signature = dict(renderer_version=3,input_signature=signature,fps=float(fps),max_width=max_width,render_options=options)
+    overlay_signature = dict(renderer_version=4,input_signature=signature,fps=float(fps),max_width=max_width,render_options=options)
     overlay_sidecar = overlay_target.with_suffix('.json') if overlay_target else None
     overlay_reused = bool(overlay_target and overlay_target.is_file() and overlay_sidecar.is_file() and
         json.loads(overlay_sidecar.read_text()).get('settings')==overlay_signature and
@@ -384,7 +384,7 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                 if writer is not None and (options['max_frames'] is None or index<options['max_frames']):
                     clock = time.perf_counter()
                     if (dw,dh)!=(w,h): image=cv2.resize(image,(dw,dh),interpolation=cv2.INTER_AREA)
-                    _draw(image,rows,int(frame_id),source_size=(w,h))
+                    _draw(image,rows,int(frame_id),source_size=(w,h),render_options=options)
                     image=cv2.copyMakeBorder(image,0,size[1]-dh,0,size[0]-dw,cv2.BORDER_CONSTANT)
                     writer.write(image)
                     times['render_seconds'] += time.perf_counter()-clock

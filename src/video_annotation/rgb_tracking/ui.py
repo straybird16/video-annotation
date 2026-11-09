@@ -2,6 +2,116 @@
 from pathlib import Path
 import re
 
+try:
+    import tkinter as tk
+    from tkinter import ttk
+except ImportError:
+    tk = ttk = None
+
+
+class ScrollableFrame(ttk.Frame if ttk is not None else object):
+    """A tab-sized viewport; image canvases and native text/list wheels stay local."""
+
+    def __init__(self, parent, **kwargs):
+        if ttk is None:
+            raise RuntimeError('Scrollable views require Tk')
+        super().__init__(parent, **kwargs)
+        self.canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0, background='#f4f6fa')
+        self.body = ttk.Frame(self.canvas)
+        self._window = self.canvas.create_window((0, 0), anchor='nw', window=self.body)
+        self.scrollbars = {'y':ttk.Scrollbar(self, orient='vertical', command=self.canvas.yview),
+                           'x':ttk.Scrollbar(self, orient='horizontal', command=self.canvas.xview)}
+        self.canvas.configure(yscrollcommand=self.scrollbars['y'].set, xscrollcommand=self.scrollbars['x'].set)
+        self.canvas.grid(row=0, column=0, sticky='nsew')
+        self.scrollbars['y'].grid(row=0, column=1, sticky='ns')
+        self.scrollbars['x'].grid(row=1, column=0, sticky='ew')
+        self.rowconfigure(0, weight=1); self.columnconfigure(0, weight=1)
+        self._pending = None
+        self._window_size = None
+        self.canvas.bind('<Configure>', self._schedule)
+        self.body.bind('<Configure>', self._schedule)
+        self._top = self.winfo_toplevel()
+        self._wheel_bindings = [(sequence, self._top.bind(sequence, self._wheel, add='+'))
+                                for sequence in ('<MouseWheel>', '<Button-4>', '<Button-5>')]
+        self.bind('<Destroy>', self._destroyed, add='+')
+
+    def _schedule(self, event=None):
+        if self._pending is None:
+            self._pending = self.after_idle(self._layout)
+
+    def _layout(self):
+        self._pending = None
+        width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
+        requested = (self.body.winfo_reqwidth(), self.body.winfo_reqheight())
+        size = (max(width, requested[0]), max(height, requested[1]))
+        if size != self._window_size:
+            self.canvas.itemconfigure(self._window, width=size[0], height=size[1])
+            self._window_size = size
+        self.canvas.configure(scrollregion=(0, 0, *size))
+        for axis, needed in (('x', requested[0] > width), ('y', requested[1] > height)):
+            self.scrollbars[axis].grid() if needed else self.scrollbars[axis].grid_remove()
+
+    def _wheel_target(self, widget):
+        if widget is self.canvas:
+            return True
+        while widget is not None and widget is not self.body:
+            if widget.winfo_class() in ('Canvas', 'Listbox', 'Text', 'Treeview', 'TCombobox', 'TSpinbox', 'TScrollbar'):
+                return False
+            widget = getattr(widget, 'master', None)
+        return widget is self.body
+
+    def _wheel(self, event):
+        if not self._wheel_target(event.widget):
+            return
+        view = self.canvas.xview if event.state & 1 else self.canvas.yview
+        if view() == (0., 1.):
+            return
+        delta = -1 if getattr(event, 'num', None) == 4 else 1 if getattr(event, 'num', None) == 5 else 0
+        if not delta and getattr(event, 'delta', 0):
+            delta = -int(event.delta/120) or (-1 if event.delta > 0 else 1)
+        if delta:
+            scroll = self.canvas.xview_scroll if event.state & 1 else self.canvas.yview_scroll
+            scroll(delta, 'units')
+            return 'break'
+
+    def _destroyed(self, event):
+        if event.widget is not self:
+            return
+        if self._pending is not None:
+            self.after_cancel(self._pending)
+        for sequence, identifier in self._wheel_bindings:
+            try:
+                self._top.unbind(sequence, identifier)
+            except tk.TclError:
+                pass
+        self._wheel_bindings.clear()
+
+
+class CollapsibleFrame(ttk.Frame if ttk is not None else object):
+    """An outlined section with a retained content frame and explicit state."""
+
+    def __init__(self, parent, *, text='', expanded=True, **kwargs):
+        if ttk is None:
+            raise RuntimeError('Collapsible views require Tk')
+        super().__init__(parent, **kwargs)
+        self.text = text
+        self.header = ttk.Button(self, command=self.toggle)
+        self.header.pack(fill='x')
+        self.body = ttk.Frame(self, padding=(10, 8))
+        self.expanded = None
+        self.set_expanded(expanded)
+
+    def set_expanded(self, expanded):
+        self.expanded = bool(expanded)
+        self.header.configure(text=f'{"▾" if self.expanded else "▸"}  {self.text}')
+        if self.expanded:
+            self.body.pack(fill='both', expand=True)
+        else:
+            self.body.pack_forget()
+
+    def toggle(self):
+        self.set_expanded(not self.expanded)
+
 
 def font_family(root):
     from tkinter import font

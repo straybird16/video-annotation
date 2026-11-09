@@ -12,9 +12,22 @@ is upward, matching the existing pose overlays. Unreliable rotations retain thei
 arrow. Lost or rejected points are hidden. Open-folder buttons locate the
 refined data and portable H.264 MP4. Render settings control FPS, width, CRF,
 encoding preset and preview frame limit; FPS changes only preview speed.
-Circle/arrow coordinates follow the resized image, while labels are drawn at
-the final video resolution: compact color-matched text with a thin dark outline and no background panel.
-Labels remain clamped at image edges and are not blurred by resizing.
+**Render settings → Pose circles, rotation and labels** controls line width,
+opacity, dark outline, label visibility and font scale. Defaults are1px,
+70% opacity and no dark outline; text has no background panel. Geometry and
+labels draw after resizing, so width/font settings use output pixels. Changing
+appearance rerenders saved poses without repeating estimation.
+
+Every tab has scrollbars; Shift+wheel scrolls horizontally over controls.
+Video wheel zoom and list/text scrolling remain local. Parameter groups can
+be expanded/collapsed without losing their values.
+
+**Save settings… / Load settings…** in this tab exports/restores refinement
+parameters together with the currently displayed overlay settings. No video
+paths or annotations are saved in the preset, and loading resets Force recompute
+to off. **Render settings** also has separate Save/Load overlay-settings buttons.
+Both validate the complete JSON before applying it. Save captures pending fields;
+use Apply render settings to commit overlay edits for subsequent jobs.
 
 CLI equivalent from the workspace root:
 

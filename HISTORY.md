@@ -2,6 +2,13 @@
 
 Newest entries first. See PROVENANCE.md for the original workspace history.
 
+- 2026-11-09 — Added scrollable notebook tabs, collapsible controls, a useful
+  annotation viewport and portable refinement/overlay presets. Pose markers
+  default to1px/70% opacity/no halo, with GUI appearance controls and rendering
+  cache isolation. Codex coordinator with resumed GUI/renderer workers;
+  109 focused checks and native five-frame GUI/preset/refinement smoke.
+  [Usage and settings](docs/POSE_REFINEMENT.md).
+
 - 2026-11-08 — Restored compact color-matched pose labels with a thin outline,
   removed solid background panels, and kept drawing after resizing. Bumped only
   the overlay cache version so saved fits can be rerendered without estimation.

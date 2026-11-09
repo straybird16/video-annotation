@@ -128,17 +128,21 @@ def dash_segments(points, slot=0, slots=1, *, closed=False, cycles=None):
     return segments
 
 
-def draw_tracks(frame, geometries, colors, *, width=2, arrow_colors=None, alpha=.75):
+def draw_tracks(frame, geometries, colors, *, width=2, arrow_colors=None, alpha=.75, halo_width=2):
     """Default track style: solid alone, complementary dashes for comparisons.
 
     Draw all halos before colors, then blend once so overlapping tracks remain visible.
     None entries reserve dash slots while a comparison track is unavailable.
+    ``halo_width`` adds pixels to the colored stroke; zero omits the black halo.
     """
     arrow_colors = colors if arrow_colors is None else arrow_colors
     if len(geometries) != len(colors) or len(geometries) != len(arrow_colors):
         raise ValueError('One color is required for each track.')
     if not np.isfinite(alpha) or not 0 < alpha <= 1:
         raise ValueError('Alpha must be in (0,1].')
+    if (isinstance(width, bool) or not isinstance(width, (int, np.integer)) or width < 1
+            or isinstance(halo_width, bool) or not isinstance(halo_width, (int, np.integer)) or halo_width < 0):
+        raise ValueError('Line width must be positive and halo width nonnegative integers.')
     layer = frame if alpha == 1 else frame.copy()
     paths = []
     for slot, (geometry, color, arrow_color) in enumerate(zip(geometries, colors, arrow_colors)):
@@ -150,7 +154,8 @@ def draw_tracks(frame, geometries, colors, *, width=2, arrow_colors=None, alpha=
         for path in geometry['arrow']:
             segments.extend(dash_segments(path, slot, len(geometries)))
         paths.append(([np.rint(path).astype(np.int32).reshape(-1, 1, 2) for path in segments], arrow_color))
-    for thickness, halo in ((width+2, True), (width, False)):
+    passes = ([(width+halo_width, True)] if halo_width else []) + [(width, False)]
+    for thickness, halo in passes:
         for segments, color in paths:
             cv2.polylines(layer, segments, False, (0, 0, 0) if halo else tuple(color),
                           thickness, cv2.LINE_AA)
