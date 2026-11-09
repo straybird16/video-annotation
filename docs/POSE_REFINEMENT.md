@@ -12,6 +12,9 @@ is upward, matching the existing pose overlays. Unreliable rotations retain thei
 arrow. Lost or rejected points are hidden. Open-folder buttons locate the
 refined data and portable H.264 MP4. Render settings control FPS, width, CRF,
 encoding preset and preview frame limit; FPS changes only preview speed.
+Circle/arrow coordinates follow the resized image, while labels are drawn at
+the final video resolution: outlined white text on an opaque dark backing,
+wrapped and clamped at image edges. Smaller previews keep readable labels.
 
 CLI equivalent from the workspace root:
 
@@ -42,8 +45,9 @@ managed derived pose folder, never the original point predictions/references.
 
 All six geometric choices now keep an immutable original and one validated
 recent appearance. Recent fitting uses the last accepted homography translated
-to the supplied point. The original is checked every10 source frames and when
-recent fitting fails; it wins when its NCC is within0.03 of recent on common
+to the supplied point. The original is checked every10 source frames and on the first
+recent failure. Repeated failures retry at that interval; a cheap original-NCC
+probe can trigger an earlier full fit when appearance returns; it wins when its NCC is within0.03 of recent on common
 visible pixels. A broader correlation search is rate-limited to once per10
 frames and uses original-sized support at the known point, independent of a
 possibly drifted scale/shear. This is bounded recovery, not a global detector.
@@ -68,11 +72,14 @@ path. If that fails, validated original/recent IC fitting can recover pose;
 only a rotation-reliable recovery reseeds features, inverse-mapped into the
 original coordinates. Flow never bridges a known hidden source frame.
 
-Plain `similarity` and explicit expensive `anchored` keep their prior policies.
-Turn off **Use recent validated template** or pass `--no-recent-template` for
-the preceding original-only geometric behavior. Changed policies have separate
-cache signatures: use a new output directory or **Force recompute** for existing
-geometric outputs. Disabling recent retains compatibility with old caches.
+Plain `similarity` and explicit expensive `anchored` retain their algorithms.
+Turn off **Use recent validated template** or pass `--no-recent-template` to
+freeze appearance updates at the original template, including correlation seeds.
+Native KLT still needs previous-frame optical flow and retains original feature
+coordinates; the opt-out disables its dense recent recovery bank. This strict
+original-appearance control differs from the earlier geometric-only opt-out.
+Changed policies/search settings have separate cache signatures: use a new
+output directory or **Force recompute** for existing results.
 
 Patch support is the saved source-pixel circle **intersected with its optional
 foreground mask**. Prediction-time supports are preferred, then the saved human
@@ -151,6 +158,43 @@ things. Native KLT's inlier ratio remains a separate geometric diagnostic; it
 is not compared with template NCC. Stricter foreground/geometry checks may
 reduce availability despite retaining a recent template. Verify overlays;
 neither passing a threshold nor interpolating a gap proves pose accuracy.
+
+Center search is opt-in (`--center-search` or the GUI checkbox). It permits bounded image-based center
+corrections near the supplied point; it does not modify the input point tracks.
+It compares the supplied center and a corrected constant-velocity hint, then
+searches only when foreground agreement is weak. The radius is
+`R * clip(2*(T/max(NCC,0.05)-1),0,1)`: with defaults, NCC0.75 uses no grid
+search, NCC0.60 uses32px and NCC0.50 or lower uses64px. Search is throttled to
+once per5 source frames; a good temporal hint is checked without that delay.
+Masked coarse NCC maps nominate up to3 peaks, native-resolution maps and a
+subpixel parabola refine them, and the selected method fits once. The original
+mask/circle and current warp define support; final solver/overlap gates remain.
+
+`center_trust` affects candidate ranking, not post-fit center averaging:
+`rank = NCC - 0.1*trust*(distance/R)^2`. Higher values favor the supplied track;
+at default0.5, a maximum-radius proposal pays0.05 NCC, the default gap between
+acceptance and template refresh. A replacement must improve rank by0.015.
+Search never blends a fitted warp with a point afterward. The radius caps
+translation proposals; the final local solver retains its normal center bound.
+A correct initial reference is required: nearby repeated textures and a
+confident wrong fit can still defeat this local recovery.
+The **Search for a refined center** checkbox and these advanced controls are
+also available from the CLI:
+
+| Control | Default / meaning |
+|---|---|
+| `--center-search` / `--no-center-search` | Enable / disable the wider center proposals; off by default. |
+| `--search-radius` |64 source pixels, hard cap on the search region. |
+| `--search-trigger` |0.75 foreground NCC threshold for triggering search. |
+| `--search-top-k` |3 candidate peaks to consider. |
+| `--center-trust` |0.5, trust in the supplied point prediction, in [0,1]. |
+| `--search-interval` |5 source frames between search attempts. |
+
+The radius uses source pixels, independent of preview width and the canonical
+resampling grid. Larger search regions/candidate counts can cost more and admit
+similar-looking distractors. The comparison showed gains for some methods but regressions for others,
+so wider search remains opt-in. Search candidates still need the fit/visibility
+checks; a high match score alone does not establish the correct object.
 
 The CLI also exposes sample budget, center weights and OpenCV threads
 (`video-annotate refine --help`). Fast fitting uses up to 2,500 foreground samples.
@@ -246,8 +290,8 @@ photometric agreement; native KLT inlier ratio/error/coverage are separate
 `reference_kind`, reference age/overlap, original/recent NCC, original-check,
 template-refresh, recovery and reseed flags audit each decision. Scores are
 not probabilities. Existing rotation-validity gates remain separate from pose
-availability. The new policy requires explicit NCC/overlap gates; the preceding
-original-only baseline is available with the opt-out. Neither is verified GT.
+availability. The new policy requires explicit NCC/overlap gates; the strict
+original-appearance control is available with the opt-out. Neither is verified GT.
 
 Rows retain absolute source frames/IDs and nominal source-video timestamps.
 `pose.raw.csv` preserves every measured fit/rejection; `pose.csv` contains the

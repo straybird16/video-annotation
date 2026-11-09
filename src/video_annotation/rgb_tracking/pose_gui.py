@@ -49,6 +49,11 @@ METHOD_FIELDS = (
     ('template_min_overlap', 'Geometric template min. overlap', float, .6),
     ('template_update_score', 'Geometric template update NCC', float, .75),
     ('original_check_interval', 'Geometric original check (frames)', int, 10),
+    ('search_radius', 'Center search hard cap (source px)', float, 64.),
+    ('search_trigger', 'Center search trigger NCC', float, .75),
+    ('search_top_k', 'Center search candidate count', int, 3),
+    ('center_trust', 'Center search prediction trust', float, .5),
+    ('search_interval', 'Center search interval (frames)', int, 5),
 )
 
 
@@ -88,7 +93,7 @@ def parse_options(values):
             raise ValueError(f'{label} must be {"an integer" if kind is int else "a number"}') from error
     config.fast = bool(values.get('fast', True))
     config.validate()
-    method_options = {'use_recent':values.get('use_recent', True)}
+    method_options = {'use_recent':values.get('use_recent', True), 'center_search':values.get('center_search', False)}
     for name, label, kind, default in METHOD_FIELDS:
         try:
             method_options[name] = kind(values.get(name, default))
@@ -139,7 +144,7 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
                               gap_seconds=tk.StringVar(value='.1'), gap_neighbors=tk.StringVar(value='2'),
                               method=tk.StringVar(value=methods.DEFAULT_METHOD),
                               fast=tk.BooleanVar(value=True), overlay=tk.BooleanVar(value=True), force=tk.BooleanVar(value=False),
-                              use_recent=tk.BooleanVar(value=True))
+                              use_recent=tk.BooleanVar(value=True), center_search=tk.BooleanVar(value=False))
         self.variables.update({name:tk.StringVar(value=str(default)) for name, _, _, default in METHOD_FIELDS})
         labels = getattr(methods, 'METHOD_LABELS', {})
         self.method_choices = {labels.get(name, name):name for name in methods.METHODS}
@@ -181,9 +186,12 @@ class PoseRefinementTab(ttk.Frame if ttk is not None else object):
             self.field(advanced, index//2, (index % 2)*2, label, self.variables[name])
         for index, (name, label, _, _) in enumerate(METHOD_FIELDS):
             self.field(advanced, 5+index//2, (index % 2)*2, label, self.variables[name])
-        widget = ttk.Checkbutton(advanced, text='Use recent validated template (geometric methods only)',
+        widget = ttk.Checkbutton(advanced, text='Use updated/recent templates',
                                  variable=self.variables['use_recent'])
         widget.grid(row=5+(len(METHOD_FIELDS)+1)//2, column=0, columnspan=4, sticky='w', pady=4)
+        self.controls.append(widget)
+        widget = ttk.Checkbutton(advanced, text='Search for a refined center', variable=self.variables['center_search'])
+        widget.grid(row=6+(len(METHOD_FIELDS)+1)//2, column=0, columnspan=4, sticky='w', pady=4)
         self.controls.append(widget)
         advanced.columnconfigure(1, weight=1); advanced.columnconfigure(3, weight=1)
         options = ttk.Frame(self); options.pack(fill='x', pady=7)

@@ -31,6 +31,8 @@ from .anchored import FUSION_FIELDS
 from .methods import (METHODS, DEFAULT_METHOD, METHOD_LABELS, METHOD_FIELDS, create_estimator,
                       method_options as normalize_method_options, row_matrix, attach_matrix,
                       RECENT_DEFAULTS, GEOMETRIC_METHODS)
+from .search import CenterSearch
+from .overlay import draw_pose_overlay
 from .gaps import finalize_pose_csv, validate_gap_options
 
 FIELDS = ('frame','timestamp_us','x','y','rotation_degrees','rotation_unwrapped_degrees',
@@ -65,26 +67,8 @@ def _overlay_path(tracks, video, method):
     return ROOT/'outputs/videos/point_pose'/relative/('refined-'+method+'.mp4')
 
 
-def _draw(frame, rows, source_frame):
-    layer = frame.copy()
-    colors = ((0,220,255),(255,180,0),(80,255,80),(255,80,255),(80,150,255))
-    for identity,row in rows.items():
-        if not int(row.get('valid') or 0):
-            continue
-        angle = float(row['rotation_degrees']) if int(row.get('rotation_valid') or 0) else None
-        geometry = circle_geometry([float(row['circle_x']),float(row['circle_y'])],float(row['circle_radius']),
-                                   None if angle is None else angle-90.)
-        color = colors[identity%len(colors)]
-        draw_tracks(layer,[geometry],[color],alpha=1.)
-        x,y = np.rint([float(row['x']),float(row['y'])]).astype(int)
-        label = (f'{identity}: {angle:.1f} deg x{float(row["scale"]):.2f}' if angle is not None
-                 else f'{identity}: rotation unavailable ({row.get("rotation_reason","unreliable")})')
-        if int(row.get('center_scale_interpolated') or 0) or int(row.get('rotation_interpolated') or 0):
-            label += ' [interpolated]'
-        cv2.putText(layer,label,(max(0,x+5),max(15,y-8)),cv2.FONT_HERSHEY_SIMPLEX,.4,color,1,cv2.LINE_AA)
-    cv2.addWeighted(layer,.75,frame,.25,0,frame)
-    cv2.putText(frame,f'Source frame {source_frame}',(8,22),cv2.FONT_HERSHEY_SIMPLEX,.5,(255,255,255),1,cv2.LINE_AA)
-    return frame
+def _draw(frame, rows, source_frame, *, source_size=None):
+    return draw_pose_overlay(frame,rows,source_frame,source_size=source_size)
 
 
 def _invalid(reason):
@@ -124,9 +108,9 @@ def _render_saved_poses(paths, video, source, start, count, target, fps, max_wid
                     if row is not None and int(row['frame'])==frame:
                         rows[identity]=row;pending[identity]=next(reader,None)
                 clock=time.perf_counter()
-                _draw(image,rows,frame)
                 if (dw,dh)!=(source['width'],source['height']):
                     image=cv2.resize(image,(dw,dh),interpolation=cv2.INTER_AREA)
+                _draw(image,rows,frame,source_size=(source['width'],source['height']))
                 image=cv2.copyMakeBorder(image,0,size[1]-dh,0,size[0]-dw,cv2.BORDER_CONSTANT)
                 writer.write(image)
                 times['render_seconds']+=time.perf_counter()-clock
@@ -216,10 +200,16 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
     recent_policy=method in GEOMETRIC_METHODS and method_options['use_recent']
     signature_options={k:v for k,v in method_options.items() if not k.startswith('klt_') and k not in RECENT_DEFAULTS}
     if recent_policy:signature_options.update({k:method_options[k] for k in RECENT_DEFAULTS})
+    signature_options['use_recent']=method_options['use_recent']
+    # Search uses foreground gates even with the legacy/original-only adapter.
+    # Default values preserve this version's signatures; overrides must refit.
+    if method_options['center_search'] and not recent_policy:
+        for key in ('geometric_min_score','template_min_overlap','template_update_score'):
+            if method_options[key]!=RECENT_DEFAULTS[key]:signature_options[key]=method_options[key]
     if method=='klt_ransac':
         for key,default in dict(klt_max_points=200,klt_min_distance=4.,klt_window=21).items():
             if method_options[key]!=default:signature_options[key]=method_options[key]
-    signature = hashlib.sha256(json.dumps(dict(version=4 if recent_policy else 3,method=method,method_options=signature_options,gap_seconds=gap_seconds,gap_neighbors=gap_neighbors,tracks=file_digest(tracks),
+    signature = hashlib.sha256(json.dumps(dict(version=5,method=method,method_options=signature_options,gap_seconds=gap_seconds,gap_neighbors=gap_neighbors,tracks=file_digest(tracks),
         metadata=file_digest(tracks.with_suffix('.json')),source=[video.stat().st_size,video.stat().st_mtime_ns],
         point_ids=selected,config=asdict(cfg),frames=count,
         supports={str(i):dict(radius=s['radius'],query=None if s['query'] is None else s['query'].tolist(),
@@ -234,7 +224,7 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
     if output_dir.exists() and not old:
         raise ValueError('Existing point refinement directory has no manifest; choose a fresh directory')
     times['adaptation_seconds'] = time.perf_counter()-begin
-    overlay_signature = dict(input_signature=signature,fps=float(fps),max_width=max_width,render_options=options)
+    overlay_signature = dict(renderer_version=2,input_signature=signature,fps=float(fps),max_width=max_width,render_options=options)
     overlay_sidecar = overlay_target.with_suffix('.json') if overlay_target else None
     overlay_reused = bool(overlay_target and overlay_target.is_file() and overlay_sidecar.is_file() and
         json.loads(overlay_sidecar.read_text()).get('settings')==overlay_signature and
@@ -277,7 +267,7 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                 writers[i] = csv.DictWriter(stack.enter_context((folder/'pose.raw.csv').open('w',newline='')),
                                             fieldnames=FIELDS,extrasaction='ignore')
                 writers[i].writeheader()
-                states[i] = dict(estimator=None,reference_frame=None,angle=0.,scale=1.,offset=np.zeros(2),reference_query=None,reference_center=None,H=None,initial_mask=None,model='similarity')
+                states[i] = dict(estimator=None,reference_frame=None,angle=0.,scale=1.,offset=np.zeros(2),reference_query=None,reference_center=None,H=None,initial_mask=None,model='similarity',search=None)
             w,h = source['width'],source['height']
             ratio = min(1.,max_width/w)
             dw,dh = max(1,round(w*ratio)),max(1,round(h*ratio))
@@ -331,9 +321,21 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                                              offset=np.asarray(center)-estimator.center,reference_query=np.asarray(center).copy(),
                                              reference_center=estimator.center.copy(),
                                              initial_mask=None if mask is None else np.asarray(mask,np.uint8).copy())
+                                estimator.reference_query=np.asarray(center).copy()
+                                if method_options['center_search']:
+                                    state['search']=CenterSearch(estimator,gray,center,method_options)
                                 row = estimator.initial_result()
                         else:
-                            row = state['estimator'].estimate(gray,box,int(frame_id-state['reference_frame']),mask=mask)
+                            local_frame=int(frame_id-state['reference_frame'])
+                            audit={}
+                            if state['search'] is not None:
+                                proposed,audit=state['search'].propose(state['estimator'],gray,box,local_frame)
+                                if mask is not None:
+                                    move=np.float32([[1,0,proposed[0]-box[0]],[0,1,proposed[1]-box[1]]])
+                                    mask=cv2.warpAffine(mask,move,(w,h),flags=cv2.INTER_NEAREST)
+                                box=proposed
+                            row = state['estimator'].estimate(gray,box,local_frame,mask=mask)
+                            row.update(audit)
                         if int(row['valid']):
                             fitted = np.array([row['x'],row['y']],float)
                             scale = float(row['similarity_scale'])
@@ -351,6 +353,8 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                                 angle=float((unwrapped+180)%360-180)
                                 row.update(scale=float(scale),similarity_scale=float(scale),rotation_degrees=angle,
                                            rotation_unwrapped_degrees=unwrapped)
+                            if state['search'] is not None:
+                                state['search'].observe(state['estimator'],gray,H,int(frame_id-state['reference_frame']),accepted=True,refresh=bool(row.get('rotation_valid')))
                             state['H']=H
                             state['model']=row.get('pose_model','similarity')
                             row.update(mask_registration_center_x=float(fitted[0]),mask_registration_center_y=float(fitted[1]),
@@ -379,8 +383,8 @@ def refine_point_tracks(tracks, *, output_dir=None, point_ids=None, config=None,
                     valid_total += int(row['valid'])
                 if writer is not None and (options['max_frames'] is None or index<options['max_frames']):
                     clock = time.perf_counter()
-                    _draw(image,rows,int(frame_id))
                     if (dw,dh)!=(w,h): image=cv2.resize(image,(dw,dh),interpolation=cv2.INTER_AREA)
+                    _draw(image,rows,int(frame_id),source_size=(w,h))
                     image=cv2.copyMakeBorder(image,0,size[1]-dh,0,size[0]-dw,cv2.BORDER_CONSTANT)
                     writer.write(image)
                     times['render_seconds'] += time.perf_counter()-clock

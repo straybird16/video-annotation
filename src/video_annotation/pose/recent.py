@@ -51,6 +51,7 @@ class RecentGeometricEstimator(GeometricEstimator):
         self.query_angle=0.
         self.sparse_frame=0
         self.search_recovery=None
+        self.loss_active=False
         self.solver=('inverse_compositional' if method in ('klt_ransac','similarity_ic_homography')
                      else 'ecc_homography' if method=='similarity_homography' else method)
 
@@ -182,7 +183,15 @@ class RecentGeometricEstimator(GeometricEstimator):
         seed=self._seed(box)
         candidate=self._sparse_candidate(gray,box,frame) if self.is_klt else None
         if candidate is None:candidate=self._fit(self.recent,gray,seed,box,'recent',frame)
-        checked=(frame-self.original_check_frame>=self.options['original_check_interval'] or candidate is None)
+        lost=candidate is None
+        # A failure gets one immediate original fit, then the configured retry
+        # cadence. Recent/KLT fitting still runs every source frame. Between
+        # retries, a cheap original NCC probe can request an immediate full fit
+        # when its appearance reappears; NCC never bypasses geometric fitting.
+        checked=(frame-self.original_check_frame>=self.options['original_check_interval'] or
+                 (lost and not self.loss_active))
+        if lost and not checked:
+            checked=self._measure(self.original,gray,seed,box) is not None
         original=self._original_fit(gray,seed,box,frame,allow_search=(candidate is None or
             candidate['score']<self.options['template_update_score'])) if checked else None
         if candidate is None and checked:candidate=self.search_recovery
@@ -193,6 +202,7 @@ class RecentGeometricEstimator(GeometricEstimator):
             original_checked=int(checked),recent_template_updated=0,recent_template_age_frames=frame-self.recent_frame,
             template_update_reason='no_accepted_fit',recovery_used=0,reseeded=0)
         if selected is None:
+            self.loss_active=True
             return dict(valid=0,reason='no_reliable_template_fit',rotation_valid=0,
                 rotation_reason='no_reliable_template_fit',template_updated=0,fit_mode='none',
                 pose_method=self.method,homography_valid=0,geometric_ms=1000*(time.perf_counter()-started),**audit)
@@ -258,6 +268,7 @@ class RecentGeometricEstimator(GeometricEstimator):
             source=selected['kind'],fit_mode='template_recovery' if recovery else 'recent_geometric',
             **quality,**rotation,**audit)
         self.H=H.copy();self.accepted_frame=frame;self.angle=angle;self.query_angle=query_angle
+        self.loss_active=False
         self._boxes(row,box,H)
         row['geometric_ms']=1000*(time.perf_counter()-started)
         return attach_matrix(row,H,self.method,'affine' if self.method=='ecc_affine' else 'homography')

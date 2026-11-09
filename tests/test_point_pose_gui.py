@@ -42,6 +42,14 @@ class PointPoseGuiTests(unittest.TestCase):
         self.assertEqual(result['method'], 'similarity_ic_homography')
         self.assertEqual(result['method_options'], method_options())
         self.assertIs(result['method_options']['use_recent'], True)
+        self.assertIs(result['method_options']['center_search'], False)
+        self.assertEqual(tuple(result['method_options'][key] for key in ('search_radius','search_trigger',
+            'search_top_k','center_trust','search_interval')), (64., .75, 3, .5, 5))
+        search = parse_options(dict(values(), center_search=False, search_radius='32', search_trigger='.6',
+            search_top_k='2', center_trust='.25', search_interval='7'))['method_options']
+        self.assertIs(search['center_search'], False)
+        self.assertEqual(tuple(search[key] for key in ('search_radius','search_trigger',
+            'search_top_k','center_trust','search_interval')), (32., .6, 2, .25, 7))
         self.assertEqual(tuple(result['method_options'][key] for key in ('geometric_min_score','original_score_slack',
             'template_min_overlap','template_update_score','original_check_interval')), (.70, .03, .6, .75, 10))
         recent = parse_options(dict(values(), use_recent=False, geometric_min_score='.65', original_score_slack='.04',
@@ -59,7 +67,8 @@ class PointPoseGuiTests(unittest.TestCase):
                        {'gap_neighbors':'1.5'}, {'method':'missing'},
                        {'ecc_iters':'0'}, {'ic_iters':'bad'}, {'ic_stride':'1.5'}, {'min_gain':'nan'},
                        {'klt_max_points':'7'}, {'klt_min_distance':'.5'}, {'klt_window':'2'}, {'klt_window':'4'},
-                       {'use_recent':'false'}, {'original_check_interval':'1.5'}):
+                       {'use_recent':'false'}, {'original_check_interval':'1.5'}, {'center_search':'false'},
+                       {'search_top_k':'1.5'}, {'center_trust':'1.1'}):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 parse_options(dict(values(), **change))
         with self.assertRaises(ValueError):
@@ -146,6 +155,8 @@ class PointPoseGuiTests(unittest.TestCase):
     def test_cli_forwards_anchor_recovery_and_gap_options_with_legacy_settings(self):
         from video_annotation.rgb_tracking.__main__ import parser, refine_command
         self.assertEqual(parser().parse_args(['refine', '--tracks', 'points.csv']).pose_method, 'similarity_ic_homography')
+        self.assertFalse(parser().parse_args(['refine','--tracks','points.csv']).center_search)
+        self.assertTrue(parser().parse_args(['refine','--tracks','points.csv','--center-search']).center_search)
         args = parser().parse_args(['refine', '--tracks', 'points.csv', '--pose-method', 'anchored', '--anchor-preference', '.7',
             '--anchor-score-delta', '.03', '--anchor-angle-tolerance', '12', '--anchor-scale-tolerance', '.2',
             '--recovery-scale-min', '.5', '--recovery-scale-max', '3', '--recovery-angle-step', '10',
@@ -153,7 +164,9 @@ class PointPoseGuiTests(unittest.TestCase):
             '--ecc-iters', '27', '--ic-iters', '11', '--ic-stride', '3', '--min-gain', '.01',
             '--klt-max-points', '80', '--klt-min-distance', '2.5', '--klt-window', '15',
             '--no-recent-template', '--geometric-min-score', '.65', '--original-score-slack', '.04',
-            '--template-min-overlap', '.7', '--template-update-score', '.8', '--original-check-interval', '5'])
+            '--template-min-overlap', '.7', '--template-update-score', '.8', '--original-check-interval', '5',
+            '--no-center-search', '--search-radius', '32', '--search-trigger', '.6', '--search-top-k', '2',
+            '--center-trust', '.25', '--search-interval', '7'])
         module = ModuleType('video_annotation.pose.workflow')
         module.refine_point_tracks = Mock(return_value={'output':'mock only'})
         with patch.dict('sys.modules', {'video_annotation.pose.workflow':module}), redirect_stdout(io.StringIO()):
@@ -169,7 +182,8 @@ class PointPoseGuiTests(unittest.TestCase):
         self.assertEqual(options['method'], 'anchored')
         self.assertEqual(options['method_options'], dict(method_options(), ecc_iters=27, ic_iters=11, ic_stride=3, min_gain=.01,
             klt_max_points=80, klt_min_distance=2.5, klt_window=15, use_recent=False, geometric_min_score=.65,
-            original_score_slack=.04, template_min_overlap=.7, template_update_score=.8, original_check_interval=5))
+            original_score_slack=.04, template_min_overlap=.7, template_update_score=.8, original_check_interval=5,
+            center_search=False, search_radius=32., search_trigger=.6, search_top_k=2, center_trust=.25, search_interval=7))
 
     def test_method_switch_hides_anchor_fields_and_retains_their_values(self):
         tab = PoseRefinementTab.__new__(PoseRefinementTab)

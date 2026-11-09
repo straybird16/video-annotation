@@ -121,7 +121,13 @@ legacy original-biased fusion. The default is **Fast correlation + guarded
 IC-LK homography**. Source radii/masks follow saved annotations; the resampling
 grid does not change their physical size. **Render overlay** reuses that method's
 saved poses and shared circle/arrow renderer. The tab shows measured costs and
-opens the pose/overlay folders. See [methods, settings and output definitions](POSE_REFINEMENT.md).
+opens the pose/overlay folders. Labels stay readable at the final preview size,
+with opaque dark backing and edge clamping. **Advanced settings** includes
+bounded center search (opt-in): search radius in source pixels,
+trigger NCC, candidate count, prediction trust and search interval. The CLI
+equivalents are `--search-radius`, `--search-trigger`, `--search-top-k`,
+`--center-trust`, `--search-interval`, and `--center-search` to enable it.
+See [methods, defaults and output definitions](POSE_REFINEMENT.md).
 
 ## SAM objects and masks
 

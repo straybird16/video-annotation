@@ -23,20 +23,23 @@ METHOD_FIELDS = ('pose_method','pose_model','homography_valid',*H_FIELDS,'candid
     'candidate_score','candidate_reason','geometric_ms','geometric_matches','geometric_inliers','fallback',
     'reference_kind','reference_age_frames','reference_ncc','reference_overlap','original_ncc','recent_ncc',
     'original_checked','recent_template_updated','recent_template_age_frames','template_update_reason',
-    'recovery_used','reseeded','geometric_inlier_ratio','geometric_fit_error','geometric_coverage','score_kind')
+    'recovery_used','reseeded','geometric_inlier_ratio','geometric_fit_error','geometric_coverage','score_kind',
+    'center_search_used','center_search_radius','center_search_ncc','center_search_dx','center_search_dy','center_search_ms')
 
 RECENT_DEFAULTS = dict(use_recent=True,geometric_min_score=.70,original_score_slack=.03,
     template_min_overlap=.6,template_update_score=.75,original_check_interval=10)
+SEARCH_DEFAULTS = dict(center_search=False,search_radius=64.,search_trigger=.75,search_top_k=3,
+    center_trust=.5,search_interval=5)
 GEOMETRIC_METHODS = tuple(m for m in METHODS if m not in ('similarity','anchored'))
 
 
 def method_options(value=None):
     result = dict(ecc_iters=45,ic_iters=20,ic_stride=2,min_gain=.0025,
-                  klt_max_points=200,klt_min_distance=4.,klt_window=21,**RECENT_DEFAULTS)
+                  klt_max_points=200,klt_min_distance=4.,klt_window=21,**RECENT_DEFAULTS,**SEARCH_DEFAULTS)
     value = dict(value or {})
     if set(value)-set(result):raise ValueError('Unknown geometric method options: '+', '.join(sorted(set(value)-set(result))))
     result.update(value)
-    for key in ('ecc_iters','ic_iters','ic_stride','klt_max_points','klt_window','original_check_interval'):
+    for key in ('ecc_iters','ic_iters','ic_stride','klt_max_points','klt_window','original_check_interval','search_top_k','search_interval'):
         if type(result[key]) is not int or result[key]<1:raise ValueError(key+' must be a positive integer')
     if result['klt_max_points']<8 or result['klt_window']<3 or result['klt_window']%2!=1:
         raise ValueError('KLT needs at least eight features and an odd window >=3')
@@ -47,12 +50,18 @@ def method_options(value=None):
     if isinstance(result['min_gain'],bool) or not isinstance(result['min_gain'],(int,float)) or not np.isfinite(result['min_gain']) or not 0<=result['min_gain']<2:
         raise ValueError('min_gain must be finite and in [0,2)')
     result['min_gain']=float(result['min_gain'])
-    if type(result['use_recent']) is not bool:raise ValueError('use_recent must be boolean')
-    for key in ('geometric_min_score','template_update_score','template_min_overlap','original_score_slack'):
+    for key in ('use_recent','center_search'):
+        if type(result[key]) is not bool:raise ValueError(key+' must be boolean')
+    v=result['search_radius']
+    if isinstance(v,bool) or not isinstance(v,(int,float)) or not np.isfinite(v) or not 0<v<=1024:
+        raise ValueError('search_radius must be finite and in (0,1024] source pixels')
+    result['search_radius']=float(v)
+    for key in ('geometric_min_score','template_update_score','template_min_overlap','original_score_slack','search_trigger','center_trust'):
         v=result[key]
         if isinstance(v,bool) or not isinstance(v,(int,float)) or not np.isfinite(v) or not 0<=v<=1:
             raise ValueError(key+' must be finite and in [0,1]')
         result[key]=float(v)
+    if result['search_trigger']<=0:raise ValueError('search_trigger must be positive')
     if result['template_min_overlap']<=0 or result['geometric_min_score']<=0:
         raise ValueError('Geometric score and foreground overlap must be positive')
     if result['template_update_score']<result['geometric_min_score']:
@@ -74,6 +83,9 @@ def attach_matrix(row, matrix, method, model='homography'):
 def create_estimator(gray, box, config, *, mask=None, method=DEFAULT_METHOD, options=None, base_factory=None):
     if method not in METHODS:raise ValueError('Unknown pose method: '+str(method))
     options=method_options(options)
+    if not options['use_recent']:
+        from dataclasses import replace
+        config=replace(config,update_rate=0.)
     if method=='anchored':
         from .anchored import AnchoredPoseEstimator
         return AnchoredPoseEstimator(gray,box,config,mask=mask)

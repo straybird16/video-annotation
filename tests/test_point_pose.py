@@ -43,6 +43,7 @@ class PointPoseTests(unittest.TestCase):
 
     def run_refinement(self,images,**options):
         options.setdefault("method","similarity")
+        options.setdefault("method_options",dict(center_search=False))
         with patch('video_annotation.pose.workflow.probe_video',return_value=(self.source,{})), \
              patch('video_annotation.pose.workflow.video_frames',side_effect=lambda *args,**kwargs:iter(images)) as decode:
             result=refine_point_tracks(self.tracks,**options)
@@ -128,7 +129,7 @@ class PointPoseTests(unittest.TestCase):
         images=[np.zeros((128,128,3),np.uint8) for _ in range(5)]
         from video_annotation.pose import workflow
         with patch.object(workflow,'PoseEstimator',Estimator),patch.object(workflow,'H264Writer',Writer), \
-             patch.object(workflow,'circle_geometry',wraps=workflow.circle_geometry) as geometry:
+             patch('video_annotation.pose.overlay.circle_geometry',wraps=workflow.circle_geometry) as geometry:
             result,decode=self.run_refinement(images,overlay=True,overlay_path=overlay)
         self.assertEqual(result['frames'],5)
         self.assertEqual(decode.call_args.args[1:],(200,5))

@@ -151,7 +151,7 @@ def parser():
     refine.add_argument("--klt-min-distance", type=float, default=4., help="KLT feature spacing in source pixels, at least 1")
     refine.add_argument("--klt-window", type=positive, default=21, help="KLT optical-flow window in pixels, odd and at least 3")
     refine.add_argument("--no-recent-template", dest="use_recent", action="store_false", default=True,
-                        help="disable recent validated templates for geometric methods")
+                        help="freeze original appearance, including correlation seeds")
     refine.add_argument("--geometric-min-score", type=float, default=.70,
                         help="geometric acceptance NCC threshold, separate from the correlation seed score")
     refine.add_argument("--original-score-slack", type=float, default=.03,
@@ -162,6 +162,14 @@ def parser():
                         help="geometric template minimum NCC for accepting an update")
     refine.add_argument("--original-check-interval", type=positive, default=10,
                         help="geometric original-template check interval in source frames")
+    refine.add_argument("--center-search", action="store_true", help="enable bounded center recovery for noisy input tracks")
+    refine.add_argument("--no-center-search", dest="center_search", action="store_false", default=False,
+                        help="disable bounded center search")
+    refine.add_argument("--search-radius", type=float, default=64., help="center search hard cap in source pixels")
+    refine.add_argument("--search-trigger", type=float, default=.75, help="center search trigger NCC")
+    refine.add_argument("--search-top-k", type=positive, default=3, help="center search candidate count")
+    refine.add_argument("--center-trust", type=float, default=.5, help="center search prediction trust in [0,1]")
+    refine.add_argument("--search-interval", type=positive, default=5, help="center search interval in source frames")
     refine.add_argument("--min-score", type=float, default=.75)
     refine.add_argument("--full-search", action="store_true", help="disable the cheaper guarded local path")
     refine.add_argument("--reference-interval", type=positive, default=10)
@@ -425,7 +433,8 @@ def refine_command(args):
         method=args.pose_method, method_options={name:getattr(args, name) for name in
             ('ecc_iters','ic_iters','ic_stride','min_gain','klt_max_points','klt_min_distance','klt_window',
              'use_recent','geometric_min_score','original_score_slack','template_min_overlap',
-             'template_update_score','original_check_interval')},
+             'template_update_score','original_check_interval','center_search','search_radius',
+             'search_trigger','search_top_k','center_trust','search_interval')},
         progress=lambda value: print(value, flush=True))
     print(json.dumps(result, indent=2))
 

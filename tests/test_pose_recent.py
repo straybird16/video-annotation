@@ -1,5 +1,6 @@
 """Tiny actual-image original/recent geometric fits; no models or user data."""
 import unittest
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -192,6 +193,45 @@ class RecentPoseTests(unittest.TestCase):
         for actual, saved in zip((estimator.seed_model.recent, estimator.seed_model.recent_visible,
                                   estimator.seed_model.recent_smooth), bank):
             np.testing.assert_array_equal(actual, saved)
+
+    def test_repeated_loss_respects_original_retry_cadence_and_checks_recent_each_frame(self):
+        estimator=self.estimator('klt_ransac',original_check_interval=4)
+        image,box,truth=self.frame(1)
+        self.assert_source_pose(estimator,estimator.estimate(image,box,1),truth)
+        checked=[]
+        recent=estimator.recent
+        with patch.object(estimator,'_original_fit',wraps=estimator._original_fit) as original_fit, \
+             patch.object(estimator,'_fit',wraps=estimator._fit) as fit:
+            for frame in range(2,11):
+                _,box,_=self.frame(frame)
+                row=estimator.estimate(np.zeros_like(self.initial),box,frame)
+                self.assertEqual(row['valid'],0)
+                if row['original_checked']:checked.append(frame)
+            self.assertEqual(original_fit.call_count,3)
+            recent_calls=[call for call in fit.call_args_list if call.args[0] is recent]
+            self.assertEqual(len(recent_calls),9)
+        self.assertEqual(checked,[2,6,10])
+        self.assertIs(estimator.recent,recent)
+
+    def test_original_reappearance_probe_requests_full_fit_before_retry_due(self):
+        estimator=self.estimator('klt_ransac',original_check_interval=10)
+        rng=np.random.default_rng(321)
+        unrelated=cv2.GaussianBlur(rng.integers(0,256,self.initial.shape,np.uint8),(0,0),.65)
+        # Isolate appearance recovery from the raw original while the recent
+        # bank is incompatible. This controls the state, not a fitted result.
+        estimator.recent=estimator.original.snapshot(unrelated,np.eye(3))
+        estimator.sparse.reference=np.empty((0,2),np.float32)
+        estimator.sparse.tracked=np.empty((0,2),np.float32)
+        rejected=estimator.estimate(np.zeros_like(self.initial),self.box,1)
+        self.assertEqual(rejected['valid'],0)
+        self.assertEqual(estimator.original_check_frame,1)
+        with patch.object(estimator,'_original_fit',wraps=estimator._original_fit) as full_fit:
+            row=estimator.estimate(self.initial,self.box,2)
+        self.assertEqual(full_fit.call_count,1)
+        self.assertEqual(row['original_checked'],1)
+        self.assertEqual(row['reference_kind'],'original')
+        self.assert_source_pose(estimator,row,np.eye(3))
+        self.assertEqual(row['reseeded'],1)
 
 
 if __name__ == '__main__':

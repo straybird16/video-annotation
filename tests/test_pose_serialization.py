@@ -65,7 +65,7 @@ class PoseSerializationTests(unittest.TestCase):
             with patch('video_annotation.pose.workflow.probe_video', return_value=(source, {})), \
                     patch('video_annotation.pose.workflow.video_frames', return_value=iter(images)), \
                     patch('video_annotation.pose.workflow.PoseEstimator', Estimator):
-                result = refine_point_tracks(tracks, overlay=False, method="similarity")
+                result = refine_point_tracks(tracks, overlay=False, method="similarity",method_options=dict(center_search=False))
             pose = Path(result['poses']['0'])
             pose_metadata = json.loads(pose.with_suffix('.json').read_text())
             summary = pose_metadata['gap_processing']
@@ -79,7 +79,7 @@ class PoseSerializationTests(unittest.TestCase):
             self.assertEqual(rows[2]['rotation_interpolated'], '1')
             with patch('video_annotation.pose.workflow.probe_video', return_value=(source, {})), \
                     patch('video_annotation.pose.workflow.PoseEstimator', side_effect=AssertionError('cached pose refitted')):
-                cached = refine_point_tracks(tracks, overlay=False, method="similarity")
+                cached = refine_point_tracks(tracks, overlay=False, method="similarity",method_options=dict(center_search=False))
             self.assertTrue(cached['reused'])
 
 

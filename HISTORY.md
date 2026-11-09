@@ -2,6 +2,15 @@
 
 Newest entries first. See PROVENANCE.md for the original workspace history.
 
+- 2026-11-08 — Added opt-in bounded masked center recovery with a supplied-point
+  trust prior, coarse/fine NCC and one final solver fit; exposed GUI/CLI controls.
+  Profiled and removed repeated failed original fits (17.9% faster in the
+  controlled KLT replay, identical geometry). Compared all eight methods across
+  original/recent appearance and search on/off; mixed coverage keeps wider
+  search opt-in. Labels now render sharply at output resolution. Codex
+  coordinator with resumed profiling and GUI/overlay workers.
+  [Controls and limitations](docs/POSE_REFINEMENT.md).
+
 - 2026-11-08 — Added original/accepted-recent geometric pose fitting, cautious
   raw-frame template refresh, original-sized bounded recovery independent of
   drifted H, and validated KLT reseeding. Added GUI/CLI controls and per-fit
