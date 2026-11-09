@@ -9,6 +9,12 @@ import numpy as np
 
 MODELS = ("similarity", "affine", "homography")
 
+# The same domain is checked for every fit. Keep it normalized so per-point
+# radii/centers cannot mutate a cached array or grow a geometry cache.
+_DOMAIN_AXIS = np.linspace(-1., 1., 5)
+_DOMAIN_GRID = np.stack(np.meshgrid(_DOMAIN_AXIS, _DOMAIN_AXIS), axis=-1).reshape(-1, 2)
+_DOMAIN_GRID.setflags(write=False)
+
 
 def normalize_warp(matrix, center=None):
     h = np.asarray(matrix, np.float64)
@@ -55,29 +61,39 @@ def homography_jacobian(matrix, point):
 def warp_geometry(matrix, center, radius):
     """Check a 5x5 domain grid plus exact linear-denominator corner extrema."""
     h = normalize_warp(matrix, center)
-    offsets = np.linspace(-radius, radius, 5)
-    xx, yy = np.meshgrid(offsets, offsets)
-    points = np.column_stack([xx.ravel(), yy.ravel()]) + center
+    points = _DOMAIN_GRID * radius + center
     denominator = points @ h[2, :2] + h[2, 2]
     if not np.isfinite(denominator).all() or denominator.min() <= .05:
         raise ValueError("warp pole or denominator sign change within patch")
     projected = project_points(h, points)
-    jacobians = (h[None, :2, :2] - projected[:, :, None] * h[None, 2, :2]) / denominator[:, None, None]
-    if not np.isfinite(jacobians).all() or np.any(np.linalg.det(jacobians) <= 1e-6):
-        raise ValueError("folded or singular patch warp")
-    _, singular, domain_vt = np.linalg.svd(jacobians)
-    domain_stretch = np.einsum("nji,nj,njk->nik", domain_vt, singular, domain_vt)
-    domain_shear = 2*np.abs(domain_stretch[:,0,1]) / np.trace(domain_stretch,axis1=1,axis2=2)
-    j = homography_jacobian(h, center)
-    u, values, vt = np.linalg.svd(j)
+    if h[2, 0] == 0. and h[2, 1] == 0.:
+        # Similarity/full-affine maps have one constant Jacobian. Checking 25
+        # copies and computing 26 SVDs gives no additional domain evidence.
+        # Never approximate a small nonzero perspective coefficient as affine.
+        j = h[:2, :2] / h[2, 2]
+        if not np.isfinite(j).all() or not np.isfinite(projected).all() or np.linalg.det(j) <= 1e-6:
+            raise ValueError("folded or singular patch warp")
+        u, values, vt = np.linalg.svd(j)
+        singular = values[None, :]
+        domain_shear = None
+    else:
+        jacobians = (h[None, :2, :2] - projected[:, :, None] * h[None, 2, :2]) / denominator[:, None, None]
+        if not np.isfinite(jacobians).all() or np.any(np.linalg.det(jacobians) <= 1e-6):
+            raise ValueError("folded or singular patch warp")
+        _, singular, domain_vt = np.linalg.svd(jacobians)
+        domain_stretch = np.einsum("nji,nj,njk->nik", domain_vt, singular, domain_vt)
+        domain_shear = float((2*np.abs(domain_stretch[:,0,1]) / np.trace(domain_stretch,axis1=1,axis2=2)).max())
+        j = homography_jacobian(h, center)
+        u, values, vt = np.linalg.svd(j)
     rotation = u @ vt
     stretch = vt.T @ np.diag(values) @ vt
+    shear = float(2 * abs(stretch[0, 1]) / np.trace(stretch))
     scale = float(np.sqrt(np.linalg.det(j)))
     tangent_similarity = (points - center) @ (rotation * scale).T + project_points(h, center)
     return {"rotation_degrees": float(np.degrees(np.arctan2(rotation[1, 0], rotation[0, 0]))),
             "scale": scale, "anisotropy": float(np.max(singular[:, 0] / singular[:, 1])),
-            "shear": float(2 * abs(stretch[0, 1]) / np.trace(stretch)),
-            "domain_shear": float(domain_shear.max()),
+            "shear": shear,
+            "domain_shear": shear if domain_shear is None else domain_shear,
             "perspective": float(np.max(np.abs(denominator - 1))),
             "local_singular_min": float(singular.min()), "local_singular_max": float(singular.max()),
             "corner_extra": float(np.linalg.norm(projected - tangent_similarity, axis=1).max() / radius)}

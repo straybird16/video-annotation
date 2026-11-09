@@ -2,6 +2,14 @@
 
 Newest entries first. See PROVENANCE.md for the original workspace history.
 
+- 2026-11-09 — Added correlation-guarded KLT with batched flow, moving support,
+  bounded source-time recovery and original-scale recovery independent of drift.
+  Track CSVs include initial pose, component flags and full source-coordinate H.
+  Optimized geometry and candidate scoring; retained the explicit legacy route.
+  Codex coordinator with focused geometry/export workers. Known-motion rolling-wheel,
+  mask, boundary, recovery, GUI and export checks; bounded real-video replay.
+  [Workflow](docs/USAGE.md), [parameters](src/video_annotation/guides/KLT_PARAMETERS.md).
+
 - 2026-11-09 — Added scrollable notebook tabs, collapsible controls, a useful
   annotation viewport and portable refinement/overlay presets. Pose markers
   default to1px/70% opacity/no halo, with GUI appearance controls and rendering

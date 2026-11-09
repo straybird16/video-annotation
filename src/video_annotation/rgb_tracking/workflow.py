@@ -21,6 +21,8 @@ from .video_geometry import DISPLAY_COORDINATE_SPACE, VIDEO_GEOMETRY_VERSION, di
 from .backends import BACKENDS, make_tracker, validate_backend_options
 
 WARP_COLUMNS = tuple(f"warp_h{i}{j}" for i in range(3) for j in range(3))
+POSE_COLUMNS = ("rotation_degrees", "scale", "pose_valid", "rotation_valid", "scale_valid",
+                "motion_model", "fit_score", *WARP_COLUMNS)
 QUALITY_COLUMNS = ("frame", "point_id", "valid", "fb_error", "lk_error", "feature_count",
                    "inlier_ratio", "residual_px", "rotation_degrees", "scale",
                    "motion_model", "model_selection", "anisotropy", "shear", "domain_shear", "perspective", "corner_extra",
@@ -28,8 +30,10 @@ QUALITY_COLUMNS = ("frame", "point_id", "valid", "fb_error", "lk_error", "featur
                    "registration_score", "registration_status", "registration_model", "registration_attempts",
                    "reference_id", "reference_frame",
                    "original_confirmed", "keyframe_count", "keyframe_action", "reason",
-                   "alignment_method", "support_pixel_count", "photometric_rms", "photometric_inlier_ratio")
-QUALITY_SCHEMA_VERSION = 3
+                   "alignment_method", "support_pixel_count", "photometric_rms", "photometric_inlier_ratio",
+                   "pose_valid", "rotation_valid", "scale_valid", "fit_score", "recent_score", "original_score",
+                   "fit_margin", "tracking_status", "recovery_attempts", "failure_reason")
+QUALITY_SCHEMA_VERSION = 4
 
 
 def file_digest(path):
@@ -82,6 +86,8 @@ def export_tracks(video, points, frame, output, tracker, *, batch_size,
     lifecycle = TrackLifecycle(point_ids, source['fps'], reacquire_seconds)
     check_cancel(cancel)
     tracker.reset()
+    if hasattr(tracker, "set_stream_timing"):
+        tracker.set_stream_timing(source['fps'], reacquire_seconds)
     if patch_regions is not None and getattr(tracker, "name", "tapnextpp") != "tapnextpp":
         tracker.set_patch_regions(*patch_regions)
     provenance = provenance if provenance is not None else tracker.provenance()
@@ -100,12 +106,14 @@ def export_tracks(video, points, frame, output, tracker, *, batch_size,
     initial_valid = final_valid = 0
     anchor_checks = Counter()
     motion_models = Counter()
+    first_failures = {}
     begin = time.perf_counter()
     try:
         with ExitStack() as stack:
             f = stack.enter_context(temporary.open("w", newline=""))
             writer = csv.writer(f)
-            writer.writerow(["frame", "point_id", "x", "y", "visible", score_column])
+            writer.writerow(["frame", "point_id", "x", "y", "visible", score_column,
+                             *(POSE_COLUMNS if classical else ())])
             quality_writer = None
             if classical:
                 qf = stack.enter_context(temporary_quality.open("w", newline=""))
@@ -127,10 +135,7 @@ def export_tracks(video, points, frame, output, tracker, *, batch_size,
                     initial_valid = int(np.count_nonzero(logits[0] > 0))
                 final_valid = int(np.count_nonzero(logits[-1] > 0))
                 valid_rows += int(np.count_nonzero(logits > 0))
-                for i in range(len(batch)):
-                    for point in range(xy.shape[1]):
-                        writer.writerow([frame + processed + i, point_ids[point], *xy[i, point],
-                                         int(logits[i, point] > 0), float(logits[i, point])])
+                diagnostic_rows = {}
                 if quality_writer:
                     diagnostics = tracker.last_diagnostics
                     if len(diagnostics) != len(batch) * len(points):
@@ -147,6 +152,22 @@ def export_tracks(video, points, frame, output, tracker, *, batch_size,
                                "valid": int(accepted[i, point])}
                         if native_valid[i, point] and not accepted[i, point]:
                             row['reason'] = 'outside_image' if not inside[i, point] else 'reacquisition_timeout'
+                        if not row['valid']:
+                            row['failure_reason'] = row.get('failure_reason') or row.get('reason') or 'tracking_failed'
+                            first_failures.setdefault(str(point_ids[point]), {
+                                'frame': int(row['frame']), 'reason': row['failure_reason'],
+                                'feature_count': int(row['feature_count']) if row.get('feature_count') is not None else None,
+                                'tracking_status': row.get('tracking_status') or 'lost'})
+                            for key in POSE_COLUMNS:
+                                row[key] = 0 if key.endswith('_valid') else None
+                        else:
+                            # Older backends may provide only warp/pose values; do not invent a fit.
+                            has_warp = all(row.get(key) is not None for key in WARP_COLUMNS)
+                            row.setdefault('pose_valid', int(has_warp))
+                            row.setdefault('rotation_valid', int(has_warp and row.get('rotation_degrees') is not None))
+                            row.setdefault('scale_valid', int(has_warp and row.get('scale') is not None))
+                            for key in ('pose_valid', 'rotation_valid', 'scale_valid'):
+                                row[key] = int(bool(row[key]))
                         if row.get("reference_frame") is not None:
                             reference_frame = row["reference_frame"]
                             if (not isinstance(reference_frame, (int, np.integer)) or
@@ -170,9 +191,16 @@ def export_tracks(video, points, frame, output, tracker, *, batch_size,
                                 raise ValueError("diagnostic query-to-frame warp does not map the saved point to its prediction "
                                                  f"(source frame {frame + processed + i}, point {point})")
                         quality_writer.writerow(row)
+                        diagnostic_rows[i, point] = row
                         anchor_checks[row.get("registration_status", "not_applicable")] += 1
                         if row["valid"] and row.get("motion_model"):
                             motion_models[row["motion_model"]] += 1
+                for i in range(len(batch)):
+                    for point in range(xy.shape[1]):
+                        row = diagnostic_rows.get((i, point), {})
+                        writer.writerow([frame + processed + i, point_ids[point], *xy[i, point],
+                                         int(logits[i, point] > 0), float(logits[i, point]),
+                                         *(row.get(key) for key in POSE_COLUMNS if classical)])
                 processed += len(batch)
                 for key in times:
                     times[key] += timing[key]
@@ -229,6 +257,8 @@ def export_tracks(video, points, frame, output, tracker, *, batch_size,
                 quality_sha256=file_digest(temporary_quality), quality_schema_version=QUALITY_SCHEMA_VERSION,
                 visibility="visible=1 means tracking quality gates and bounded reacquisition passed, not observed physical visibility; only recovered internal gaps remain invalid; terminal tails are absent")
             metadata["warp_geometry"] = {"columns": list(WARP_COLUMNS),
+                "track_pose_columns": list(POSE_COLUMNS),
+                "availability": "initial tracker pose only; missing/invalid predictions carry no pose or warp; manual corrections invalidate tracker pose",
                 "direction": "query-frame displayed video pixels to row-frame displayed video pixels; homogeneous division required",
                 "pose_location": "local Jacobian at the initial query point",
                 "rotation": "clockwise image-XY polar-decomposition rotation in degrees",
@@ -238,7 +268,8 @@ def export_tracks(video, points, frame, output, tracker, *, batch_size,
             metadata["quality_summary"] = {"valid_point_rows": valid_rows,
                 "total_point_rows": saved_rows, "valid_fraction": valid_rows / saved_rows if saved_rows else 0.,
                 "initial_valid_points": initial_valid, "final_valid_points": final_valid,
-                "registration_checks": dict(anchor_checks), "valid_rows_by_motion_model": dict(motion_models)}
+                "registration_checks": dict(anchor_checks), "valid_rows_by_motion_model": dict(motion_models),
+                "first_failures": first_failures}
         else:
             metadata.update(resolution=tracker.resolution, precision=tracker.precision,
                 model=provenance, visibility="native logit > 0 and bounded reacquisition accepted; terminal tails absent; logits are not calibrated confidence")

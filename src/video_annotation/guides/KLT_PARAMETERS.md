@@ -2,16 +2,23 @@
 
 Without an explicit mask, the tracker follows local texture with pyramidal
 Lucas–Kanade optical flow and checks each match forwards and backwards.
-`klt-affine` fits motion to several support features; `klt-template` also
-registers against the original patch or an original-validated keyframe to check
-drift. Explicit masks use direct patch alignment as described below. Similarity is the conservative
+`klt-affine` fits motion to several support features; `klt-template` defaults to
+correlation-guarded proposals, retaining the original patch and accepted recent
+appearance. Weak correlation triggers bounded nearby center/pose recovery;
+only the best candidate receives fine alignment. `template_mode=legacy_ecc`
+selects the former periodic iterative registration. Similarity is the conservative
 rotation/uniform-scale model; affine adds shear and homography adds perspective.
+Adaptive is the new default: extra affine/projective freedom is tried only when
+the simpler proposal has insufficient evidence; explicit fixed-model settings
+remain fixed.
 These are estimates: a passing score does not certify correct correspondence.
-Lost points stay lost until a new run.
+Image correlation does not require a minimum number of corners to validate a
+recovery, but needs textured and sufficiently unambiguous support.
 
 The shared `reacquire_seconds` runtime setting defaults to 0.5 source-video
 seconds (CLI `--reacquire-seconds`); zero ends a track immediately. It limits native
-recoveries such as TAPNext++ provides and does not add KLT recovery. Lost markers
+recoveries such as TAPNext++ provides; correlation-mode template KLT also tries
+bounded patch recovery during that window. Lost markers
 are hidden and unrecovered prediction tails are omitted. See
 [loss and reacquisition](../../../docs/USAGE.md).
 
@@ -23,10 +30,16 @@ Narrow masks do not need six complete LK feature windows. Unmasked circles use
 sparse LK; window/pyramid/corner and RANSAC settings below apply to that path.
 Flat or geometrically ambiguous masks can still fail initialization.
 
-Masked alignment uses `registration_iterations` / `registration_epsilon` every
-frame, with correlation, visibility and warp bounds retained. Adaptive masked
-updates start with similarity; periodic original registration can try a higher
-model if its correlation gain justifies it. Masked diagnostics report actual
+Support moves according to the full fitted warp, not the average feature
+translation. A rolling wheel's contact region may be almost stationary while
+its center translates: rotation plus translation permits both motions. The
+query center is projected through the fitted warp. A single warp still cannot
+represent mixed moving wheel/road/background pixels or arbitrary nonrigid motion.
+
+Masked alignment uses `registration_iterations` / `registration_epsilon` for its
+foreground-only proposal each frame, followed by the same correlation guard and
+recovery as unmasked patches. Adaptive masked updates start with similarity;
+stronger models need supported improvement. Masked diagnostics report actual
 photometric support and residuals instead of corner/FB counts. Larger patches
 can help texture but may mix objects; start with useful foreground and defaults.
 
@@ -43,15 +56,15 @@ independently of KLT parameters; see the point workflow for interpolation rules.
 
 Defaults below are library defaults; a loaded config or CLI option may override
 them. Step limits apply between adjacent frames; total limits apply relative to
-the original patch. Geometry limits reject fitted results rather than constrain
-the ECC optimization itself.
+the original patch. Geometry limits reject fitted results; they do not promise
+that an iterative optimizer or a finite candidate grid finds the true motion.
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `motion_model` | `similarity` | Patch geometry: similarity (rotation/uniform scale), affine (shear/axis scale), homography (perspective), or adaptive selection. |
+| `motion_model` | `adaptive` | Start simple and upgrade with evidence; fixed similarity, affine or homography are also selectable. |
 | `adaptive_max_model` | `homography` | Most flexible model adaptive fitting may use. Affine is more conservative than homography. |
 | `win_size` | `21` | Odd sparse-LK window width in source pixels (at least 5); unused by direct masked alignment. |
-| `max_level` | `3` | Maximum optical-flow pyramid level. Actual levels are reduced to fit supported foreground. |
+| `max_level` | `3` | Maximum optical-flow pyramid level; sparse LK windows can use image context outside support. |
 | `fb_threshold` | `1.0` | Maximum forward/backward LK disagreement in source pixels. Lower rejects more uncertain matches. |
 | `min_eigenvalue` | `0.0001` | Minimum LK corner strength. Increase to reject weak or flat features. |
 | `max_lk_error` | `30.0` | Maximum OpenCV LK photometric error (8-bit image units). Lower rejects poorer local matches. |
@@ -68,7 +81,7 @@ the ECC optimization itself.
 | `min_inlier_ratio` | `0.5` | Minimum consistent feature fraction; for explicit masks, minimum photometric inlier fraction (absolute normalized intensity residual ≤ 0.75). |
 | `min_support_coverage` | `0.02` | Minimum convex-hull area of inlier features divided by the square patch area. |
 | `ransac_threshold` | `1.5` | RANSAC inlier residual threshold in source pixels. |
-| `feature_refresh_interval` | `10` | Frames between support-feature refreshes after accepted motion; point IDs never change. |
+| `feature_refresh_interval` | `5` | Frames between support-feature refreshes after accepted motion, or earlier if depleted; point IDs never change. |
 | `min_scale_step` | `0.8` | Minimum accepted local linear scale multiplier per frame. |
 | `max_scale_step` | `1.25` | Maximum accepted local linear scale multiplier per frame. |
 | `max_rotation_step` | `20.0` | Maximum absolute local rotation change per frame, in degrees. |
@@ -89,17 +102,26 @@ the ECC optimization itself.
 | `adaptive_complexity_penalty` | `0.03` | Additional validation penalty per model complexity level, in pixel residual units. |
 | `adaptive_registration_min_ncc` | `0.95` | Original-registration NCC below this triggers one supported higher-model attempt. |
 | `adaptive_registration_min_gain` | `0.02` | NCC improvement required to replace an accepted simpler registration. |
-| `reanchor_interval` | `10` | Frames between periodic template registration attempts. Lower costs more compute. |
+| `template_mode` | `correlation` | Cheap masked NCC guard/recovery; `legacy_ecc` selects the older iterative route. |
+| `correlation_trigger` | `0.85` | NCC below this triggers bounded dense center/pose recovery. |
+| `correlation_margin` | `0.03` | Required score advantage over a distinct recovery basin; adjacent samples do not count as a rival. |
+| `correlation_search_radius` | `12.0` | Maximum local center search radius in source pixels, also capped by `max_displacement`. |
+| `correlation_search_step` | `3.0` | Coarse center-grid spacing in source pixels. |
+| `correlation_pose_step` | `0.06` | Coarse log-scale/shear/perspective neighborhood step within the motion model and geometry bounds. |
+| `correlation_angle_step` | `6.0` | Coarse rotation step in degrees. |
+| `correlation_max_candidates` | `24` | Maximum coarse shape hypotheses per recovery; center-grid scoring is performed for each. |
+| `correlation_refine_iterations` | `8` | Maximum fine alignment iterations for at most the best candidate. |
+| `reanchor_interval` | `10` | Frames between original-reference checks; in `legacy_ecc` this runs periodic iterative registration. Lower costs more compute. |
 | `registration_min_ncc` | `0.85` | Minimum reference-to-current normalized correlation to accept a template registration. |
 | `registration_min_gain` | `0.0` | Required NCC improvement over the prealigned patch; 0 permits equal scores within tolerance. |
 | `registration_min_overlap` | `0.95` | Minimum fraction of supported registration/reference pixels inside the image. |
 | `registration_max_translation` | `8.0` | Maximum native-pixel displacement caused by a registration correction. |
 | `registration_max_rotation` | `15.0` | Maximum rotation of a registration correction, in degrees. |
 | `registration_max_scale` | `1.2` | Maximum correction scale multiplier; its reciprocal is the minimum. |
-| `registration_max_anisotropy` | `0.1` | Allowed singular-value ratio minus 1 when converting ECC affine output to similarity. |
-| `registration_min_observability` | `0.02` | Minimum reference orientation observability for ECC; low means weak rotation evidence. |
-| `registration_iterations` | `30` | Maximum iterations per registration attempt; also the per-frame direct masked alignment budget. |
-| `registration_epsilon` | `0.0001` | Convergence tolerance. Direct masked alignment has a 0.015-pixel interpolation floor; smaller values do not add precision there. |
+| `registration_max_anisotropy` | `0.1` | Legacy ECC: allowed singular-value ratio minus 1 when converting affine output to similarity. |
+| `registration_min_observability` | `0.02` | Minimum orientation observability; low values flag uncertain rotation. Also guards legacy ECC orientation. |
+| `registration_iterations` | `30` | Legacy ECC iteration budget; also used for per-frame direct masked proposals. Correlation recovery uses `correlation_refine_iterations`. |
+| `registration_epsilon` | `0.0001` | Iterative alignment convergence tolerance. Direct masked alignment has a 0.015-pixel interpolation floor. |
 | `keyframe_interval` | `0` | Minimum frames between candidate keyframes; 0 disables the bank. Promotion needs original-reference confirmation. |
 | `max_keyframes` | `3` | Maximum stored references per point, including the immutable original; 1 keeps only the original. |
 | `keyframe_min_ncc` | `0.95` | Minimum successful original-registration NCC before promoting a keyframe. |

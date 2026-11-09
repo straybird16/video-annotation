@@ -26,9 +26,28 @@ loaded across editors in the same session.
 KLT uses the circle intersected with the optional mask. Explicit masks use
 foreground-only direct alignment, transporting support with the accepted warp.
 Unmasked patches use sparse pyramidal KLT. `klt-affine` adds geometric fitting;
-`klt-template` also checks the original/validated keyframe. Similarity, affine,
-homography and adaptive models are selectable. TAPNext++ uses point coordinates
-only; patch annotations remain editable for other trackers.
+`klt-template` defaults to correlation-guarded motion proposals: masked patch
+scores validate the proposal, and weak evidence triggers bounded center/pose
+recovery against the original and accepted recent appearance. Similarity,
+affine, homography and adaptive models are selectable. `template_mode=legacy_ecc`
+keeps the former periodic iterative-registration route. TAPNext++ uses point
+coordinates only; patch annotations remain editable for other trackers.
+Adaptive is the default for new KLT patch runs; existing configs retain their
+explicit model choice.
+
+Classical `points.csv` keeps the original first six columns and appends initial
+rotation/scale estimates, component-validity flags, selected motion model,
+fit score and nine `warp_h00`…`warp_h22` coefficients. The warp maps the original
+query frame to each row's source frame; pose comes from its local Jacobian at
+the query point. Full homography is retained when accepted. These are tracker
+estimates, not independently refined GT. Invalid rows have no pose/warp; manual
+corrections deliberately omit old tracker geometry. Per-point first-failure
+receipts survive tail trimming in `points.json` → `quality_summary.first_failures`.
+`pose_valid` means the local matrix was accepted, not independently verified.
+`rotation_valid` additionally requires orientation observability. `scale_valid`
+is false when scale differs too much from the last original-supported anchor
+(beyond `registration_max_scale` or its reciprocal); the numeric scale remains
+available as an explicitly uncertain initial guess.
 
 **Settings** exposes tracking parameters and hover help, including template-bank
 size. **Save settings** exports a JSON usable with `--config` in the GUI or CLI.
@@ -36,8 +55,10 @@ See the [parameter guide](../src/video_annotation/guides/KLT_PARAMETERS.md).
 
 Lost points disappear and trails clear. Native reacquisition is accepted within
 `reacquire_seconds` (default 0.5 source-video seconds); later automatic returns
-are suppressed. Zero ends immediately. This policy adds no new KLT recovery
-algorithm. New CSVs omit unrecovered tails; readers preserve full source timing.
+are suppressed. Zero ends immediately. Correlation-mode KLT template tracking
+attempts bounded recovery during this window; other backends retain their own
+native recovery behavior. New CSVs omit unrecovered tails; readers preserve full
+source timing.
 
 For old predictions **and corrected tracks**, apply the rule to the stored CSVs:
 

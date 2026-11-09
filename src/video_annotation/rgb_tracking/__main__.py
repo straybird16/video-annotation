@@ -58,7 +58,7 @@ def parser():
             s.add_argument("--patch-radius", type=positive, help="local support/template radius in pixels")
             s.add_argument("--reanchor-interval", type=positive, help="klt-template registration period in frames")
             s.add_argument("--motion-model", choices=("similarity", "affine", "homography", "adaptive"),
-                           help="local geometric model for klt-affine/klt-template (default: similarity)")
+                           help="local geometric model for klt-affine/klt-template (default: adaptive)")
             s.add_argument("--keyframe-interval", type=nonnegative,
                            help="klt-template validated keyframe period; 0 disables (default)")
         s.add_argument("--repo", type=Path, default=DEFAULT_REPO if tap_only else None,
@@ -72,7 +72,7 @@ def parser():
         s.add_argument("--compile", action="store_true", default=False if tap_only else None,
                        help="experimental TAPNext++ compilation; included in timings")
         s.add_argument("--threads", type=positive, default=8 if tap_only else None,
-                       help="CPU worker threads (default: 8)")
+                       help="CPU worker threads (KLT default: 1; TAPNext++ default: 8)")
     track = sub.choices["track"]
     track.add_argument("--video", type=Path, required=True)
     queries = track.add_mutually_exclusive_group(required=True)
