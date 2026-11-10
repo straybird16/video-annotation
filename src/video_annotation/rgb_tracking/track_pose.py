@@ -160,7 +160,7 @@ def read_point_pose_tracks(tracks,*,video=None,source=None,gap_seconds=0.,gap_ne
     return dict(tracks=tracks,metadata=metadata,video=video,source=source,supports=supports,frames=frames,rows_by_frame=rows_by_frame,gap_reports=reports)
 
 
-def write_point_pose_tracks(output,data,*,pose_rows=None,references=None,prefer_existing=True,method=None,destination=None):
+def write_point_pose_tracks(output,data,*,pose_rows=None,references=None,prefer_existing=True,method=None,destination=None,extra_fields=()):
     """Consolidate compatible rows and copy masks; output has no per-point dependency."""
     output=contained_path(output,'data');output.parent.mkdir(parents=True,exist_ok=True)
     metadata_base=Path(destination).parent if destination is not None else output.parent
@@ -176,6 +176,7 @@ def write_point_pose_tracks(output,data,*,pose_rows=None,references=None,prefer_
             patch['mask']=str(asset)
         patches.append(patch)
     fields=['frame','point_id','x','y','visible','quality_score',*POSE_FIELDS]
+    fields.extend(key for key in extra_fields if key not in fields)
     pending=output.with_name('.'+output.name+'.'+uuid4().hex+'.partial')
     rows_written=0;ends={str(i):None for i in ids}
     for frame in data['frames']:

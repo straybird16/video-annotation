@@ -10,7 +10,10 @@ from .tapnextpp import ROOT, contained_path
 PARAMETER_GUIDE = Path(__file__).resolve().parents[1]/'guides/KLT_PARAMETERS.md'
 
 PARAMETER_HELP = {
-    'tracking_policy': 'Accuracy (default) fits the immutable original patch densely every frame, with conditional homography and accepted recent fallback. Fast retains the earlier sparse-KLT/correlation cascade. Only applies to correlation-mode klt-template.',
+    'tracking_policy': 'Combined (default) adds full sparse-RANSAC proposals, soft acceleration-continuity regularization and separate template admission. Accuracy fits the immutable original patch densely every frame, with conditional homography and accepted recent fallback. Fast retains the earlier sparse-KLT/correlation cascade. Only applies to correlation-mode klt-template.',
+    'combined_motion_weight': 'Maximum soft center/shape prior cost in normalized correlation units; default 0.03, matching correlation_margin. Larger image improvements win. Zero disables regularization.',
+    'template_stable_frames': 'Consecutive accepted, motion-consistent full-pose fits before recent-template admission in combined mode; default 3. Center-only fallbacks never refresh appearance.',
+    'output_smoothing_seconds': 'Optional degree-2 Savitzky-Golay center filter after tracking/lifetime cleanup. Source seconds; 0 disables (default). Keeps raw_x/raw_y, gaps, endings and anchors; translates complete H.',
     'dense_iterations': 'Maximum inverse-compositional iterations per dense local fit, from 1 to 100; default 12. More iterations may improve convergence but cost more time.',
     'dense_original_threshold': 'Masked NCC below this tries recent appearance and an independent original-shape seed, in (0,1]; default 0.93. Scores at or above it count as strong original support; min_patch_ncc remains the acceptance floor.',
     'dense_recent_threshold': 'Minimum masked NCC for an accepted recent-template dense fallback, in (0,1]; default 0.94. Recent appearance is updated only after accepted geometry.',
@@ -72,7 +75,7 @@ PARAMETER_HELP = {
     'adaptive_complexity_penalty': 'Additional validation penalty per model complexity level, in pixel residual units.',
     'adaptive_registration_min_ncc': 'Original-registration NCC below this triggers one supported higher-model attempt.',
     'adaptive_registration_min_gain': 'NCC improvement required to replace an accepted simpler registration.',
-    'template_mode': 'Correlation supports dense accuracy and sparse fast policies. Legacy ECC keeps the former periodic iterative registration route.',
+    'template_mode': 'Correlation supports combined, dense accuracy and sparse fast policies. Legacy ECC keeps the former periodic iterative registration route.',
     'correlation_trigger': 'Correlation below this score triggers bounded nearby motion/center search. Higher values search more often.',
     'correlation_margin': 'Required normalized-correlation advantage over a distinct recovery candidate. Larger rejects ambiguous matches.',
     'correlation_search_radius': 'Maximum nearby center search radius in source pixels during recovery; max_displacement remains an acceptance limit.',

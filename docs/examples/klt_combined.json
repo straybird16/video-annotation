@@ -1,0 +1,13 @@
+{
+  "tracking_policy": "combined",
+  "motion_model": "adaptive",
+  "dense_iterations": 12,
+  "dense_original_threshold": 0.93,
+  "dense_recent_threshold": 0.94,
+  "dense_homography_trigger": 0.965,
+  "combined_motion_weight": 0.03,
+  "template_stable_frames": 3,
+  "output_smoothing_seconds": 0.0,
+  "use_recent_template": true,
+  "recovery_enabled": false
+}

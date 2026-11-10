@@ -37,8 +37,11 @@ QUALITY_COLUMNS = ("frame", "point_id", "valid", "fb_error", "lk_error", "featur
                    "shape_innovation", "motion_penalty", "recent_template_updated", "recovery_dof",
                    "recovery_shape_count", "recovery_bank_truncated", "search_candidates",
                    "foreground_match_fraction", "foreground_observable_pixels", "feature_retention_ratio",
-                   "occluded", "occlusion_suspected", "center_smoothing_alpha", "center_correction_px", "raw_center_x", "raw_center_y")
-QUALITY_SCHEMA_VERSION = 6
+                   "occluded", "occlusion_suspected", "center_smoothing_alpha", "center_correction_px", "raw_center_x", "raw_center_y",
+                   "sparse_proposal", "sparse_center_error_px", "sparse_center_agreement", "consecutive_score", "fallback_reference",
+                   "center_innovation_px", "center_motion_penalty", "temporal_regularization_px",
+                   "template_motion_consistent", "template_stable_count", "template_admission")
+QUALITY_SCHEMA_VERSION = 7
 
 
 def file_digest(path):
@@ -278,6 +281,10 @@ def export_tracks(video, points, frame, output, tracker, *, batch_size,
         else:
             metadata.update(resolution=tracker.resolution, precision=tracker.precision,
                 model=provenance, visibility="native logit > 0 and bounded reacquisition accepted; terminal tails absent; logits are not calibrated confidence")
+        smoothing_seconds = getattr(getattr(tracker, "config", None), "output_smoothing_seconds", 0.)
+        if smoothing_seconds:
+            from .smoothing import smooth_csv
+            smooth_csv(temporary, metadata, smoothing_seconds)
         if signature is not None:
             metadata["input_signature"] = signature
         write_json(temporary_metadata, metadata)
@@ -398,7 +405,7 @@ class Processor:
             import cv2
             package = Path(__file__).parent
             dependencies = [package / "klt.py", package / "backends.py", package / "workflow.py",
-                            package / "lifecycle.py",
+                            package / "lifecycle.py", package / "smoothing.py",
                             package.parent / "common/registration.py"]
             dependencies.extend(sorted(package.glob("klt_*.py")))
             dependencies.extend(sorted((package.parent/'common').glob('patch_*.py')))

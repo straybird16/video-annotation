@@ -53,6 +53,10 @@ def parser():
                            help="point tracking algorithm (default: %(default)s)")
             s.add_argument("--tracker-options", type=Path,
                            help="JSON object of algorithm-specific options; unknown keys fail")
+            s.add_argument("--tracking-policy", choices=("combined", "accuracy", "fast"), help="klt-template policy (default combined)")
+            s.add_argument("--combined-motion-weight", type=float, help="combined soft prior maximum cost in NCC units (default .03; 0 disables)")
+            s.add_argument("--template-stable-frames", type=positive, help="combined consecutive stable fits before template admission (default 3)")
+            s.add_argument("--output-smoothing-seconds", type=float, help="optional degree-2 SG center window in source seconds (default 0/off)")
             s.add_argument("--lk-window", type=positive, help="KLT window side length (odd pixels)")
             s.add_argument("--fb-threshold", type=float, help="KLT forward/backward limit in pixels")
             s.add_argument("--patch-radius", type=positive, help="local support/template radius in pixels")
@@ -144,6 +148,13 @@ def parser():
     clean.add_argument("--reacquire-seconds", type=float, default=.5,
                        help="recovery window in source-video seconds (default 0.5; 0 ends immediately)")
     clean.add_argument("--dry-run", action="store_true", help="report changes without writing files")
+    smooth = sub.add_parser("smooth", help="save SG-smoothed existing/corrected centers as a new data-local track")
+    smooth.add_argument("--tracks", type=Path, required=True)
+    smooth.add_argument("--output", type=Path, help="new CSV; default smoothed/points.csv beside input")
+    smooth.add_argument("--window-seconds", type=float, default=.1)
+    smooth.add_argument("--overlay", action="store_true")
+    smooth.add_argument("--overlay-fps", type=float)
+    smooth.add_argument("--max-width", type=positive, default=1280)
     reindex = sub.add_parser('reindex',help='compact saved point IDs, including linked corrections/poses, with backups')
     reindex.add_argument('--data-dir',type=Path,help='workspace data directory; default data/')
     reindex.add_argument('--dry-run',action='store_true')
@@ -239,7 +250,7 @@ def parser():
     refine.add_argument("--max-width", type=positive, default=1280)
     refine.add_argument("--force", action="store_true", help="recompute matching results")
     from .render_options import RENDER_PRESETS
-    for name in ('render', 'render-named', 'annotate', 'process', 'refine'):
+    for name in ('render', 'render-named', 'annotate', 'process', 'refine', 'smooth'):
         command = sub.choices[name]
         command.add_argument('--render-max-frames', type=positive, help='preview limit only; does not shorten tracks')
         command.add_argument('--crf', type=int, help='H.264 quality 0–51; lower is higher quality (default 18)')
@@ -266,7 +277,8 @@ def tracking_configuration(args):
     overrides.update({name:getattr(args,name,None) for name in
                      ('motion_gate','motion_sigma','motion_noise_px','motion_memory_seconds',
                       'recovery_enabled','stop_on_occlusion','min_foreground_fraction',
-                      'center_smoothing','center_smoothing_px')})
+                      'center_smoothing','center_smoothing_px','tracking_policy','combined_motion_weight',
+                      'template_stable_frames','output_smoothing_seconds')})
     options.update({key: value for key, value in overrides.items() if value is not None})
     tap_flags = ("repo", "checkpoint", "resolution", "device", "precision", "compile")
     explicit = ["--" + key.replace("_", "-") for key in tap_flags if getattr(args, key) is not None]
@@ -285,7 +297,7 @@ def tracking_configuration(args):
         if args.threads is not None:
             options["threads"] = args.threads
         else:
-            options.setdefault("threads", 8)
+            options.setdefault("threads", 1)
         canonical = validate_backend_options(args.tracker, options)
     return canonical, tap
 
@@ -579,6 +591,20 @@ def main(argv=None):
         elif args.command == 'reindex':
             from .reindex import reindex_saved_points
             print(json.dumps(reindex_saved_points(args.data_dir,dry_run=args.dry_run),indent=2))
+        elif args.command == "smooth":
+            from .smoothing import smooth_tracks
+            output = args.output or args.tracks.parent/"smoothed"/"points.csv"
+            result = smooth_tracks(args.tracks, output, seconds=args.window_seconds)
+            if args.overlay:
+                from .tapnextpp import ROOT
+                from .render import render_tracks
+                base = ROOT/"data/pseudo-ground-truths/point_tracks"
+                relative = output.resolve().relative_to(base if output.resolve().is_relative_to(base) else ROOT/"data")
+                target = ROOT/"outputs/videos/point_tracks"/relative
+                result['overlay'] = render_tracks(output, target.with_suffix('.mp4'),
+                    fps=args.overlay_fps, max_width=args.max_width,
+                    render_options=rendering_configuration(args))
+            print(json.dumps(result,indent=2))
         elif args.command == "clean":
             from .cleanup_tracks import cleanup_saved_tracks
             print(json.dumps(cleanup_saved_tracks(saved_track_files(args.master),

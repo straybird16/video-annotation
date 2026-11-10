@@ -40,6 +40,10 @@ class State:
     anchor_scale: float = 1.0
     foreground: object = None
     last_original_score: float = 1.0
+    template_streak: int = 0
+    template_candidate_frame: int = 0
+    flow_center_only: bool = False
+    flow_seed: object = None
 
 
 def initialize(tracker, gray, rows):
@@ -49,7 +53,7 @@ def initialize(tracker, gray, rows):
     for i, row in enumerate(rows):
         c = tracker.patch_configs[i]
         # Dense evidence can initialize a textured support without five corners.
-        dense_accuracy = getattr(c, "tracking_policy", "fast") == "accuracy"
+        dense_accuracy = getattr(c, "tracking_policy", "fast") in ("accuracy", "combined")
         init_model = "similarity"
         if not tracker.alive[i] and (
             row["reason"] == "initial_few_support_features"
@@ -97,6 +101,7 @@ def initialize(tracker, gray, rows):
             noise_px=c.motion_noise_px,
             memory_seconds=c.motion_memory_seconds,
             center_trust=c.center_trust,
+            acceleration=c.tracking_policy == "combined",
         )
         row.update(
             pose_valid=bool(row["valid"] and init_model != "translation"),
@@ -196,7 +201,7 @@ def _batch_flow(tracker, gray, active):
     for i in active:
         if (
             tracker.explicit_masks[i]
-            or tracker._hybrid[i].center_only
+            or (tracker._hybrid[i].center_only and not tracker._hybrid[i].flow_center_only)
             or tracker._hybrid[i].last_frame != tracker.frames_seen - 1
             or tracker._hybrid[i].missing_since is not None
             or not len(tracker.features[i])
@@ -706,7 +711,7 @@ def _geometry(tracker, i, candidate, last, *, reanchor=False):
 
 
 def advance(tracker, gray, offset):
-    if getattr(tracker.config, "tracking_policy", "fast") == "accuracy":
+    if getattr(tracker.config, "tracking_policy", "fast") in ("accuracy", "combined"):
         from .klt_dense import advance as advance_dense
 
         return advance_dense(tracker, gray, offset)

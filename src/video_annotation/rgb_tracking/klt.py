@@ -82,7 +82,10 @@ class KLTConfig:
     keyframe_min_inlier_ratio: float = .8
     threads: int = 1
     template_mode: str = "correlation"
-    tracking_policy: str = "accuracy"
+    tracking_policy: str = "combined"
+    combined_motion_weight: float = .03
+    template_stable_frames: int = 3
+    output_smoothing_seconds: float = 0.
     dense_iterations: int = 12
     dense_original_threshold: float = .93
     dense_recent_threshold: float = .94
@@ -113,14 +116,14 @@ class KLTConfig:
     def __post_init__(self):
         if self.template_mode not in ("correlation", "legacy_ecc"):
             raise ValueError("template_mode must be correlation or legacy_ecc")
-        if self.tracking_policy not in ("accuracy", "fast"):
-            raise ValueError("tracking_policy must be accuracy or fast")
+        if self.tracking_policy not in ("combined", "accuracy", "fast"):
+            raise ValueError("tracking_policy must be combined, accuracy or fast")
         if self.motion_model not in MOTION_MODELS or self.adaptive_max_model not in ("affine", "homography"):
             raise ValueError("unsupported motion_model or adaptive_max_model")
         integers = ("win_size", "max_level", "patch_radius", "max_features", "min_inliers",
                     "feature_refresh_interval", "reanchor_interval", "registration_iterations", "threads",
                     "min_model_features", "min_projective_features", "keyframe_interval", "max_keyframes",
-                    "correlation_max_candidates", "correlation_refine_iterations", "correlation_top_k", "correlation_max_shapes", "dense_iterations")
+                    "correlation_max_candidates", "correlation_refine_iterations", "correlation_top_k", "correlation_max_shapes", "dense_iterations", "template_stable_frames")
         for name in integers:
             value = getattr(self, name)
             minimum = 0 if name in ("max_level", "keyframe_interval") else 1
@@ -180,6 +183,10 @@ class KLTConfig:
                 or min(self.motion_sigma, self.motion_noise_px, self.motion_memory_seconds) <= 0
                 or not 1 <= self.correlation_top_k <= 8 or not 1 <= self.correlation_max_shapes <= 729):
             raise ValueError("invalid shared motion/reference/recovery settings")
+        if not 0 <= self.combined_motion_weight <= 1 or not 0 <= self.output_smoothing_seconds <= 10:
+            raise ValueError("combined_motion_weight must be in [0,1] and output_smoothing_seconds in [0,10]")
+        if self.template_stable_frames > 100:
+            raise ValueError("template_stable_frames must be <= 100")
         if self.dense_iterations > 100:
             raise ValueError("dense_iterations must be <= 100")
         if self.registration_iterations > 100:
@@ -187,10 +194,10 @@ class KLTConfig:
 
 
 _COMMON = {"win_size", "max_level", "fb_threshold", "min_eigenvalue", "max_lk_error", "patch_radius",
-           "min_patch_ncc", "min_patch_overlap", "min_patch_std", "min_visible_fraction", "max_displacement", "threads"}
+           "min_patch_ncc", "min_patch_overlap", "min_patch_std", "min_visible_fraction", "max_displacement", "threads", "output_smoothing_seconds"}
 _REGISTRATION = {field.name for field in fields(KLTConfig) if field.name.startswith(("registration_", "adaptive_registration_"))} | {"reanchor_interval"}
 _CORRELATION = {field.name for field in fields(KLTConfig) if field.name.startswith("correlation_")} | {"template_mode"}
-_DENSE = {field.name for field in fields(KLTConfig) if field.name.startswith("dense_")} | {"tracking_policy"}
+_DENSE = {field.name for field in fields(KLTConfig) if field.name.startswith("dense_")} | {"tracking_policy", "combined_motion_weight", "template_stable_frames"}
 _KEYFRAME = {field.name for field in fields(KLTConfig) if field.name.startswith("keyframe_")} | {"max_keyframes"}
 
 
@@ -217,6 +224,8 @@ def validate_options(algorithm, options):
     allowed = available_options(algorithm, config.template_mode)
     for name, value in options.items():
         # Full canonical dataclass dictionaries remain usable by the registry.
+        if name == "tracking_policy" and name not in allowed and value in ("combined", "accuracy"):
+            continue  # Older canonical settings carry an unused accuracy default.
         if name not in allowed and value != defaults[name]:
             raise ValueError(f"{name} is not applicable to {algorithm}")
     return asdict(config)
@@ -345,8 +354,8 @@ class KLTTracker:
 
     def provenance(self):
         accuracy = (self.algorithm == "klt-template" and self.config.template_mode == "correlation"
-                    and self.config.tracking_policy == "accuracy")
-        return {"algorithm": self.name, "engine_revision": 5, "template_mode": self.config.template_mode, "tracking_policy": (self.config.tracking_policy if self.algorithm == "klt-template" and self.config.template_mode == "correlation" else "not_applicable"), "implementation": "OpenCV pyramidal LK for circles; inverse-compositional foreground alignment for explicit masks",
+                    and self.config.tracking_policy in ("accuracy", "combined"))
+        return {"algorithm": self.name, "engine_revision": 6, "template_mode": self.config.template_mode, "tracking_policy": (self.config.tracking_policy if self.algorithm == "klt-template" and self.config.template_mode == "correlation" else "not_applicable"), "implementation": "OpenCV pyramidal LK for circles; inverse-compositional foreground alignment for explicit masks",
                 "opencv": cv2.__version__, "config": asdict(self.config),
                 "patch_regions": self.patch_regions_used,
                 "support_policy": "per-query source-pixel circle intersected with optional reference foreground mask; transported by accepted warp",
@@ -354,7 +363,7 @@ class KLTTracker:
                 "border_policy": "immutable real reference pixels; reference/current visibility intersection for appearance; in-frame center and min_visible_fraction; plain edge uses supported-corner translation and LK windows shrink with visible circle area",
                 "reference_policy": ("immutable original foreground guard plus accepted recent raw RGB restricted to matching foreground; rejected/occluded fits never refresh" if self.algorithm == "klt-template" and self.config.template_mode == "correlation" else "immutable original plus optional bounded original-validated native-pixel keyframes; no unchecked template promotion"),
                 "validity_policy": "positive local tracking gates do not certify an original anchor or a drift bound; inspect registration_status separately",
-                "registration_policy": ("dense original-reference affine every frame; conditional homography and accepted recent fallback; center and pose validity remain separate" if accuracy else "original/recent proposals share source-time acceptance; center-only ambiguity never updates pose or templates; immutable original"),
+                "registration_policy": ("combined sparse/dense candidates, soft acceleration prior and stable template admission" if self.config.tracking_policy == "combined" and accuracy else "dense original-reference affine every frame; conditional homography and accepted recent fallback; center and pose validity remain separate" if accuracy else "original/recent proposals share source-time acceptance; center-only ambiguity never updates pose or templates; immutable original"),
                 "registration_convergence": ("masked NCC and temporal guard; progressive joint shape/center banks, automatic CPU map/remap scoring and bounded top-K IC-LK fits" if self.algorithm == "klt-template" and self.config.template_mode == "correlation" else "local ECC needs an already close prior; innovation limits are rejection gates, not a guaranteed capture range"),
                 "registration_budget": ("dense_iterations per original/recent local fit; conditional homography; broad recovery remains opt-in" if accuracy else "no broad recovery by default; explicit recovery enables bounded coarse/fine banks on weak evidence; one final direct fit per searched reference" if self.algorithm == "klt-template" and self.config.template_mode == "correlation" else "original first; adaptive can try one higher original model, then at most one validated-keyframe fallback (at most three ECC hypotheses per due query)"),
                 "warp_convention": "full native original-to-current homography; pose from polar decomposition of its Jacobian at the original query",
@@ -787,7 +796,7 @@ class KLTTracker:
             return
         row["keyframe_action"] = "rejected_quality"
         dense = (self.algorithm == "klt-template" and c.template_mode == "correlation"
-                 and c.tracking_policy == "accuracy")
+                 and c.tracking_policy in ("accuracy", "combined"))
         support_inliers = (row.get("photometric_inlier_ratio") if self.explicit_masks[identity] or dense
                            else row.get("inlier_ratio"))
         if support_inliers is None and dense:

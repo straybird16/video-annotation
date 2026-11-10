@@ -13,17 +13,18 @@ from video_annotation.rgb_tracking.session import parameter_help
 class AccuracyOptionTests(unittest.TestCase):
     def test_defaults_and_gui_choices(self):
         config = KLTConfig()
-        self.assertEqual(config.tracking_policy, "accuracy")
+        self.assertEqual(config.tracking_policy, "combined")
         self.assertEqual(config.dense_iterations, 12)
         self.assertEqual(config.dense_original_threshold, .93)
         self.assertEqual(config.dense_recent_threshold, .94)
         self.assertEqual(config.dense_homography_trigger, .965)
         fields = settings_fields(SimpleNamespace(
             backend="klt-template", backend_options={}))
-        self.assertEqual(fields["tracking_policy"]["choices"], ("accuracy", "fast"))
+        self.assertEqual(fields["tracking_policy"]["choices"], ("combined", "accuracy", "fast"))
         self.assertIs(fields["dense_iterations"]["type"], int)
         for name in ("tracking_policy", "dense_iterations", "dense_original_threshold",
-                     "dense_recent_threshold", "dense_homography_trigger"):
+                     "dense_recent_threshold", "dense_homography_trigger", "combined_motion_weight",
+                     "template_stable_frames", "output_smoothing_seconds"):
             self.assertIn(name, fields)
             self.assertGreater(len(parameter_help(name)), 35)
 
@@ -61,8 +62,8 @@ class AccuracyOptionTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     validate_options(algorithm, {"template_mode": mode, "dense_iterations": 20})
         tracker = KLTTracker("klt-template")
-        self.assertEqual(tracker.provenance()["engine_revision"], 5)
-        self.assertEqual(tracker.provenance()["tracking_policy"], "accuracy")
+        self.assertEqual(tracker.provenance()["engine_revision"], 6)
+        self.assertEqual(tracker.provenance()["tracking_policy"], "combined")
 
 
 if __name__ == "__main__":

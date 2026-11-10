@@ -32,7 +32,8 @@ class PatchMotion:
         sigma=4.0,
         noise_px=1.0,
         memory_seconds=0.1,
-        center_trust=0.5
+        center_trust=0.5,
+        acceleration=False,
     ):
         if (
             not np.isfinite(
@@ -48,6 +49,9 @@ class PatchMotion:
         self.enabled, self.sigma = bool(enabled), float(sigma)
         self.noise_px, self.memory_seconds = float(noise_px), float(memory_seconds)
         self.center_trust = float(center_trust)
+        if type(acceleration) is not bool:
+            raise ValueError("acceleration must be boolean")
+        self.use_acceleration = acceleration and self.enabled
         self.domain = np.array(
             [
                 [radius, 0.0, self.query[0]],
@@ -66,6 +70,11 @@ class PatchMotion:
         self.velocity = np.zeros(6)
         self.center = self.query.copy()
         self.center_velocity = np.zeros(2)
+        self.acceleration = np.zeros(6)
+        self.center_acceleration = np.zeros(2)
+        self.center_updates = 0
+        self._shape_step_velocity = self._center_step_velocity = None
+        self._shape_step_dt = self._center_step_dt = 0.0
         self.bias = np.zeros(2)
         self.bias_velocity = np.zeros(2)
         noise = noise_px / radius
@@ -135,16 +144,20 @@ class PatchMotion:
         dt = max(0.0, (float(frame) - self.frame) / self.fps)
         # Bound extrapolation, while uncertainty continues to grow through gaps.
         horizon = min(dt, max(self.memory_seconds, 1 / self.fps))
-        return dt, self.params + self.velocity * horizon
+        value = self.params + self.velocity * horizon
+        if self.use_acceleration:
+            value = value + 0.5 * self.acceleration * horizon**2
+        return dt, value
 
     def predict(self, frame, supplied=None):
         dt, params = self._prediction(frame)
         horizon = min(dt, max(self.memory_seconds, 1 / self.fps))
         if supplied is None:
             center_dt = max(0.0, (float(frame) - self.center_frame) / self.fps)
-            center = self.center + self.center_velocity * min(
-                center_dt, max(self.memory_seconds, 1 / self.fps)
-            )
+            horizon = min(center_dt, max(self.memory_seconds, 1 / self.fps))
+            center = self.center + self.center_velocity * horizon
+            if self.use_acceleration:
+                center = center + 0.5 * self.center_acceleration * horizon**2
         else:
             center = (
                 np.asarray(supplied, float) + self.bias + self.bias_velocity * horizon
@@ -236,11 +249,23 @@ class PatchMotion:
             raise ValueError("Center measurements must be finite and increasing")
         alpha = -np.expm1(-dt / self.memory_seconds)
         velocity = (center - self.center) / dt
-        self.center_velocity = (
-            (1 - alpha) * self.center_velocity + alpha * velocity
-            if self.updates
-            else velocity
-        )
+        if self.use_acceleration:
+            self.center_velocity, self.center_acceleration = self._rates(
+                self.center_velocity,
+                self.center_acceleration,
+                velocity,
+                self._center_step_velocity,
+                dt,
+                self._center_step_dt,
+                alpha,
+            )
+        else:
+            self.center_velocity = (
+                (1 - alpha) * self.center_velocity + alpha * velocity
+                if self.center_updates
+                else velocity
+            )
+        self._center_step_velocity, self._center_step_dt = velocity.copy(), dt
         if supplied is not None:
             bias = center - np.asarray(supplied, float)
             velocity = (bias - self.bias) / dt
@@ -251,7 +276,26 @@ class PatchMotion:
             )
             self.bias = bias
         self.center, self.center_frame = center.copy(), int(frame)
+        self.center_updates += 1
         self._check_cache.clear()
+
+    @staticmethod
+    def _rates(velocity, acceleration, observed, previous, dt, previous_dt, alpha):
+        """Source-time secant derivatives with a soft acceleration-continuity prior.
+
+        EMA acceleration is the minimizer of a weighted new-acceleration versus
+        previous-acceleration quadratic. It smooths jerk, not acceleration toward
+        zero. A secant spans the middle of its interval; extrapolate its rate to
+        the current instant before combining with the predicted rate.
+        """
+        if previous is None:
+            return observed.copy(), np.zeros_like(acceleration)
+        measured_acceleration = 2 * (observed - previous) / (dt + previous_dt)
+        updated = (1 - alpha) * acceleration + alpha * measured_acceleration
+        rate = (1 - alpha) * (velocity + acceleration * dt) + alpha * (
+            observed + 0.5 * updated * dt
+        )
+        return rate, updated
 
     def commit(self, matrix, frame, supplied=None):
         center, params, valid = self.decompose([matrix])
@@ -264,9 +308,7 @@ class PatchMotion:
         value[0] = self.params[0] + _wrap(value[0] - self.params[0])
         difference = value - self.params
         alpha = -np.expm1(-dt / self.memory_seconds)
-        predicted = self.params + self.velocity * min(
-            dt, max(self.memory_seconds, 1 / self.fps)
-        )
+        _, predicted = self._prediction(frame)
         innovation = value - predicted
         innovation[0] = _wrap(innovation[0])
         if self.updates:
@@ -274,11 +316,24 @@ class PatchMotion:
                 innovation**2,
                 (self.sigma * np.sqrt(np.maximum(self.variance, self.noise**2))) ** 2,
             )
-        self.velocity = (
-            (1 - alpha) * self.velocity + alpha * difference / dt
-            if self.updates
-            else difference / dt
-        )
+        observed = difference / dt
+        if self.use_acceleration:
+            self.velocity, self.acceleration = self._rates(
+                self.velocity,
+                self.acceleration,
+                observed,
+                self._shape_step_velocity,
+                dt,
+                self._shape_step_dt,
+                alpha,
+            )
+        else:
+            self.velocity = (
+                (1 - alpha) * self.velocity + alpha * observed
+                if self.updates
+                else observed
+            )
+        self._shape_step_velocity, self._shape_step_dt = observed.copy(), dt
         self.commit_center(center[0], frame, supplied)
         self.params, self.center = value, center[0]
         self.H, self.frame = np.asarray(matrix, float).copy(), int(frame)

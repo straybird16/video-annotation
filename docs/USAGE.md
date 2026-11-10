@@ -25,12 +25,13 @@ loaded across editors in the same session.
 
 KLT uses the circle intersected with the optional mask, transporting that support
 with the accepted warp. `klt` follows sparse pyramidal flow; `klt-affine` adds
-geometric fitting. `klt-template` defaults to `tracking_policy=accuracy`: dense
-original-reference registration on every frame, conditional perspective fitting,
-and accepted recent-reference fallback when appearance changes. This makes center
-localization the primary measurement rather than accepting a sparse proposal.
-Choose `tracking_policy=fast` for the earlier sparse-KLT/correlation cascade.
-Both policies keep broad center/pose recovery **off by default**; enable
+geometric fitting. `klt-template` defaults to `tracking_policy=combined`: full
+KLT/RANSAC proposals seed dense original-reference registration, conditional
+perspective fitting and accepted recent-reference fallback. Strong sparse motion
+with consecutive-frame appearance agreement can retain a center when pose is
+uncertain; no pose or appearance update is published for that fallback.
+Choose `accuracy` for the preceding dense policy or `fast` for the earlier
+sparse-KLT/correlation cascade. All keep broad recovery **off by default**; enable
 `recovery_enabled` for a deliberate recovery pass. Similarity, affine, homography
 and adaptive models remain selectable. `template_mode=legacy_ecc` keeps the older
 periodic iterative-registration route. TAPNext++ uses point coordinates only;
@@ -44,8 +45,33 @@ occluder. `stop_on_occlusion` and `min_foreground_fraction` control this policy.
 In the fast policy, `center_smoothing` suppresses weak small translation
 innovations; a sufficient NCC improvement or larger motion passes through. The
 accuracy policy retains the dense subpixel optimum; motion prediction only seeds
-the fit. `center_smoothing_px` is the
-source-pixel jitter range (default2). Center and full H are corrected together.
+the fit. Combined uses filtered source-time velocity and acceleration, then scores
+a small set of full-H candidates with a soft motion prior. Its maximum cost is
+`combined_motion_weight=0.03` NCC units, so stronger image evidence can override
+it. There is no hard center-acceleration rejection. Shape gates remain active.
+Recent appearance needs `template_stable_frames=3` consecutive accepted,
+motion-consistent fits; center-only fallbacks never refresh it. The fast-policy
+`center_smoothing_px` defaults to 2 source pixels. Center and full H remain coherent.
+
+Optional `output_smoothing_seconds` (default 0/off) applies a degree-2
+Savitzky–Golay center filter after tracking and lifetime cleanup. Use source
+seconds, for example `--output-smoothing-seconds 0.15`. It works only within
+contiguous visible segments, keeps query/manual anchors and `raw_x`/`raw_y`,
+and translates full H without refitting its shape. Pose/fit scores still describe
+the raw measurements. The window is odd and at least five frames; shorter
+segments are unchanged. It never fills gaps or extends point endings.
+
+To smooth existing predictions or corrections into a **new** track and render it:
+
+```bash
+video-annotate smooth --tracks data/pseudo-ground-truths/point_tracks/COLLECTION/VIDEO/TRACKER/MODEL/points.csv \
+  --window-seconds 0.15 --overlay
+```
+
+The default output is `smoothed/points.csv` beside the input. Use `--output` for
+another new data-local CSV. Originals are preserved; an existing destination is
+rejected. Re-smoothing uses recorded raw centers rather than filtering twice.
+These controls are also in point **Settings** and saved session presets.
 
 Classical `points.csv` keeps the original first six columns and appends initial
 rotation/scale estimates, component-validity flags, selected motion model,
@@ -63,7 +89,8 @@ available as an explicitly uncertain initial guess.
 
 **Settings** exposes tracking parameters and hover help, including template-bank
 size. **Save settings** exports a JSON usable with `--config` in the GUI or CLI.
-See the [parameter guide](../src/video_annotation/guides/KLT_PARAMETERS.md).
+See the [parameter guide](../src/video_annotation/guides/KLT_PARAMETERS.md) and
+[portable combined options](examples/klt_combined.json) (`--tracker-options`).
 
 Lost points disappear and trails clear. Native reacquisition is accepted within
 `reacquire_seconds` (default 0.5 source-video seconds); later automatic returns

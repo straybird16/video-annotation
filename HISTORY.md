@@ -2,6 +2,15 @@
 
 Newest entries first. See PROVENANCE.md for the original workspace history.
 
+- 2026-11-10 — Combined full sparse KLT/RANSAC proposals with original/recent dense
+  fitting and reliable center-only fallbacks. Added a bounded soft acceleration
+  prior, stable appearance admission and optional segmentwise degree-2 SG center
+  output, including a derivative command for existing/corrected tracks. Defaults
+  keep broad recovery and output filtering off; old policies remain selectable.
+  Codex `/root`; known-motion/lighting checks and a 60-frame Amherst export/render
+  smoke, not a new full-video accuracy benchmark. [Usage](docs/USAGE.md),
+  [parameters](src/video_annotation/guides/KLT_PARAMETERS.md).
+
 - 2026-11-10 — Added the original-first dense accuracy policy for template KLT:
   per-frame affine registration, conditional perspective fitting and accepted
   recent-reference fallback. Preserved the prior fast policy, explicit patch

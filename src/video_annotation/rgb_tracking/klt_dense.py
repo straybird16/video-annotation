@@ -39,8 +39,11 @@ def _prefer_fit(candidate, previous):
 
 
 def _last(tracker, i):
+    state = tracker._hybrid[i]
+    if state.flow_center_only and state.flow_seed is not None:
+        return state.flow_seed
     matrix = tracker.transforms[i]
-    if tracker._hybrid[i].center_only:
+    if state.center_only:
         # A center-only stream advances independently of its last trusted pose.
         # Rebase only the internal seed; never export this invented full pose.
         return shared._centered_shape(
@@ -244,6 +247,7 @@ def _seeds(tracker, i, predicted, flow):
 
 def _failure(tracker, i, row, reason, hint):
     state, c = tracker._hybrid[i], tracker.patch_configs[i]
+    state.template_streak = 0
     row.update(
         reason=reason,
         failure_reason=reason,
@@ -278,10 +282,15 @@ def _reanchor(state, matrix, frame, hint):
     """Repair the accepted shape prior without teaching it the drift jump."""
     motion = state.motion
     center_velocity = motion.center_velocity.copy()
+    center_acceleration = motion.center_acceleration.copy()
     motion.commit(matrix, frame, hint)
     motion.velocity[:] = 0
+    motion.acceleration[:] = 0
+    motion._shape_step_velocity = None
+    motion._center_step_velocity = None
     motion.variance = motion.noise**2
     motion.center_velocity = center_velocity
+    motion.center_acceleration = center_acceleration
     motion._check_cache.clear()
 
 
@@ -325,6 +334,12 @@ def advance(tracker, gray, offset):
             continue
         predicted = state.motion.predict(tracker.frames_seen, hint)
         flow = flows.get(i)
+        combined = c.tracking_policy == "combined"
+        sparse = None
+        if combined:
+            from .klt_combined import sparse_proposal
+
+            sparse = sparse_proposal(tracker, gray, i, flow)
         row.update(
             tracking_status="tracking",
             alignment_method="original_dense",
@@ -337,6 +352,13 @@ def advance(tracker, gray, offset):
             ),
         )
         seeds = _seeds(tracker, i, predicted, flow)
+        if sparse is not None:
+            seeds.insert(0, sparse["matrix"])
+            row.update(
+                sparse_proposal=True,
+                inlier_ratio=sparse["metrics"]["inlier_ratio"],
+                residual_px=sparse["metrics"]["residual_px"],
+            )
         original = _original_fit(tracker, gray, i, seeds)
         chosen = original
         recent_score = -1.0
@@ -396,9 +418,37 @@ def advance(tracker, gray, offset):
                     if chosen.matrix is None
                     else "low_patch_correlation"
                 )
+                if combined:
+                    from .klt_combined import keep_sparse_center
+
+                    if keep_sparse_center(tracker, gray, i, sparse, row, hint):
+                        scores[i] = max(0.001, row["fit_score"])
+                        continue
                 _failure(tracker, i, row, reason, hint)
                 continue
         candidate = chosen.matrix
+        if combined:
+            from .klt_combined import regularize
+
+            reference = (
+                state.original if chosen.reference == "original" else state.recent
+            )
+            candidate, chosen.info, regularization = regularize(
+                tracker, gray, i, candidate, reference, chosen.info or {}, predicted
+            )
+            chosen.score = float(
+                shared._score(tracker, gray, i, [candidate], reference)[0][0]
+            )
+            row.update(regularization)
+            if sparse is not None and sparse["reliable"]:
+                disagreement = float(
+                    np.linalg.norm(project_points(candidate, p) - sparse["center"])
+                )
+                row.update(
+                    sparse_center_error_px=disagreement,
+                    sparse_center_agreement=disagreement
+                    <= max(1.0, c.motion_noise_px * 2),
+                )
         original_score = float(
             shared._score(tracker, gray, i, [candidate], state.original)[0][0]
         )
@@ -428,7 +478,7 @@ def advance(tracker, gray, offset):
         continuous_recent = (
             chosen.reference == "recent"
             and recent_score >= c.dense_recent_threshold
-            and (chosen.info or {}).get("photometric_inlier_ratio", 0.0) >= 0.9
+            and ((chosen.info or {}).get("photometric_inlier_ratio") or 0.0) >= 0.9
             and (chosen.info or {}).get("overlap", 0.0)
             >= max(0.4, c.min_visible_fraction)
             and state.last_original_score - original_score <= 0.1
@@ -492,6 +542,12 @@ def advance(tracker, gray, offset):
             and not reanchored
         )
         if center_only:
+            if combined:
+                from .klt_combined import keep_sparse_center
+
+                if keep_sparse_center(tracker, gray, i, sparse, row, hint):
+                    scores[i] = max(0.001, row["fit_score"])
+                    continue
             # Ambiguous rotation/shape must not discard a strongly localized
             # center or leak a rejected H into the unified point/pose table.
             if chosen.score >= (
@@ -502,6 +558,8 @@ def advance(tracker, gray, offset):
                 tracker.points[i] = center
                 state.motion.commit_center(center, tracker.frames_seen, hint)
                 state.center_only = True
+                state.flow_center_only = False
+                state.template_streak = 0
                 state.last_frame = tracker.frames_seen
                 state.missing_since = None
                 state.last_original_score = original_score
@@ -541,6 +599,8 @@ def advance(tracker, gray, offset):
             state.motion.commit(candidate, tracker.frames_seen, hint)
         state.delta = candidate @ np.linalg.inv(last)
         state.center_only = False
+        state.flow_center_only = False
+        state.flow_seed = None
         state.last_frame = tracker.frames_seen
         state.missing_since = None
         state.foreground = foreground
@@ -562,6 +622,17 @@ def advance(tracker, gray, offset):
             and tracker.observability[i] >= c.registration_min_observability
             and not row.get("occlusion_suspected", False)
         )
+        if combined:
+            from .klt_combined import admit_template
+
+            refresh = admit_template(
+                state,
+                row,
+                frame=tracker.frames_seen,
+                stable_frames=c.template_stable_frames,
+                eligible=refresh,
+                reanchored=reanchored,
+            )
         if refresh:
             pixels, visible = shared._sampled_patch(tracker, gray, i, candidate)
             # Keep the original support; visibility excludes only genuinely
@@ -613,7 +684,11 @@ def advance(tracker, gray, offset):
                 for x in range(3)
             }
         )
-        if strong_original and not row.get("occlusion_suspected", False):
+        if (
+            strong_original
+            and not row.get("occlusion_suspected", False)
+            and (not combined or refresh)
+        ):
             tracker._promote_keyframe(gray, i, candidate, row)
         scores[i] = min(1.0, max(0.001, chosen.score))
         tracker._sampled_patches[i].clear()
