@@ -28,7 +28,7 @@ def sparse_identity(p, q, config):
 class FastPolicyTests(unittest.TestCase):
     def test_occluder_matching_recent_cannot_replace_original_identity(self):
         original, foreign = image(), image(19)
-        tracker = KLTTracker("klt-template", win_size=5)
+        tracker = KLTTracker("klt-template", tracking_policy="fast", win_size=5)
         tracker.initialize_gray(original, [[80.0, 80.0]])
         state = tracker._hybrid[0]
         pixels, _ = tracker._patch(
@@ -55,7 +55,7 @@ class FastPolicyTests(unittest.TestCase):
         np.testing.assert_array_equal(tracker.transforms[0], np.eye(3))
 
     def test_default_failure_does_not_retry_during_grace(self):
-        tracker = KLTTracker("klt-template", stop_on_occlusion=False)
+        tracker = KLTTracker("klt-template", tracking_policy="fast", stop_on_occlusion=False)
         tracker.set_stream_timing(30, 2.0)
         tracker.initialize_gray(image(), [[80.0, 80.0]])
         self.assertFalse(KLTConfig().recovery_enabled)
@@ -77,6 +77,7 @@ class FastPolicyTests(unittest.TestCase):
         for smoothing in (False, True):
             tracker = KLTTracker(
                 "klt-template",
+                tracking_policy="fast",
                 win_size=5,
                 center_smoothing=smoothing,
                 stop_on_occlusion=False,

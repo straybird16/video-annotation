@@ -42,6 +42,7 @@ def settings_fields(processor, *, overlay_fps=None, max_width=1280):
     choices = {"motion_model": ("similarity", "affine", "homography", "adaptive"),
                "adaptive_max_model": ("affine", "homography"),
                "template_mode": ("correlation", "legacy_ecc"),
+               "tracking_policy": ("accuracy", "fast"),
                "resolution": (256, 512), "precision": ("auto", "none", "float16", "bfloat16")}
     if backend == "tapnextpp":
         from inspect import signature
@@ -53,8 +54,8 @@ def settings_fields(processor, *, overlay_fps=None, max_width=1280):
         from dataclasses import asdict
         from .klt import KLTConfig, available_options
         defaults = asdict(KLTConfig())
-        defaults = {name: defaults[name] for name in available_options(backend)}
         current = processor.backend_options
+        defaults = {name: defaults[name] for name in available_options(backend, current.get("template_mode", "correlation"))}
     result = {}
     for name, default in defaults.items():
         value = current.get(name, default)

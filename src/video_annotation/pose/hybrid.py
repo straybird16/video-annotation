@@ -104,6 +104,7 @@ class HybridPoseEstimator:
             registration_min_observability=config.rotation_min_observability,
             registration_iterations=min(100, options["ic_iters"]),
             correlation_refine_iterations=min(30, options["ic_iters"]),
+            dense_iterations=min(100, options["ic_iters"]),
             correlation_trigger=options["search_trigger"],
             correlation_search_radius=(
                 options["search_radius"] if options["center_search"] else 12.0

@@ -2,6 +2,15 @@
 
 Newest entries first. See PROVENANCE.md for the original workspace history.
 
+- 2026-11-10 — Added the original-first dense accuracy policy for template KLT:
+  per-frame affine registration, conditional perspective fitting and accepted
+  recent-reference fallback. Preserved the prior fast policy, explicit patch
+  support, separate center/pose validity and opt-in broad recovery. Based on the
+  user-supplied `tracker_evaluation_bundle` and discussion, reusing the shared
+  patch fitter; supplied experimental results are not validation of this release.
+  Codex coordinator with focused engine, controls and evaluation workers.
+  [Workflow](docs/USAGE.md), [parameters](src/video_annotation/guides/KLT_PARAMETERS.md).
+
 - 2026-11-09 — Disabled broad recovery by default, added original-foreground
   survival checks, bounded original drift correction and confidence-aware center
   smoothing. Unified tracking/refinement in `points.csv`, added full-H review and

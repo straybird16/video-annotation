@@ -10,10 +10,15 @@ from .tapnextpp import ROOT, contained_path
 PARAMETER_GUIDE = Path(__file__).resolve().parents[1]/'guides/KLT_PARAMETERS.md'
 
 PARAMETER_HELP = {
+    'tracking_policy': 'Accuracy (default) fits the immutable original patch densely every frame, with conditional homography and accepted recent fallback. Fast retains the earlier sparse-KLT/correlation cascade. Only applies to correlation-mode klt-template.',
+    'dense_iterations': 'Maximum inverse-compositional iterations per dense local fit, from 1 to 100; default 12. More iterations may improve convergence but cost more time.',
+    'dense_original_threshold': 'Masked NCC below this tries recent appearance and an independent original-shape seed, in (0,1]; default 0.93. Scores at or above it count as strong original support; min_patch_ncc remains the acceptance floor.',
+    'dense_recent_threshold': 'Minimum masked NCC for an accepted recent-template dense fallback, in (0,1]; default 0.94. Recent appearance is updated only after accepted geometry.',
+    'dense_homography_trigger': 'Try a supported homography when dense affine NCC is below this value, in (0,1]; default 0.965. A larger value tries perspective fitting more often.',
     'recovery_enabled': 'Allow expensive shape/center recovery after a local fit fails. Default off keeps the fast local path. Definite occlusion never triggers a recovery search.',
     'stop_on_occlusion': 'End a patch track when foreground evidence indicates definite occlusion; default on. This is distinct from ordinary uncertain fits and the source-time reacquisition grace.',
     'min_foreground_fraction': 'Minimum fraction of original foreground evidence required by the occlusion check, in (0,1]; default 0.5. Lower values permit more partial foreground.',
-    'center_smoothing': 'Reduce small accepted center jitter using source-pixel motion uncertainty; default on. Accepted rotation/scale and source timestamps remain unchanged.',
+    'center_smoothing': 'Fast-policy only: reduce small accepted center jitter using source-pixel motion uncertainty. Accuracy retains the dense subpixel optimum and uses the motion prior only as a fit seed.',
     'center_smoothing_px': 'Source-pixel range used to smooth small center jitter; default 2 pixels. Larger values smooth more, independently of overlay resolution or FPS.',
     'reacquire_seconds': 'Maximum source-video seconds after first loss for native tracker recovery. Default 0.5; zero ends immediately. Lost points are hidden and unrecovered tails are omitted from new predictions.',
     'motion_model': 'Patch geometry: adaptive (default) upgrades only with evidence; fixed similarity, affine or homography are also available.',
@@ -67,7 +72,7 @@ PARAMETER_HELP = {
     'adaptive_complexity_penalty': 'Additional validation penalty per model complexity level, in pixel residual units.',
     'adaptive_registration_min_ncc': 'Original-registration NCC below this triggers one supported higher-model attempt.',
     'adaptive_registration_min_gain': 'NCC improvement required to replace an accepted simpler registration.',
-    'template_mode': 'Correlation uses cheap masked patch scoring and bounded recovery. Legacy ECC keeps the former iterative registration route.',
+    'template_mode': 'Correlation supports dense accuracy and sparse fast policies. Legacy ECC keeps the former periodic iterative registration route.',
     'correlation_trigger': 'Correlation below this score triggers bounded nearby motion/center search. Higher values search more often.',
     'correlation_margin': 'Required normalized-correlation advantage over a distinct recovery candidate. Larger rejects ambiguous matches.',
     'correlation_search_radius': 'Maximum nearby center search radius in source pixels during recovery; max_displacement remains an acceptance limit.',

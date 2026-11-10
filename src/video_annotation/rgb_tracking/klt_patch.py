@@ -39,6 +39,7 @@ class State:
     center_only: bool = False
     anchor_scale: float = 1.0
     foreground: object = None
+    last_original_score: float = 1.0
 
 
 def initialize(tracker, gray, rows):
@@ -48,23 +49,33 @@ def initialize(tracker, gray, rows):
     for i, row in enumerate(rows):
         c = tracker.patch_configs[i]
         # Dense evidence can initialize a textured support without five corners.
-        if not tracker.alive[i] and row["reason"] == "initial_few_support_features":
-            fit, info = tracker._masked_align(
-                gray,
-                tracker.templates[i],
-                tracker.support_masks[i],
-                tracker.initial_points[i],
-                np.eye(3),
-                c,
-                "similarity",
-            )
-            if fit is not None:
-                tracker.alive[i] = True
-                row.update(
-                    valid=True,
-                    reason="initialized_dense_support",
-                    **{k: v for k, v in info.items() if k != "reason"},
+        dense_accuracy = getattr(c, "tracking_policy", "fast") == "accuracy"
+        init_model = "similarity"
+        if not tracker.alive[i] and (
+            row["reason"] == "initial_few_support_features"
+            or dense_accuracy
+            and row["reason"] == "initial_masked_unobservable_warp"
+        ):
+            for init_model in (
+                ("similarity", "translation") if dense_accuracy else ("similarity",)
+            ):
+                fit, info = tracker._masked_align(
+                    gray,
+                    tracker.templates[i],
+                    tracker.support_masks[i],
+                    tracker.initial_points[i],
+                    np.eye(3),
+                    c,
+                    init_model,
                 )
+                if fit is not None:
+                    tracker.alive[i] = True
+                    row.update(
+                        valid=True,
+                        reason="initialized_dense_support",
+                        **{k: v for k, v in info.items() if k != "reason"},
+                    )
+                    break
         tracker._hybrid.append(
             State(
                 Reference(
@@ -88,12 +99,13 @@ def initialize(tracker, gray, rows):
             center_trust=c.center_trust,
         )
         row.update(
-            pose_valid=bool(row["valid"]),
+            pose_valid=bool(row["valid"] and init_model != "translation"),
             rotation_valid=bool(
                 row["valid"]
+                and init_model != "translation"
                 and tracker.observability[i] >= c.registration_min_observability
             ),
-            scale_valid=bool(row["valid"]),
+            scale_valid=bool(row["valid"] and init_model != "translation"),
             fit_score=1.0 if row["valid"] else None,
             recent_score=1.0 if row["valid"] else None,
             original_score=1.0 if row["valid"] else None,
@@ -612,7 +624,11 @@ def _foreground(tracker, gray, i, candidate, row):
         or tracker.explicit_masks[i]
         and row.get("original_score", 1.0) < c.min_patch_ncc
     )
-    lost = low_foreground and corroborated
+    lost = (
+        low_foreground
+        and corroborated
+        and not row.get("continuous_recent_appearance", False)
+    )
     row["occlusion_suspected"] = bool(low_foreground)
     row["occluded"] = bool(lost)
     if lost:
@@ -690,6 +706,10 @@ def _geometry(tracker, i, candidate, last, *, reanchor=False):
 
 
 def advance(tracker, gray, offset):
+    if getattr(tracker.config, "tracking_policy", "fast") == "accuracy":
+        from .klt_dense import advance as advance_dense
+
+        return advance_dense(tracker, gray, offset)
     from .klt import fit_similarity
 
     tracker._current_gray = gray

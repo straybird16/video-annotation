@@ -1,20 +1,21 @@
 # KLT settings reference
 
-Without an explicit mask, the tracker follows local texture with pyramidal
-Lucas–Kanade optical flow and checks each match forwards and backwards.
-`klt-affine` fits motion to several support features; `klt-template` defaults to
-correlation-guarded proposals, retaining the original patch and accepted recent
-appearance. Expensive nearby center/pose recovery is optional and off by default;
-enable `recovery_enabled` to search after a weak local fit. Only bounded top-K
-candidates receive fine alignment. `template_mode=legacy_ecc`
-selects the former periodic iterative registration. Similarity is the conservative
-rotation/uniform-scale model; affine adds shear and homography adds perspective.
-Adaptive is the new default: extra affine/projective freedom is tried only when
-the simpler proposal has insufficient evidence; explicit fixed-model settings
-remain fixed.
-These are estimates: a passing score does not certify correct correspondence.
-Image correlation does not require a minimum number of corners to validate a
-recovery, but needs textured and sufficiently unambiguous support.
+`klt` follows local texture with pyramidal Lucas–Kanade flow and forward/backward
+checks. `klt-affine` fits geometric motion to several support features.
+`klt-template` defaults to **accuracy**: fit the immutable original patch densely
+on every frame, use a conditional homography when affine is insufficient, and
+fall back to accepted recent appearance when the original appearance changes.
+KLT and temporal predictions provide starting guesses rather than final centers.
+The saved point circle and optional foreground mask define the fit support.
+
+Set `tracking_policy=fast` to retain the earlier sparse-KLT/correlation cascade.
+The policy and `dense_*` controls apply only to `klt-template` with
+`template_mode=correlation`; `template_mode=legacy_ecc` retains the older periodic
+iterative-registration route. Broad center/pose recovery remains optional and
+off by default. With `recovery_enabled`, bounded top-K candidates receive fine
+alignment after a weak local fit. Similarity, affine and homography remain
+selectable; adaptive permits a supported upgrade to the configured maximum model.
+A passing score does not certify correct object correspondence or absolute accuracy.
 
 The shared patch-hybrid path applies temporal motion acceptance before committing
 a pose, recent appearance or motion history. Motion controls use source-video
@@ -40,7 +41,8 @@ Explicit masks use direct inverse-compositional Lucas–Kanade alignment: the
 previous and current patches are compared only on foreground samples, transported
 through the candidate warp. Reference gradients exclude the mask boundary.
 Narrow masks do not need six complete LK feature windows. Unmasked circles use
-sparse LK; window/pyramid/corner and RANSAC settings below apply to that path.
+sparse LK for proposals; the accuracy policy also densely fits their foreground.
+Window/pyramid/corner and RANSAC settings below control sparse proposals.
 Flat or geometrically ambiguous masks can still fail initialization.
 
 Support moves according to the full fitted warp, not the average feature
@@ -49,10 +51,11 @@ its center translates: rotation plus translation permits both motions. The
 query center is projected through the fitted warp. A single warp still cannot
 represent mixed moving wheel/road/background pixels or arbitrary nonrigid motion.
 
-Masked alignment uses `registration_iterations` / `registration_epsilon` for its
-foreground-only proposal each frame, followed by the same correlation guard and
-recovery as unmasked patches. Adaptive masked updates start with similarity;
-stronger models need supported improvement. Masked diagnostics report actual
+The accuracy policy uses `dense_iterations` for its local dense fits. The fast
+policy uses `registration_iterations` / `registration_epsilon` for foreground-only
+masked proposals, followed by the same correlation guard and recovery as unmasked
+patches. Fast adaptive masked updates start with similarity; stronger models need
+supported improvement. Masked diagnostics report actual
 photometric support and residuals instead of corner/FB counts. Larger patches
 can help texture but may mix objects; start with useful foreground and defaults.
 
@@ -74,10 +77,15 @@ that an iterative optimizer or a finite candidate grid finds the true motion.
 
 | Parameter | Default | Meaning |
 |---|---|---|
+| `tracking_policy` | `accuracy` | Original-first dense local fitting; `fast` retains the earlier sparse proposal/correlation cascade. Correlation-mode template tracking only. |
+| `dense_iterations` | `12` | Maximum inverse-compositional iterations per dense local fit, from 1 to 100. |
+| `dense_original_threshold` | `0.93` | Below this original NCC, try a recent fallback and an independent original-shape seed; at/above it marks strong original support. `min_patch_ncc` is the acceptance floor. |
+| `dense_recent_threshold` | `0.94` | Minimum masked NCC for an accepted recent-reference dense fallback. |
+| `dense_homography_trigger` | `0.965` | Try supported perspective fitting when affine NCC falls below this value; larger tries more often. |
 | `recovery_enabled` | `false` | Permit expensive shape/center recovery after local failure. |
 | `stop_on_occlusion` | `true` | End a track on definite foreground occlusion; no occluded-frame search. |
 | `min_foreground_fraction` | `0.5` | Foreground fraction required by the occlusion check, in (0,1]. |
-| `center_smoothing` | `true` | Smooth small accepted center jitter. |
+| `center_smoothing` | `true` | Fast-policy small-center smoothing. Accuracy retains the dense subpixel optimum; its motion prior only seeds fitting. |
 | `center_smoothing_px` | `2` | Source-pixel smoothing range; independent of preview size/FPS. |
 | `motion_model` | `adaptive` | Start simple and upgrade with evidence; fixed similarity, affine or homography are also selectable. |
 | `motion_gate` | `true` | Reject temporally inconsistent motion before committing pose or template updates. |
@@ -129,7 +137,7 @@ that an iterative optimizer or a finite candidate grid finds the true motion.
 | `adaptive_complexity_penalty` | `0.03` | Additional validation penalty per model complexity level, in pixel residual units. |
 | `adaptive_registration_min_ncc` | `0.95` | Original-registration NCC below this triggers one supported higher-model attempt. |
 | `adaptive_registration_min_gain` | `0.02` | NCC improvement required to replace an accepted simpler registration. |
-| `template_mode` | `correlation` | Cheap masked NCC guard/recovery; `legacy_ecc` selects the older iterative route. |
+| `template_mode` | `correlation` | Dense accuracy or sparse fast policy; `legacy_ecc` selects the older periodic iterative route. |
 | `correlation_trigger` | `0.85` | NCC below this triggers bounded dense center/pose recovery. |
 | `correlation_margin` | `0.03` | Required score advantage over a distinct recovery basin; adjacent samples do not count as a rival. |
 | `correlation_search_radius` | `12.0` | Maximum local center search radius in source pixels, also capped by `max_displacement`. |
@@ -138,7 +146,7 @@ that an iterative optimizer or a finite candidate grid finds the true motion.
 | `correlation_angle_step` | `6.0` | Coarse rotation step in degrees. |
 | `correlation_max_candidates` | `24` | Maximum ranked joint candidates considered for distinct-basin fine fitting; every selected shape/center is still coarse-scored. |
 | `correlation_refine_iterations` | `8` | Maximum fine alignment iterations for at most the best candidate. |
-| `reanchor_interval` | `10` | Frames between original-reference checks; in `legacy_ecc` this runs periodic iterative registration. Lower costs more compute. |
+| `reanchor_interval` | `10` | Fast-policy frames between original-reference checks; legacy ECC runs periodic iterative registration. Accuracy fits the original every frame. |
 | `registration_min_ncc` | `0.85` | Minimum reference-to-current normalized correlation to accept a template registration. |
 | `registration_min_gain` | `0.0` | Required NCC improvement over the prealigned patch; 0 permits equal scores within tolerance. |
 | `registration_min_overlap` | `0.95` | Minimum fraction of supported registration/reference pixels inside the image. |

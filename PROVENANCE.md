@@ -45,3 +45,13 @@ were added. The supplied synthetic performance claims are not reclassified as
 measurements on real data or as an official implementation. The existing fast
 correlation engine supplies seeds; `pose/methods.py` selects candidates with the
 supplied guarded-fallback policy. `anchored` remains explicitly selectable.
+
+
+On 2026-11-10 the accuracy policy in `rgb_tracking/klt_dense.py` was informed by
+user-supplied `tracker_evaluation_bundle/tested_reference_tracker.py` and the
+accompanying discussion. It integrates that original-first dense registration
+approach through the existing `common.patch_matching.PatchReference` engine,
+with the application's mask, source-coordinate, validity and storage contracts.
+The bundle and its example result artifacts are not redistributed. Its reported
+experimental numbers remain supplied evidence, not independently reproduced
+accuracy measurements or official upstream guarantees.

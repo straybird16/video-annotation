@@ -30,7 +30,7 @@ class CorrelationTrackingTests(unittest.TestCase):
             )
             for i in range(5)
         ]
-        tracker = KLTTracker("klt-template", win_size=5, feature_refresh_interval=5)
+        tracker = KLTTracker("klt-template", tracking_policy="fast", win_size=5, feature_refresh_interval=5)
         tracker.set_patch_regions([12, 12])
         with patch("cv2.calcOpticalFlowPyrLK", wraps=cv2.calcOpticalFlowPyrLK) as flow:
             xy, quality, _ = tracker.infer(frames, points)
@@ -50,7 +50,7 @@ class CorrelationTrackingTests(unittest.TestCase):
 
     def test_dense_search_recovers_without_a_sparse_fit(self):
         image = texture()
-        tracker = KLTTracker("klt-template", win_size=5, correlation_margin=0.02,
+        tracker = KLTTracker("klt-template", tracking_policy="fast", win_size=5, correlation_margin=0.02,
                              recovery_enabled=True, stop_on_occlusion=False)
         tracker.set_patch_regions([20])
         tracker.infer([bgr(image)], [[70.0, 70.0]])
@@ -67,7 +67,7 @@ class CorrelationTrackingTests(unittest.TestCase):
         image = texture()
         blank = np.full_like(image, 110)
         for grace, recover in [(0.5, True), (0.05, False)]:
-            tracker = KLTTracker("klt-template", win_size=5,
+            tracker = KLTTracker("klt-template", tracking_policy="fast", win_size=5,
                                  recovery_enabled=True, stop_on_occlusion=False)
             tracker.set_stream_timing(10, grace)
             tracker.infer([bgr(image)], [[80.0, 80.0]])
@@ -111,6 +111,7 @@ class CorrelationTrackingTests(unittest.TestCase):
         )
         tracker = KLTTracker(
             "klt-template",
+            tracking_policy="fast",
             motion_model="adaptive",
             win_size=7,
             min_inliers=4,
@@ -148,6 +149,7 @@ class CorrelationTrackingTests(unittest.TestCase):
             frames.append(bgr(cv2.warpPerspective(image, h, (160, 160))))
         tracker = KLTTracker(
             "klt-template",
+            tracking_policy="fast",
             motion_model="homography",
             win_size=7,
             min_inliers=4,
@@ -174,6 +176,7 @@ class CorrelationTrackingTests(unittest.TestCase):
         point = np.array([80.0, 80.0])
         tracker = KLTTracker(
             "klt-template",
+            tracking_policy="fast",
             win_size=5,
             reanchor_interval=1,
             motion_model="similarity",

@@ -23,25 +23,28 @@ with middle-drag or Shift-left-drag. Apply a SAM preview to edit it manually.
 Without SAM installed, all manual tools remain available. The SAM model stays
 loaded across editors in the same session.
 
-KLT uses the circle intersected with the optional mask. Explicit masks use
-foreground-only direct alignment, transporting support with the accepted warp.
-Unmasked patches use sparse pyramidal KLT. `klt-affine` adds geometric fitting;
-`klt-template` defaults to correlation-guarded motion proposals: masked patch
-scores validate the proposal. Broad center/pose recovery is **off by default**;
-enable `recovery_enabled` for a deliberate recovery pass. Similarity,
-affine, homography and adaptive models are selectable. `template_mode=legacy_ecc`
-keeps the former periodic iterative-registration route. TAPNext++ uses point
-coordinates only; patch annotations remain editable for other trackers.
-Adaptive is the default for new KLT patch runs; existing configs retain their
-explicit model choice.
+KLT uses the circle intersected with the optional mask, transporting that support
+with the accepted warp. `klt` follows sparse pyramidal flow; `klt-affine` adds
+geometric fitting. `klt-template` defaults to `tracking_policy=accuracy`: dense
+original-reference registration on every frame, conditional perspective fitting,
+and accepted recent-reference fallback when appearance changes. This makes center
+localization the primary measurement rather than accepting a sparse proposal.
+Choose `tracking_policy=fast` for the earlier sparse-KLT/correlation cascade.
+Both policies keep broad center/pose recovery **off by default**; enable
+`recovery_enabled` for a deliberate recovery pass. Similarity, affine, homography
+and adaptive models remain selectable. `template_mode=legacy_ecc` keeps the older
+periodic iterative-registration route. TAPNext++ uses point coordinates only;
+patch annotations remain editable for other trackers.
 
 The default foreground guard compares local appearance with the immutable
 original support. Too little agreement plus weak global appearance or feature
 survival ends the track immediately; uncertain occlusion freezes template updates.
 It excludes offscreen pixels and cannot prove object identity against a similar
 occluder. `stop_on_occlusion` and `min_foreground_fraction` control this policy.
-`center_smoothing` suppresses weak small translation innovations; a sufficient
-NCC improvement or larger motion passes through. `center_smoothing_px` is the
+In the fast policy, `center_smoothing` suppresses weak small translation
+innovations; a sufficient NCC improvement or larger motion passes through. The
+accuracy policy retains the dense subpixel optimum; motion prediction only seeds
+the fit. `center_smoothing_px` is the
 source-pixel jitter range (default2). Center and full H are corrected together.
 
 Classical `points.csv` keeps the original first six columns and appends initial
