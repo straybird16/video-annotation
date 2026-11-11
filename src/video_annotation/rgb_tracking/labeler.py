@@ -721,10 +721,20 @@ class PointLabeler:
     def apply_session(self, path):
         if self.controller.busy:
             raise ValueError("cannot load settings while processing")
-        from .session import load_settings, apply_settings
+        from .session import load_settings, apply_settings, settings_snapshot
         from pathlib import Path
         from .tapnextpp import ROOT
-        value = apply_settings(self.processor, load_settings(path))
+        def current_settings():
+            rendering = self.capture_render_settings()
+            return settings_snapshot(self.processor,
+                overlay_fps=rendering["overlay_fps"], max_width=rendering["max_width"],
+                render_options=rendering["render_options"],
+                source_dir=getattr(self.controller, "source_dir", None),
+                recursive=getattr(self.controller, "recursive", True),
+                frame=getattr(self.controller, "default_frame", 0),
+                mask_color=self.mask_color_var.get(), mask_alpha=self.mask_alpha_var.get(),
+                mask_visible=self.mask_visible_var.get())
+        value = apply_settings(self.processor, load_settings(path, defaults=current_settings))
         self.overlay_fps, self.max_width = value["overlay_fps"], value["max_width"]
         from .render_options import normalize_render_options
         self.render_options = normalize_render_options(value.get("render_options"))

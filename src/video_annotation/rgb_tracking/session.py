@@ -199,8 +199,23 @@ def save_settings(path, value):
     return path
 
 
-def load_settings(path):
-    return _normalize(json.loads(Path(path).expanduser().read_text()))
+def load_settings(path, *, defaults=None):
+    """Load a session or a plain KLT-template options preset, validating first.
+
+    GUI callers supply their current snapshot so importing algorithm options
+    preserves playback, rendering and session preferences.
+    """
+    value = json.loads(Path(path).expanduser().read_text())
+    if isinstance(value, dict) and 'kind' not in value:
+        from .klt import KLTConfig
+        from .backends import validate_backend_options
+        if any(key in KLTConfig.__dataclass_fields__ for key in value):
+            options = validate_backend_options('klt-template', value)
+            current = defaults() if callable(defaults) else defaults
+            value = {**(current or {}), 'kind': 'rgb_point_tracking_session',
+                     'schema_version': 1, 'tracker': 'klt-template',
+                     'tracker_options': options}
+    return _normalize(value)
 
 
 def apply_settings(processor, value):

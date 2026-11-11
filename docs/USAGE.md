@@ -88,7 +88,11 @@ is false when scale differs too much from the last original-supported anchor
 available as an explicitly uncertain initial guess.
 
 **Settings** exposes tracking parameters and hover help, including template-bank
-size. **Save settings** exports a JSON usable with `--config` in the GUI or CLI.
+size. **Load settings** accepts both a full saved session and a plain KLT options
+preset such as [klt_combined.json](examples/klt_combined.json). A plain preset
+selects `klt-template` and preserves current video/annotation and unrelated session
+preferences. **Save settings** exports a full JSON usable with `--config` in the
+GUI or CLI. For plain options on the CLI, prefer `--tracker-options`.
 See the [parameter guide](../src/video_annotation/guides/KLT_PARAMETERS.md) and
 [portable combined options](examples/klt_combined.json) (`--tracker-options`).
 

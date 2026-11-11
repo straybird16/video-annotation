@@ -2,6 +2,11 @@
 
 Newest entries first. See PROVENANCE.md for the original workspace history.
 
+- 2026-11-10 — Fixed GUI loading of plain KLT option presets, including combined:
+  validate before applying, select template tracking and retain the current
+  annotations, queue and unrelated session/render preferences. Full sessions
+  remain supported. Codex `/root`; nine focused session/options checks pass.
+
 - 2026-11-10 — Combined full sparse KLT/RANSAC proposals with original/recent dense
   fitting and reliable center-only fallbacks. Added a bounded soft acceleration
   prior, stable appearance admission and optional segmentwise degree-2 SG center
