@@ -326,8 +326,9 @@ class PointLabeler:
         entry(pose, 0, "pose_line_width", "Circle / rotation line width (pixels, default 1)")
         entry(pose, 1, "pose_alpha", "Circle / rotation opacity (0 < value ≤ 1, default 0.7)")
         entry(pose, 2, "pose_font_scale", "Pose label font scale (default 0.4)")
-        for row, name, label in ((3, "pose_halo", "Dark outline around pose lines and labels"),
-                                  (4, "pose_labels", "Show pose labels")):
+        for row, name, label in ((3, "show_pose", "Show saved patch pose in track videos"),
+                                  (4, "pose_halo", "Dark outline around pose lines and labels"),
+                                  (5, "pose_labels", "Show pose labels")):
             variable = tk.BooleanVar()
             self.render_variables[name] = variable
             widget = ttk.Checkbutton(pose, text=label, variable=variable)
@@ -348,7 +349,7 @@ class PointLabeler:
         values = {**self.render_options, "overlay_fps": self.overlay_fps, "max_width": self.max_width}
         for name, variable in self.render_variables.items():
             value = values[name]
-            variable.set(value if name in ("trails", "pose_halo", "pose_labels") else "" if value is None else str(value))
+            variable.set(value if name in ("trails", "show_pose", "pose_halo", "pose_labels") else "" if value is None else str(value))
         maximum = self.render_options["max_frames"]
         self.render_status.set(f"Applied: FPS {self.overlay_fps or 'source'}, width {self.max_width}, "
                                f"render limit {maximum if maximum is not None else 'all'}, "

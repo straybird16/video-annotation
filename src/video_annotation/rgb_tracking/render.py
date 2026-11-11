@@ -141,7 +141,7 @@ def render_tracks(tracks, output, *, fps=None, max_width=1280, force=False,
         for anchor in anchors:
             if anchor.get('visible') is True:
                 resets.setdefault(anchor['frame'], []).append(int(identity))
-    signature = hashlib.sha256(json.dumps({"version": VIDEO_GEOMETRY_VERSION, "render_version": 4,
+    signature = hashlib.sha256(json.dumps({"version": VIDEO_GEOMETRY_VERSION, "render_version": 5,
         "tracks": [tracks.stat().st_size, tracks.stat().st_mtime_ns],
         "metadata": metadata, "source": [video.stat().st_size, video.stat().st_mtime_ns],
         "fps": fps, "max_width": max_width, 'render_options': options,
@@ -164,6 +164,18 @@ def render_tracks(tracks, output, *, fps=None, max_width=1280, force=False,
     ratio = min(1., max_width / w)
     dw, dh = max(1, round(w * ratio)), max(1, round(h * ratio))
     size = (dw + dw % 2, dh + dh % 2)
+    pose_data = None
+    if options['show_pose'] and metadata.get('coordinate_space') == DISPLAY_COORDINATE_SPACE:
+        with tracks.open(newline='') as stream:
+            columns = set(csv.DictReader(stream).fieldnames or ())
+        if columns & {'warp_h00', 'h00', 'scale', 'similarity_scale', 'rotation_degrees'}:
+            from .track_pose import read_point_pose_tracks
+            pose_data = read_point_pose_tracks(tracks, video=video, source=source,
+                                               reacquire_seconds=lifecycle.seconds)
+    if pose_data is not None:
+        from ..pose.overlay import draw_point_pose_rows
+        # Review uses geometry plus existing point IDs, avoiding duplicate labels.
+        pose_options = dict(options, pose_labels=False)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.stem}.{uuid4().hex}.mp4")
     writer, processed = None, 0
@@ -203,6 +215,11 @@ def render_tracks(tracks, output, *, fps=None, max_width=1280, force=False,
                 image = draw_points(frame, row[1], row[0])
             if (dw, dh) != (w, h):
                 image = cv2.resize(image, (dw, dh), interpolation=cv2.INTER_AREA)
+            if pose_data is not None:
+                poses = {identity: pose for identity, pose in pose_data['rows_by_frame'][row[0]].items()
+                         if row[1][identity][1]}
+                draw_point_pose_rows(image, poses, row[0], supports=pose_data['supports'],
+                                     source_size=(w, h), render_options=pose_options)
             image = cv2.copyMakeBorder(image, 0, size[1] - dh, 0, size[0] - dw,
                                        cv2.BORDER_CONSTANT, value=(0, 0, 0))
             writer.write(image)
@@ -223,6 +240,7 @@ def render_tracks(tracks, output, *, fps=None, max_width=1280, force=False,
                   "timing": "CFR sanity preview: one source frame per output frame; FPS override changes preview speed, not labels or alignment; VFR intervals are not preserved",
                   "codec": "H.264 libx264", "pixel_format": "yuv420p", "faststart": True,
                   'render_options': options, 'track_frames': total_frames,
+                  'pose_overlay': pose_data is not None, 'render_version': 5,
                   'reacquire_seconds': lifecycle.seconds,
                   "output_bytes": output.stat().st_size,
                   "input_signature": signature}

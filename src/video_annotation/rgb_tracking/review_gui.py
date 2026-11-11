@@ -739,19 +739,29 @@ class TrackReview(ttk.Frame if ttk is not None else object):
 
     def render(self):
         model = self.require_model()
-        tracks = self.save() if self.dirty or model.output is None else Path(model.output)
+        # Rendering an unchanged prediction must not convert it into a manual
+        # center-only export, which intentionally omits the original fitted H.
+        tracks = self.save() if self.dirty else Path(self.last_saved_path or model.input_tracks)
         if tracks is None:
             return
         root = ROOT/"data/pseudo-ground-truths/point_tracks"
         relative = tracks.relative_to(root if tracks.is_relative_to(root) else ROOT/"data")
         output = ROOT/"outputs/videos/point_tracks"/relative.with_suffix(".mp4")
         fps, max_width = getattr(self.owner, "overlay_fps", None), getattr(self.owner, "max_width", 1280)
-        options = deepcopy(getattr(self.owner, "render_options", None))
+        options = self.render_snapshot()
         def work():
             from .render import render_tracks
             return render_tracks(tracks, output, fps=fps, max_width=max_width, render_options=options,
                 cancel=self.cancel.is_set, progress=lambda message: self.events.put(("progress", message)))
         self.launch_output(work, f"Rendering corrected MP4: {output}")
+
+    def render_snapshot(self):
+        """Export the review's pose visibility with shared appearance settings."""
+        options = deepcopy(getattr(self.owner, 'render_options', None) or {})
+        switch = getattr(self, 'show_pose', None)
+        if switch is not None:
+            options['show_pose'] = bool(switch.get())
+        return options
 
     def choose_folder(self, variable, title):
         self.require_idle()
@@ -767,7 +777,7 @@ class TrackReview(ttk.Frame if ttk is not None else object):
         if kind == "render":
             destination = self.render_dir.get().strip()
             fps, max_width = getattr(self.owner, "overlay_fps", None), getattr(self.owner, "max_width", 1280)
-            options = deepcopy(getattr(self.owner, "render_options", None))
+            options = self.render_snapshot()
             def work():
                 from .publication import render_named_tracks
                 return render_named_tracks(master, name, destination or None, fps=fps, max_width=max_width,

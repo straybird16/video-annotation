@@ -2,6 +2,12 @@
 
 Newest entries first. See PROVENANCE.md for the original workspace history.
 
+- 2026-11-11 — Fixed point-track MP4 exports to include review's shared pose
+  circles/arrows and style controls. Render-only keeps original fitted tracks,
+  follows review's pose switch and refreshes old point-only caches. No fitting
+  or prediction changes. Codex `/root`; 194 tests and a three-frame H.264 smoke
+  pass, with the decoded circle/arrow inspected.
+
 - 2026-11-10 — Added all-DOF acceleration prediction/ranking, a small stationary
   preference, guarded high-NCC early acceptance and score-adaptive local search.
   Added step/total limit multipliers and effective-bound provenance; geometry

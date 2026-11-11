@@ -187,6 +187,14 @@ Rendering old CSVs applies the disappearance rule without rewriting those CSVs.
 **Render settings** controls compression, FPS, dimensions, frame limit and trails.
 Preview FPS never changes source time or tracking.
 
+Point-track videos also draw saved pose as the same warped circle and rotation
+arrow used in review, with shared line width/opacity. **Show saved patch pose in
+track videos** is enabled in Render settings. Review's **Patch pose** checkbox
+controls its own Render/Render all actions. Existing point-only videos regenerate
+when rendered again; fitting/tracking is unnecessary. Rows without valid pose
+keep their visible center. Rendering an unchanged prediction reads that file
+directly rather than first saving a manual center-only copy.
+
 ## Refine point-patch pose
 
 Open **Refine pose**, select **Use current tracks** (prefers saved corrections)

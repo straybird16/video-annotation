@@ -1,7 +1,7 @@
 """Focused model-free checks for review loss display and source-time policy."""
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock,patch
+from unittest.mock import Mock,patch,PropertyMock
 
 import numpy as np
 
@@ -15,6 +15,35 @@ class Value:
 
 
 class PointReviewLossTests(unittest.TestCase):
+    def test_render_unchanged_predictions_keeps_loaded_pose_file_without_manual_save(self):
+        from pathlib import Path
+        from video_annotation.rgb_tracking.tapnextpp import ROOT
+        review = TrackReview.__new__(TrackReview)
+        tracks = ROOT/'data/pseudo-ground-truths/point_tracks/example/points.csv'
+        review.model = SimpleNamespace(input_tracks=tracks, output=None)
+        review.require_model = lambda: review.model
+        review.last_saved_path, review.show_pose = tracks, Value(True)
+        review.owner = SimpleNamespace(render_options={'pose_alpha':.4}, overlay_fps=120, max_width=1280)
+        review.save = Mock(side_effect=AssertionError('rendering must not discard saved poses'))
+        review.launch_output, review.events = Mock(), Mock()
+        review.cancel = SimpleNamespace(is_set=lambda: False)
+        with patch.object(TrackReview, 'dirty', new_callable=PropertyMock, return_value=False), \
+             patch('video_annotation.rgb_tracking.render.render_tracks') as render:
+            review.render()
+            review.launch_output.call_args.args[0]()
+        self.assertEqual(render.call_args.args[0], Path(tracks))
+        self.assertTrue(render.call_args.kwargs['render_options']['show_pose'])
+        review.save.assert_not_called()
+
+    def test_render_snapshot_uses_review_pose_switch_without_mutating_global_settings(self):
+        review = TrackReview.__new__(TrackReview)
+        review.owner = SimpleNamespace(render_options={'pose_alpha':.4, 'show_pose':False})
+        review.show_pose = Value(True)
+        self.assertEqual(review.render_snapshot(), {'pose_alpha':.4, 'show_pose':True})
+        self.assertFalse(review.owner.render_options['show_pose'])
+        review.show_pose.set(False)
+        self.assertFalse(review.render_snapshot()['show_pose'])
+
     def review_canvas(self, visible, original_visible=None):
         review = TrackReview.__new__(TrackReview)
         count = len(visible)

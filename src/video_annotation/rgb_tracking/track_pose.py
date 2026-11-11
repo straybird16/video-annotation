@@ -76,7 +76,7 @@ def point_track_metadata(tracks,*,video=None,source=None):
     return metadata,video,source
 
 
-def read_point_pose_tracks(tracks,*,video=None,source=None,gap_seconds=0.,gap_neighbors=2):
+def read_point_pose_tracks(tracks,*,video=None,source=None,gap_seconds=0.,gap_neighbors=2,reacquire_seconds=None):
     """Return metadata/video/source/supports/frames/rows_by_frame and gap reports.
 
     Rows keep source visibility independently of pose validity. Missing pose must
@@ -99,7 +99,8 @@ def read_point_pose_tracks(tracks,*,video=None,source=None,gap_seconds=0.,gap_ne
     shown=np.asarray([[points[i][1] for i in ids] for _,points in groups],bool)
     shown&=np.all((positions>=0)&(positions<[source['width'],source['height']]),axis=-1)
     shown,_=apply_lifecycle(np.asarray(frames),ids,positions,shown,source['fps'],
-        metadata.get('track_policy',{}).get('reacquire_seconds',.5),metadata.get('manual_edits',{}).get('anchors'))
+        metadata.get('track_policy',{}).get('reacquire_seconds',.5) if reacquire_seconds is None else reacquire_seconds,
+        metadata.get('manual_edits',{}).get('anchors'))
     rows_by_frame={frame:{} for frame in frames};reports={}
     reference_map=metadata.get('pose_references',{})
     for point,identity in enumerate(ids):
