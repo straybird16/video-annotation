@@ -67,13 +67,23 @@ def regularize(tracker, gray, i, matrix, reference, info, predicted):
             not c.motion_gate or innovation <= c.motion_noise_px
         ),
     )
+    from .klt_predictive import ranks as rank_candidates
+
+    if info.get("reason") == "predicted_correlation":
+        values, penalty, bonus = rank_candidates(tracker, i, [matrix], [info["score"]], predicted)
+        diagnostics.update(center_motion_penalty=float(penalty[0]),
+                           acceleration_penalty=float(penalty[0]),
+                           stationary_bonus=float(bonus[0]), candidate_rank=float(values[0]),
+                           template_motion_consistent=bool(penalty[0] <= c.combined_motion_weight*.5))
+        return matrix, info, diagnostics
     if (
-        state.motion.center_updates < 2
-        or not c.motion_gate
-        or c.combined_motion_weight == 0
+        not c.motion_gate
+        or c.combined_motion_weight == 0 and c.motion_still_bonus == 0
     ):
         return matrix, info, diagnostics
-    hypotheses = [matrix]
+    from .klt_dense import _last
+
+    hypotheses = [matrix, predicted, _last(tracker, i)]
     # Avoid pulling a failed long-gap prior into a local registration search.
     if state.missing_since is None and innovation <= max(
         4 * c.motion_noise_px, c.center_smoothing_px * 2
@@ -85,8 +95,10 @@ def regularize(tracker, gray, i, matrix, reference, info, predicted):
             for amount in (0.5, 1.0)
         )
     hypotheses.append(shared._centered_shape(predicted, point, raw_center))
-    from .klt_dense import _last
-
+    # A stationary prior commonly appears in several roles. Compare/validate it
+    # once rather than remap identical patches and decompose identical domains.
+    _, unique = np.unique(np.round(np.asarray(hypotheses), 12), axis=0, return_index=True)
+    hypotheses = [hypotheses[k] for k in np.sort(unique)]
     valid = [
         h
         for h in hypotheses
@@ -96,21 +108,11 @@ def regularize(tracker, gray, i, matrix, reference, info, predicted):
     if not valid:
         return matrix, info, diagnostics
     scores, overlaps = shared._score(tracker, gray, i, valid, reference, common=True)
-    centers, params, _ = state.motion.decompose(valid)
-    _, predicted_params, _ = state.motion.decompose([predicted])
-    difference = params - predicted_params[0]
-    difference[:, 0] = (difference[:, 0] + np.pi) % (2 * np.pi) - np.pi
-    uncertainty = np.sqrt(np.maximum(state.motion.variance, state.motion.noise**2))
-    center_distance = np.sum(((centers - expected) / c.motion_noise_px) ** 2, axis=1)
-    shape_distance = np.mean((difference / uncertainty) ** 2, axis=1)
-    penalty = c.combined_motion_weight * (
-        1 - np.exp(-0.5 * (center_distance + shape_distance))
-    )
-    ranks = scores - penalty
-    ranks[scores < c.min_patch_ncc] = -np.inf
-    if not np.isfinite(ranks).any():
+    values, penalty, bonus = rank_candidates(tracker, i, valid, scores, predicted)
+    values[scores < c.min_patch_ncc] = -np.inf
+    if not np.isfinite(values).any():
         return matrix, info, diagnostics
-    best = int(np.argmax(ranks))
+    best = int(np.argmax(values))
     selected = valid[best]
     if not np.array_equal(selected, matrix):
         # Rescore on the actual final full support. The original fit's inlier
@@ -120,12 +122,17 @@ def regularize(tracker, gray, i, matrix, reference, info, predicted):
             **info,
             "score": float(score[0]),
             "overlap": float(overlap[0]),
-            "photometric_inlier_ratio": None,
         }
+        from .klt_predictive import photometric_info
+        info.update(photometric_info(tracker, gray, i, selected, reference))
     diagnostics["temporal_regularization_px"] = float(
         np.linalg.norm(project_points(selected, point) - raw_center)
     )
     diagnostics["center_motion_penalty"] = float(penalty[best])
+    diagnostics["acceleration_penalty"] = float(penalty[best])
+    diagnostics["stationary_bonus"] = float(bonus[best])
+    diagnostics["candidate_rank"] = float(values[best])
+    diagnostics["template_motion_consistent"] = bool(penalty[best] <= c.combined_motion_weight*.5)
     return selected, info, diagnostics
 
 

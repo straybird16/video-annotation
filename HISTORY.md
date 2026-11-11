@@ -2,6 +2,15 @@
 
 Newest entries first. See PROVENANCE.md for the original workspace history.
 
+- 2026-11-10 — Added all-DOF acceleration prediction/ranking, a small stationary
+  preference, guarded high-NCC early acceptance and score-adaptive local search.
+  Added step/total limit multipliers and effective-bound provenance; geometry
+  checks and candidate sampling reuse frame-local caches. Combined uses soft
+  temporal cost; earlier policies stay selectable. Codex `/root`; 190 application
+  and 35 Event compatibility tests pass. A 60-frame/three-point Amherst smoke
+  keeps all 177 tracked rows with 20 early exits; it does not establish general
+  speed or accuracy improvement.
+
 - 2026-11-10 — Fixed GUI loading of plain KLT option presets, including combined:
   validate before applying, select template tracking and retain the current
   annotations, queue and unrelated session/render preferences. Full sessions

@@ -1,6 +1,7 @@
 """Original-first dense registration for accurate patch centers.
 
-LK and the motion filter supply initial guesses, never the acceptance score.
+LK and motion supply proposals; image evidence plus bounded motion cost ranks
+them. Guarded high-NCC predictions may skip flow and iterative fitting.
 The numerical optimizer, mask sampling, geometry and recovery bank are shared
 with the fast policy. Only accepted raw image samples may update appearance.
 """
@@ -27,13 +28,15 @@ def _model_limit(c):
     return c.adaptive_max_model if c.motion_model == "adaptive" else c.motion_model
 
 
-def _prefer_fit(candidate, previous):
+def _prefer_fit(candidate, previous, tracker=None, i=None):
     """Geometric validity outranks image score; retain failed-fit diagnostics."""
     if (candidate.matrix is not None) != (previous.matrix is not None):
         return candidate if candidate.matrix is not None else previous
+    from .klt_predictive import fit_rank
+    score = lambda fit: fit.score if tracker is None else fit_rank(tracker, i, fit)
     return (
         candidate
-        if candidate.score > previous.score or previous.info is None
+        if score(candidate) > score(previous) or previous.info is None
         else previous
     )
 
@@ -158,7 +161,7 @@ def _original_fit(tracker, gray, i, seeds):
                 fitted = _fit(tracker, gray, i, reference, seed, simpler)
                 if fitted.matrix is not None:
                     break
-        best = _prefer_fit(fitted, best)
+        best = _prefer_fit(fitted, best, tracker, i)
         if best.matrix is not None and best.score >= max(
             0.969, c.dense_original_threshold
         ):
@@ -169,7 +172,7 @@ def _original_fit(tracker, gray, i, seeds):
         reset = np.eye(3)
         reset[:2, 2] = project_points(seeds[0], reference.query) - reference.query
         fitted = _fit(tracker, gray, i, reference, reset, base_model)
-        best = _prefer_fit(fitted, best)
+        best = _prefer_fit(fitted, best, tracker, i)
     if (
         best.matrix is None
         or limit != "homography"
@@ -207,7 +210,7 @@ def _original_fit(tracker, gray, i, seeds):
             "score": upgraded.score,
             "homography_validation_gain": float(independent[1] - independent[0]),
         }
-        return upgraded
+        return _prefer_fit(upgraded, best, tracker, i)
     return best
 
 
@@ -302,7 +305,11 @@ def advance(tracker, gray, offset):
         if tracker._active_mask is None
         else tracker.alive & tracker._active_mask
     )
-    flows = shared._batch_flow(tracker, gray, active)
+    from .klt_predictive import probe, fit_rank
+
+    probes = {int(i): probe(tracker, gray, i) for i in active}
+    flow_active = np.array([i for i in active if probes[i] is None or probes[i]["fit"] is None], dtype=int)
+    flows = shared._batch_flow(tracker, gray, flow_active)
     rows = [
         tracker._diagnostic(
             offset,
@@ -322,6 +329,9 @@ def advance(tracker, gray, offset):
             tracker.initial_points[i],
         )
         row, last = rows[i], _last(tracker, i)
+        initial = probes[i]
+        if initial is not None:
+            row.update(initial["diagnostics"])
         hint = None if tracker._center_hints is None else tracker._center_hints[i]
         if hint is not None and not np.isfinite(hint).all():
             hint = None
@@ -332,7 +342,7 @@ def advance(tracker, gray, offset):
         ):
             _failure(tracker, i, row, "reacquisition_timeout", hint)
             continue
-        predicted = state.motion.predict(tracker.frames_seen, hint)
+        predicted = initial["predicted"] if initial is not None else state.motion.predict(tracker.frames_seen, hint)
         flow = flows.get(i)
         combined = c.tracking_policy == "combined"
         sparse = None
@@ -359,7 +369,11 @@ def advance(tracker, gray, offset):
                 inlier_ratio=sparse["metrics"]["inlier_ratio"],
                 residual_px=sparse["metrics"]["residual_px"],
             )
-        original = _original_fit(tracker, gray, i, seeds)
+        if initial is not None and initial["fit"] is None:
+            # Fine fitting is bounded. Keep independent sparse/history seeds
+            # alongside the two best joint center/shape prediction neighbors.
+            seeds = initial["seeds"][:2] + seeds[:2]
+        original = initial["fit"] if initial is not None and initial["fit"] is not None else _original_fit(tracker, gray, i, seeds)
         chosen = original
         recent_score = -1.0
         recent = shared._prepared(tracker, i, state.recent)
@@ -395,7 +409,7 @@ def advance(tracker, gray, offset):
                     and shared._geometry(tracker, i, fitted.matrix, last)[0] is not None
                 ):
                     fitted.reference = "recent"
-                    if chosen.reference == "original" or fitted.score > chosen.score:
+                    if chosen.matrix is None or fit_rank(tracker, i, fitted) > fit_rank(tracker, i, chosen):
                         chosen = fitted
                     break
         if chosen.matrix is None or chosen.score < c.min_patch_ncc:
@@ -473,6 +487,8 @@ def advance(tracker, gray, offset):
         )
         temporal = state.motion.check(candidate, tracker.frames_seen, hint)
         row.update(temporal)
+        if combined:
+            row["motion_penalty"] = row.get("acceleration_penalty", 0.)
         # Only evaluate foreground after plausible affine/projective correction.
         retention = row["feature_retention_ratio"]
         continuous_recent = (

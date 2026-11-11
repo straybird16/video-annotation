@@ -11,7 +11,12 @@ PARAMETER_GUIDE = Path(__file__).resolve().parents[1]/'guides/KLT_PARAMETERS.md'
 
 PARAMETER_HELP = {
     'tracking_policy': 'Combined (default) adds full sparse-RANSAC proposals, soft acceleration-continuity regularization and separate template admission. Accuracy fits the immutable original patch densely every frame, with conditional homography and accepted recent fallback. Fast retains the earlier sparse-KLT/correlation cascade. Only applies to correlation-mode klt-template.',
-    'combined_motion_weight': 'Maximum soft center/shape prior cost in normalized correlation units; default 0.03, matching correlation_margin. Larger image improvements win. Zero disables regularization.',
+    'combined_motion_weight': 'Maximum acceleration-continuity cost across all eight homography degrees of freedom in NCC units; default 0.03. Larger image improvements win. Zero disables this penalty.',
+    'motion_still_bonus': 'NCC preference for no displacement/deformation from the last accepted patch; default 0.01. A smooth bonus, not a motion rejection. Zero disables it.',
+    'prediction_fast_threshold': 'Combined mode: accept an all-DOF predicted/no-motion warp before LK or iterative fitting when masked NCC reaches this value; default 0.99. Geometry/foreground checks still apply. Zero disables early acceptance.',
+    'prediction_search_enabled': 'Combined mode: batch-score a small center/rotation/log-scale/strain/perspective neighborhood before fine fitting. Score deficit expands its radius quadratically; broad recovery remains separate.',
+    'step_limit_multiplier': 'Multiplier for per-frame motion limits; default 1. Ratios use powers (1.2^m), angles/distances multiply, perspective stays below its pole. At 2, default scale bound is 1.44 and rotation 10 degrees. Higher FPS often needs a smaller value.',
+    'total_limit_multiplier': 'Multiplier for accumulated deformation limits relative to the original patch; default 1. Ratios use powers, shear/corner limits multiply and perspective remains bounded. Does not compound with step multiplier.',
     'template_stable_frames': 'Consecutive accepted, motion-consistent full-pose fits before recent-template admission in combined mode; default 3. Center-only fallbacks never refresh appearance.',
     'output_smoothing_seconds': 'Optional degree-2 Savitzky-Golay center filter after tracking/lifetime cleanup. Source seconds; 0 disables (default). Keeps raw_x/raw_y, gaps, endings and anchors; translates complete H.',
     'dense_iterations': 'Maximum inverse-compositional iterations per dense local fit, from 1 to 100; default 12. More iterations may improve convergence but cost more time.',
@@ -25,7 +30,7 @@ PARAMETER_HELP = {
     'center_smoothing_px': 'Source-pixel range used to smooth small center jitter; default 2 pixels. Larger values smooth more, independently of overlay resolution or FPS.',
     'reacquire_seconds': 'Maximum source-video seconds after first loss for native tracker recovery. Default 0.5; zero ends immediately. Lost points are hidden and unrecovered tails are omitted from new predictions.',
     'motion_model': 'Patch geometry: adaptive (default) upgrades only with evidence; fixed similarity, affine or homography are also available.',
-    'motion_gate': 'Reject candidate pose jumps that disagree with recent accepted source-time motion and uncertainty. Rejected candidates cannot update the template or motion history.',
+    'motion_gate': 'Enable source-time prediction/regularization. Combined uses a bounded soft acceleration-change penalty across all eight DOFs; accuracy/fast retain the earlier hard pose-innovation gate. Domain/geometry limits always apply.',
     'motion_sigma': 'Temporal innovation limit in uncertainty standard deviations; default 4. Larger values tolerate larger motion surprises.',
     'motion_noise_px': 'Source-pixel uncertainty floor for the motion gate; default 1 pixel. Increase for noisier measurements.',
     'motion_memory_seconds': 'Source-time adaptation and prediction memory; default 0.1 second. Independent of overlay FPS and lost-point lifetime.',

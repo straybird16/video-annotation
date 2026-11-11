@@ -45,9 +45,9 @@ class KLTConfig:
     min_support_coverage: float = .02
     ransac_threshold: float = 1.5
     feature_refresh_interval: int = 5
-    min_scale_step: float = .8
-    max_scale_step: float = 1.25
-    max_rotation_step: float = 20.0
+    min_scale_step: float = 1/1.2
+    max_scale_step: float = 1.2
+    max_rotation_step: float = 5.0
     max_anisotropy_step: float = 1.5
     max_shear_step: float = .3
     max_perspective_step: float = .15
@@ -58,6 +58,8 @@ class KLTConfig:
     max_shear_total: float = .8
     max_perspective_total: float = .6
     max_corner_extra_total: float = 2.
+    step_limit_multiplier: float = 1.
+    total_limit_multiplier: float = 1.
     min_model_features: int = 12
     min_projective_features: int = 20
     adaptive_min_improvement: float = .2
@@ -84,6 +86,9 @@ class KLTConfig:
     template_mode: str = "correlation"
     tracking_policy: str = "combined"
     combined_motion_weight: float = .03
+    motion_still_bonus: float = .01
+    prediction_fast_threshold: float = .99
+    prediction_search_enabled: bool = True
     template_stable_frames: int = 3
     output_smoothing_seconds: float = 0.
     dense_iterations: int = 12
@@ -134,7 +139,7 @@ class KLTConfig:
         if self.patch_radius < 4 or self.max_features < self.min_inliers or self.min_inliers < 3:
             raise ValueError("need patch_radius >= 4, max_features >= min_inliers >= 3")
         booleans = ("use_recent_template", "motion_gate", "recovery_enabled",
-                    "stop_on_occlusion", "center_smoothing")
+                    "stop_on_occlusion", "center_smoothing", "prediction_search_enabled")
         for name in booleans:
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be boolean")
@@ -185,6 +190,10 @@ class KLTConfig:
             raise ValueError("invalid shared motion/reference/recovery settings")
         if not 0 <= self.combined_motion_weight <= 1 or not 0 <= self.output_smoothing_seconds <= 10:
             raise ValueError("combined_motion_weight must be in [0,1] and output_smoothing_seconds in [0,10]")
+        if not 0 <= self.motion_still_bonus <= .1 or not 0 <= self.prediction_fast_threshold <= 1:
+            raise ValueError("motion_still_bonus must be in [0,.1], prediction_fast_threshold in [0,1]")
+        if not .05 <= self.step_limit_multiplier <= 20 or not .05 <= self.total_limit_multiplier <= 20:
+            raise ValueError("limit multipliers must be in [.05,20]")
         if self.template_stable_frames > 100:
             raise ValueError("template_stable_frames must be <= 100")
         if self.dense_iterations > 100:
@@ -193,11 +202,40 @@ class KLTConfig:
             raise ValueError("registration_iterations must be <= 100")
 
 
-_COMMON = {"win_size", "max_level", "fb_threshold", "min_eigenvalue", "max_lk_error", "patch_radius",
+def effective_limits(config):
+    """Resolve user multipliers once, keeping base settings serializable.
+
+    Ratios scale in log space; bounded perspective scales remaining distance
+    from its projective pole. Runtime copies have unit multipliers, so patch
+    radius changes and gap relaxation cannot compound the settings.
+    """
+    changes = {}
+    for suffix, multiplier in (("step", config.step_limit_multiplier),
+                               ("total", config.total_limit_multiplier)):
+        for name in ("min_scale", "max_scale", "max_anisotropy"):
+            key = f"{name}_{suffix}"
+            changes[key] = getattr(config, key)**multiplier
+        for name in ("max_shear", "max_corner_extra"):
+            key = f"{name}_{suffix}"
+            changes[key] = getattr(config, key)*multiplier
+        key = f"max_perspective_{suffix}"
+        changes[key] = min(.95, -np.expm1(multiplier*np.log1p(-getattr(config, key))))
+    m = config.step_limit_multiplier
+    changes.update(max_rotation_step=min(180., config.max_rotation_step*m),
+                   max_displacement=config.max_displacement*m,
+                   registration_max_translation=config.registration_max_translation*m,
+                   registration_max_rotation=min(180., config.registration_max_rotation*m),
+                   registration_max_scale=config.registration_max_scale**m,
+                   registration_max_anisotropy=min(1., config.registration_max_anisotropy*m),
+                   step_limit_multiplier=1., total_limit_multiplier=1.)
+    return replace(config, **changes)
+
+
+_COMMON = {"win_size", "max_level", "fb_threshold", "min_eigenvalue", "max_lk_error", "patch_radius", "step_limit_multiplier",
            "min_patch_ncc", "min_patch_overlap", "min_patch_std", "min_visible_fraction", "max_displacement", "threads", "output_smoothing_seconds"}
 _REGISTRATION = {field.name for field in fields(KLTConfig) if field.name.startswith(("registration_", "adaptive_registration_"))} | {"reanchor_interval"}
 _CORRELATION = {field.name for field in fields(KLTConfig) if field.name.startswith("correlation_")} | {"template_mode"}
-_DENSE = {field.name for field in fields(KLTConfig) if field.name.startswith("dense_")} | {"tracking_policy", "combined_motion_weight", "template_stable_frames"}
+_DENSE = {field.name for field in fields(KLTConfig) if field.name.startswith(("dense_", "prediction_"))} | {"tracking_policy", "combined_motion_weight", "motion_still_bonus", "template_stable_frames"}
 _KEYFRAME = {field.name for field in fields(KLTConfig) if field.name.startswith("keyframe_")} | {"max_keyframes"}
 
 
@@ -271,6 +309,7 @@ class KLTTracker:
 
     def __init__(self, algorithm="klt", **options):
         self.config = KLTConfig(**validate_options(algorithm, options))
+        self.effective_config = effective_limits(self.config)
         self.name = algorithm
         self.algorithm = algorithm
         self.resolution = "native"
@@ -304,6 +343,8 @@ class KLTTracker:
         self._hybrid = None
         self.first_failures = {}
         self._flow_frame = -1
+        self._geometry_stamp = None
+        self._geometry_cache = []
         self._center_hints = self._warp_hints = self._active_mask = None
         self._direct_references = {}
         self.patch_configs, self.support_masks, self.explicit_masks = [], [], []
@@ -347,7 +388,7 @@ class KLTTracker:
         return self._grids[radius]
 
     def _config(self, identity=None):
-        return self.config if identity is None else self.patch_configs[identity]
+        return self.effective_config if identity is None else self.patch_configs[identity]
 
     def _circle(self, radius):
         return np.sum(self._grid(radius)**2, axis=-1) <= radius**2
@@ -355,8 +396,9 @@ class KLTTracker:
     def provenance(self):
         accuracy = (self.algorithm == "klt-template" and self.config.template_mode == "correlation"
                     and self.config.tracking_policy in ("accuracy", "combined"))
-        return {"algorithm": self.name, "engine_revision": 6, "template_mode": self.config.template_mode, "tracking_policy": (self.config.tracking_policy if self.algorithm == "klt-template" and self.config.template_mode == "correlation" else "not_applicable"), "implementation": "OpenCV pyramidal LK for circles; inverse-compositional foreground alignment for explicit masks",
+        return {"algorithm": self.name, "engine_revision": 7, "template_mode": self.config.template_mode, "tracking_policy": (self.config.tracking_policy if self.algorithm == "klt-template" and self.config.template_mode == "correlation" else "not_applicable"), "implementation": "OpenCV pyramidal LK for circles; inverse-compositional foreground alignment for explicit masks",
                 "opencv": cv2.__version__, "config": asdict(self.config),
+                "effective_limits": {key: value for key, value in asdict(self.effective_config).items() if key.startswith(("min_scale_", "max_scale_", "max_rotation_", "max_anisotropy_", "max_shear_", "max_perspective_", "max_corner_extra_", "registration_max_")) or key == "max_displacement"},
                 "patch_regions": self.patch_regions_used,
                 "support_policy": "per-query source-pixel circle intersected with optional reference foreground mask; transported by accepted warp",
                 "lk_support_policy": ("batched circle LK uses native context for proposals; correlation validates real transported support; explicit masks use foreground-only direct fitting" if self.algorithm == "klt-template" and self.config.template_mode == "correlation" else "unmasked queries use supported LK footprints; explicit masks use foreground-only inverse-compositional patch alignment, sampled through each candidate warp"),
@@ -603,7 +645,7 @@ class KLTTracker:
             raise ValueError("patch region count must match the initial query count")
         if any(mask is not None and mask.shape != gray.shape for mask in masks):
             raise ValueError(f"patch masks must match displayed frame {gray.shape[1]}x{gray.shape[0]}")
-        self.patch_configs = [replace(self.config, patch_radius=radius) for radius in radii]
+        self.patch_configs = [replace(self.effective_config, patch_radius=radius) for radius in radii]
         initial_visibility = []
         for point, radius, mask in zip(self.points, radii, masks):
             support = self._circle(radius).copy()

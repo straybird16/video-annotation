@@ -1,5 +1,55 @@
 # KLT settings reference
 
+Combined tracking predicts all eight query-local homography components:
+translation XY, rotation, log scale, two log-strain/shear terms and two
+radius-normalized perspective terms. The first two observations have zero
+acceleration; accepted measurements then learn source-time velocity and
+acceleration separately per component. Angle differences wrap across ±180°.
+Rejected candidates do not alter this history.
+
+`combined_motion_weight` caps acceleration-change cost at **0.03 NCC**. It ranks
+candidate fits before selection and replaces the combined policy's hard temporal
+innovation gate; stronger image evidence can override it. A separate
+`motion_still_bonus=0.01` gently favors no motion/deformation from the last pose.
+`motion_gate=false` disables these motion priors. The earlier `accuracy`/`fast`
+policies retain their previous temporal behavior; `center_smoothing` is fast-only.
+
+`prediction_fast_threshold=0.99` accepts a predicted/stationary warp before LK
+or iterative fitting when masked normalized correlation is high. Zero disables
+early acceptance. Domain, geometry, foreground, visibility and appearance-update
+checks still apply. With `prediction_search_enabled=true`, strong nearby matches
+use native local subpixel fitting; weaker priors batch-score nearby changes in
+every active motion component on cached coarse samples. The bank radius grows
+quadratically with the score deficit, followed by bounded full-resolution fitting.
+Adaptive perspective promotion still needs independent support; explicit
+homography mode and established projective motion predict/search both perspective
+components. This is a local search; broad recovery
+remains opt-in. A high NCC is not an identity guarantee or a probability.
+
+Use **Step limit multiplier** and **Total limit multiplier** in KLT Settings
+(JSON: `step_limit_multiplier`, `total_limit_multiplier`, both default **1**).
+Existing individual limits remain base values. Scale/anisotropy ratios use
+`base^multiplier`, angles/distances/shear multiply directly, and perspective uses
+`1-(1-base)^multiplier` capped at 0.95. Step scaling also affects displacement and
+registration-correction limits. Total scaling applies only to accumulated bounds.
+The runtime resolves multipliers once and saves actual bounds in provenance.
+
+| Limit | Default step | Default accumulated |
+|---|---:|---:|
+| Singular-value scale range | 1/1.2–1.2 | 0.2–5 |
+| Rotation | ±5° | Unrestricted wrapped orientation |
+| Anisotropy ratio | 1.5 | 3 |
+| Shear | 0.3 | 0.8 |
+| Normalized perspective | 0.15 | 0.6 |
+| Extra corner displacement / radius | 0.5 | 2 |
+
+For example, step multiplier **2** permits scale **1/1.44–1.44** and rotation
+**±10°**; **0.5** permits **1/√1.2–√1.2** and **±2.5°**. At twice the source FPS,
+0.5 is a useful starting point for similar physical motion, not an automatic
+guarantee. View FPS does not change source-time prediction. Explicit limits in
+older saved presets remain explicit; load the current combined preset for this
+default set. These defaults are engineering bounds, not data-fitted guarantees.
+
 `klt` follows local texture with pyramidal Lucas–Kanade flow and forward/backward
 checks. `klt-affine` fits geometric motion to several support features.
 `klt-template` defaults to **combined**: full KLT/RANSAC proposals seed dense
@@ -20,8 +70,8 @@ alignment after a weak local fit. Similarity, affine and homography remain
 selectable; adaptive permits a supported upgrade to the configured maximum model.
 A passing score does not certify correct object correspondence or absolute accuracy.
 
-The shared patch-hybrid path applies temporal motion acceptance before committing
-a pose, recent appearance or motion history. Motion controls use source-video
+The shared patch-hybrid path applies motion scoring and geometry/appearance
+acceptance before committing a pose, recent appearance or motion history. Motion controls use source-video
 time; they are separate from loss/reacquisition and final gap interpolation.
 The pose method selector also exposes `patch_hybrid`, using the shared patch
 tracker instead of a second independent refinement engine.

@@ -7,6 +7,15 @@ outside its root. The GUI contains separate **Annotate points**, **Review tracks
 
 ## Points and patches
 
+The current [combined preset](examples/klt_combined.json) adds acceleration
+prediction for all eight homography components. In **KLT Settings**, use
+**Step limit multiplier** and **Total limit multiplier** to scale the base
+limits (default step: scale 1/1.2–1.2, rotation ±5°). Ratios scale exponentially;
+angles/distances scale linearly. A 0.99 masked-NCC prediction can skip LK and
+iterative fitting; weaker matches use local fitting or a bounded nearby bank.
+The default motion penalty is soft and capped at 0.03 NCC; no-motion bonus is
+0.01. See the [parameter guide](../src/video_annotation/guides/KLT_PARAMETERS.md).
+
 Click to add points, select one or several list rows to remove them or change
 their radii, and save references with **Save points** or **Save & next**. Source
 coordinates follow the displayed video orientation. Point labels use consecutive

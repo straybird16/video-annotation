@@ -116,7 +116,8 @@ class CombinedTests(unittest.TestCase):
             return_value=Fit(info={"reason": "changed_appearance"}),
         ), patch(
             "video_annotation.rgb_tracking.klt_patch._score",
-            return_value=(np.array([0.1]), np.array([1.0])),
+            side_effect=lambda tracker, gray, i, matrices, reference, **kwargs:
+                (np.full(len(matrices), .1), np.ones(len(matrices))),
         ):
             for frame in range(1, 4):
                 current = cv2.warpAffine(

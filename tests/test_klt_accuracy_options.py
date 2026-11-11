@@ -24,7 +24,9 @@ class AccuracyOptionTests(unittest.TestCase):
         self.assertIs(fields["dense_iterations"]["type"], int)
         for name in ("tracking_policy", "dense_iterations", "dense_original_threshold",
                      "dense_recent_threshold", "dense_homography_trigger", "combined_motion_weight",
-                     "template_stable_frames", "output_smoothing_seconds"):
+                     "template_stable_frames", "output_smoothing_seconds", "motion_still_bonus",
+                     "prediction_fast_threshold", "prediction_search_enabled",
+                     "step_limit_multiplier", "total_limit_multiplier"):
             self.assertIn(name, fields)
             self.assertGreater(len(parameter_help(name)), 35)
 
@@ -62,7 +64,7 @@ class AccuracyOptionTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     validate_options(algorithm, {"template_mode": mode, "dense_iterations": 20})
         tracker = KLTTracker("klt-template")
-        self.assertEqual(tracker.provenance()["engine_revision"], 6)
+        self.assertEqual(tracker.provenance()["engine_revision"], 7)
         self.assertEqual(tracker.provenance()["tracking_policy"], "combined")
 
 

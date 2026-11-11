@@ -40,8 +40,10 @@ QUALITY_COLUMNS = ("frame", "point_id", "valid", "fb_error", "lk_error", "featur
                    "occluded", "occlusion_suspected", "center_smoothing_alpha", "center_correction_px", "raw_center_x", "raw_center_y",
                    "sparse_proposal", "sparse_center_error_px", "sparse_center_agreement", "consecutive_score", "fallback_reference",
                    "center_innovation_px", "center_motion_penalty", "temporal_regularization_px",
-                   "template_motion_consistent", "template_stable_count", "template_admission")
-QUALITY_SCHEMA_VERSION = 7
+                   "template_motion_consistent", "template_stable_count", "template_admission",
+                   "acceleration_penalty", "stationary_bonus", "candidate_rank", "prediction_score",
+                   "prediction_fast_accepted", "prediction_candidates", "prediction_radius_px", "prediction_search_mode")
+QUALITY_SCHEMA_VERSION = 8
 
 
 def file_digest(path):

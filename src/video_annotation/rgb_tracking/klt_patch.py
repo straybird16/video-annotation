@@ -102,6 +102,7 @@ def initialize(tracker, gray, rows):
             memory_seconds=c.motion_memory_seconds,
             center_trust=c.center_trust,
             acceleration=c.tracking_policy == "combined",
+            soft=c.tracking_policy == "combined",
         )
         row.update(
             pose_valid=bool(row["valid"] and init_model != "translation"),
@@ -223,7 +224,7 @@ def _batch_flow(tracker, gray, active):
         # full LK footprints, with origins aligned to the pyramid sampling grid.
         level = tracker.config.max_level
         alignment = 2**level
-        margin = (window // 2 + 3) * alignment + tracker.config.max_displacement
+        margin = (window // 2 + 3) * alignment + tracker.effective_config.max_displacement
         extent = np.concatenate((p, seed))
         low = np.maximum(
             0, np.floor((extent.min(axis=0) - margin) / alignment) * alignment
@@ -659,6 +660,24 @@ def _foreground(tracker, gray, i, candidate, row):
 
 
 def _geometry(tracker, i, candidate, last, *, reanchor=False):
+    """Cache repeated native-domain checks only within one source frame."""
+    stamp = (tracker.frames_seen, id(getattr(tracker, "_current_gray", tracker.previous)))
+    if getattr(tracker, "_geometry_stamp", None) != stamp:
+        tracker._geometry_stamp = stamp
+        tracker._geometry_cache = [{} for _ in range(tracker.query_count)]
+    cache = tracker._geometry_cache[i]
+    key = (np.asarray(candidate, float).tobytes(), np.asarray(last, float).tobytes(),
+           reanchor, max(1, tracker.frames_seen-tracker._hybrid[i].last_frame),
+           id(tracker.patch_configs[i]))
+    if key not in cache:
+        if len(cache) >= 32:
+            cache.clear()
+        cache[key] = _geometry_uncached(tracker, i, candidate, last, reanchor=reanchor)
+    matrix, metrics, reason = cache[key]
+    return matrix, None if metrics is None else metrics.copy(), reason
+
+
+def _geometry_uncached(tracker, i, candidate, last, *, reanchor=False):
     c = tracker.patch_configs[i]
     p = tracker.initial_points[i]
     try:

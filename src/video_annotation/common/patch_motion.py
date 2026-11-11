@@ -1,8 +1,9 @@
 """Shared source-time pose prediction and transactional temporal acceptance.
 
-Shape is normalized by the original query/radius. Batch candidate checks do not
-mutate state; only a final accepted measurement may call ``commit``. Image scores
-are deliberately not treated as probabilities or permission to bypass this gate.
+Shape is normalized by the original query/radius. Candidate checks do not mutate
+state; only an accepted measurement commits. The combined tracker uses soft
+all-DOF prediction ranking; legacy callers retain hard innovation gates. Image
+scores are not probabilities and do not bypass domain/foreground checks.
 """
 
 import numpy as np
@@ -34,6 +35,7 @@ class PatchMotion:
         memory_seconds=0.1,
         center_trust=0.5,
         acceleration=False,
+        soft=False,
     ):
         if (
             not np.isfinite(
@@ -52,6 +54,7 @@ class PatchMotion:
         if type(acceleration) is not bool:
             raise ValueError("acceleration must be boolean")
         self.use_acceleration = acceleration and self.enabled
+        self.soft = bool(soft)
         self.domain = np.array(
             [
                 [radius, 0.0, self.query[0]],
@@ -77,6 +80,9 @@ class PatchMotion:
         self._shape_step_dt = self._center_step_dt = 0.0
         self.bias = np.zeros(2)
         self.bias_velocity = np.zeros(2)
+        self.bias_acceleration = np.zeros(2)
+        self._bias_step_velocity = None
+        self._bias_step_dt = 0.
         noise = noise_px / radius
         self.noise = np.array([np.arctan(noise), noise, noise, noise, noise, noise])
         self.variance = self.noise**2
@@ -124,21 +130,59 @@ class PatchMotion:
         return center, params, valid
 
     def compose(self, center, params):
-        theta, ell, a, b, p, q = np.asarray(params, float)
-        amplitude = float(np.hypot(a, b))
-        multiplier = np.sinh(amplitude) / amplitude if amplitude > 1e-9 else 1.0
-        strain = np.cosh(amplitude) * np.eye(2) + multiplier * np.array(
-            [[a, b], [b, -a]]
-        )
-        rotation = np.array(
-            [[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]]
-        )
-        local = np.eye(3)
-        local[:2, :2] = np.exp(ell) * rotation @ strain
-        local[2, :2] = p, q
-        destination = self.domain.copy()
-        destination[:2, 2] = center
+        return self.compose_batch(np.asarray(center).reshape(1, 2),
+                                  np.asarray(params).reshape(1, 6))[0]
+
+    def compose_batch(self, centers, params):
+        """Vectorized eight-DOF hypotheses; no pixel/parameter loops."""
+        centers, params = np.asarray(centers, float), np.asarray(params, float)
+        theta, ell, a, b, p, q = params.T
+        amplitude = np.hypot(a, b)
+        multiplier = np.divide(np.sinh(amplitude), amplitude,
+                               out=np.ones_like(amplitude), where=amplitude > 1e-9)
+        strain = np.zeros((len(params), 2, 2))
+        strain[:, 0, 0], strain[:, 1, 1] = np.cosh(amplitude)+multiplier*a, np.cosh(amplitude)-multiplier*a
+        strain[:, 0, 1] = strain[:, 1, 0] = multiplier*b
+        rotation = np.zeros_like(strain)
+        rotation[:, 0, 0] = rotation[:, 1, 1] = np.cos(theta)
+        rotation[:, 1, 0], rotation[:, 0, 1] = np.sin(theta), -np.sin(theta)
+        local = np.broadcast_to(np.eye(3), (len(params), 3, 3)).copy()
+        local[:, :2, :2] = np.exp(ell)[:, None, None] * (rotation @ strain)
+        local[:, 2, :2] = np.column_stack((p, q))
+        destination = np.broadcast_to(self.domain, local.shape).copy()
+        destination[:, :2, 2] = centers
         return destination @ local @ self.inverse_domain
+
+    def rank(self, matrices, scores, frame, supplied=None, *, weight=.03,
+             still_bonus=.01, predicted=None):
+        """Bounded acceleration-continuity cost in query-local physical units.
+
+        Innovation about constant-acceleration prediction is an integrated
+        acceleration-change residual, not a penalty toward zero acceleration.
+        Learned per-channel variances separate angle/scale/strain/perspective.
+        """
+        center, params, valid = self.decompose(matrices)
+        predicted = self.predict(frame, supplied) if predicted is None else predicted
+        expected_center, expected_params, _ = self.decompose([predicted])
+        difference = params - expected_params[0]
+        difference[:, 0] = _wrap(difference[:, 0])
+        dt = max(0., (frame-self.frame)/self.fps)
+        growth = np.sqrt(1 + (max(0., dt-1/self.fps)/self.memory_seconds)**2)
+        noise = np.sqrt(np.maximum(self.variance, self.noise**2))*growth
+        shape_error = np.mean((difference/noise)**2, axis=1)
+        center_error = np.sum(((center-expected_center[0])/(self.noise_px*growth))**2, axis=1)
+        penalty = weight * (-np.expm1(-.5*(center_error+shape_error)))
+        change = params-self.params
+        change[:, 0] = _wrap(change[:, 0])
+        movement = np.sum(((center-self.center)/self.noise_px)**2, axis=1)
+        movement += np.mean((change/self.noise)**2, axis=1)
+        bonus = still_bonus*np.exp(-.5*movement)
+        if not self.enabled:
+            penalty[:] = 0.
+            bonus[:] = 0.
+        ranks = np.asarray(scores, float)-penalty+bonus
+        ranks[~valid | ~np.isfinite(scores)] = -np.inf
+        return ranks, penalty, bonus
 
     def _prediction(self, frame):
         dt = max(0.0, (float(frame) - self.frame) / self.fps)
@@ -162,6 +206,8 @@ class PatchMotion:
             center = (
                 np.asarray(supplied, float) + self.bias + self.bias_velocity * horizon
             )
+            if self.use_acceleration:
+                center += .5*self.bias_acceleration*horizon**2
         # Never extrapolate a projective pole into the reference support.
         perspective = np.abs(params[4:]).sum()
         if perspective > 0.8:
@@ -181,7 +227,7 @@ class PatchMotion:
         # Before velocity is observable, existing geometric bounds govern startup.
         bootstrap = self.updates == 0
         accepted = valid & (bootstrap | (standardized.max(axis=1) <= self.sigma))
-        if not self.enabled:
+        if not self.enabled or self.soft:
             accepted = valid
         angular = np.rad2deg(innovation[:, 0])
         shape = np.linalg.norm(innovation[:, 2:], axis=1)
@@ -269,11 +315,18 @@ class PatchMotion:
         if supplied is not None:
             bias = center - np.asarray(supplied, float)
             velocity = (bias - self.bias) / dt
-            self.bias_velocity = (
-                (1 - alpha) * self.bias_velocity + alpha * velocity
-                if self.updates
-                else np.zeros(2)
-            )
+            if not self.center_updates:
+                # The first supplied-center correction is a prior mean, not
+                # a physical velocity/acceleration jump from zero bias.
+                self.bias_velocity[:] = 0.
+                self.bias_acceleration[:] = 0.
+            elif self.use_acceleration:
+                self.bias_velocity, self.bias_acceleration = self._rates(
+                    self.bias_velocity, self.bias_acceleration, velocity,
+                    self._bias_step_velocity, dt, self._bias_step_dt, alpha)
+                self._bias_step_velocity, self._bias_step_dt = velocity.copy(), dt
+            else:
+                self.bias_velocity = (1-alpha)*self.bias_velocity + alpha*velocity
             self.bias = bias
         self.center, self.center_frame = center.copy(), int(frame)
         self.center_updates += 1
